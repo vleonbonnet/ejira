@@ -930,7 +930,7 @@ Without type, match for all ejira types (task, epic, story, subtask)"
   "Parse sprint name from DATA. Return NIL if not found."
   (let ((name (last (mapcar #'ejira-sprint-name
                             (mapcar #'ejira--parse-sprint data)))))
-    (when name
+    (when (car name)
       ;; Spaces are not valid in a tagname.
       (ejira--to-tagname (car name)))))
 
