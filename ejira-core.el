@@ -259,7 +259,7 @@ The default value is applicable for:
           (write-region "" nil project-file-name)
           (add-to-list 'org-agenda-files project-file-name))
         (let ((project-buffer (or (find-buffer-visiting project-file-name)
-                                  (find-file project-file-name))))
+                                  (find-file-noselect project-file-name))))
 
           (unless existing-heading
             (ejira--new-heading project-buffer nil key))
@@ -601,11 +601,15 @@ of the document."
          (goto-char (point-min))
 
          (if parent
-             ;; Jump to parent and insert one level deeper so the new
-             ;; heading is born as a child, not a sibling.
+             ;; Jump to end of parent's subtree and insert one level deeper.
+             ;; Using org-end-of-subtree avoids inserting between the parent
+             ;; heading and its :PROPERTIES: drawer, which would displace the
+             ;; drawer and break org-id lookup on the parent.
              (progn
                (goto-char (ejira--find-heading parent))
-               (org-insert-subheading t))
+               (org-end-of-subtree t t)
+               (org-insert-heading t)
+               (org-demote))
            ;; No parent: insert after the first line (startup keyword).
            (forward-line)
            (org-insert-heading-respect-content t))
