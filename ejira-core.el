@@ -279,11 +279,24 @@ The slots are parsed from struct TYPE."
        ,@body)))
 (function-put #'ejira--with-bind-struct 'lisp-indent-function 'defun)
 
+(defvar ejira--syncing nil
+  "Non-nil during `ejira-update-project' to suppress per-op outline expand.")
+
+(defvar ejira--heading-cache nil
+  "Hash table ID->marker, valid for the duration of one `ejira-update-project'.
+Avoids repeated linear file scans for the same heading.  Markers auto-update
+on buffer edits, so they stay valid through property changes.  Entries for
+refiled headings are evicted after the refile.")
+
 (defmacro ejira--with-expand-all (&rest body)
-  "Evalate BODY while all outline contents are visible."
-  `(org-save-outline-visibility t
-     (outline-show-all)
-     ,@body))
+  "Evalate BODY while all outline contents are visible.
+During sync (`ejira--syncing' t) the buffer is pre-expanded once and
+this macro becomes a bare progn to avoid repeated save/restore overhead."
+  `(if ejira--syncing
+       (progn ,@body)
+     (org-save-outline-visibility t
+       (outline-show-all)
+       ,@body)))
 (function-put #'ejira--with-expand-all 'lisp-indent-function 'defun)
 
 (defmacro ejira--with-point-on (id &rest body)
@@ -334,72 +347,78 @@ If the issue heading does not exist, fallback to full update."
                             (or parent project)
                             key))
 
-      (ejira--set-todo-state key (alist-get status ejira-todo-states-alist 1 nil #'equal))
+      ;; Skip expensive field/comment updates when Jira reports no changes.
+      ;; Modified stores the last-seen Jira updated timestamp; equality means
+      ;; nothing on the server changed since the last sync.
+      (unless (equal (ejira--get-property key "Modified")
+                     (format-time-string "%Y-%m-%d %H:%M:%S" updated "UTC"))
 
-      (ejira--set-property key "TYPE" (symbol-name org-type))
-      (ejira--set-summary key summary)
+        (ejira--set-todo-state key (alist-get status ejira-todo-states-alist 1 nil #'equal))
 
-      ;; Set the sprint tag
-      (ejira--with-point-on key
-        (dolist (tag (org-get-tags))
-          (when (s-starts-with-p ejira-sprint-tagname-prefix tag)
-            (org-toggle-tag tag 'off)))
+        (ejira--set-property key "TYPE" (symbol-name org-type))
+        (ejira--set-summary key summary)
 
-        (when sprint (org-toggle-tag sprint 'on))
+        ;; Set the sprint tag
+        (ejira--with-point-on key
+          (dolist (tag (org-get-tags))
+            (when (s-starts-with-p ejira-sprint-tagname-prefix tag)
+              (org-toggle-tag tag 'off)))
 
-        ;; Update deadline (4 is the prefix argument to remove deadline)
-        (if deadline (org-deadline nil deadline) (org-deadline '(4)))
+          (when sprint (org-toggle-tag sprint 'on))
 
-        ;; Set priority.
-        (when-let ((p (alist-get priority ejira-priorities-alist nil nil #'equal)))
-          (org-priority p))
+          ;; Update deadline (4 is the prefix argument to remove deadline)
+          (if deadline (org-deadline nil deadline) (org-deadline '(4)))
 
-        (org-set-property "Status" status)
-        (when reporter
-          (org-set-property "Reporter" reporter))
-        (org-set-property "Assignee" (or assignee ""))
-        (if (equal assignee (ejira--my-fullname))
-            (org-toggle-tag ejira-assigned-tagname 'on)
-          (org-toggle-tag ejira-assigned-tagname 'off))
+          ;; Set priority.
+          (when-let ((p (alist-get priority ejira-priorities-alist nil nil #'equal)))
+            (org-priority p))
 
-        (org-set-property "Issuetype" type)
-        (org-set-property "Created" (format-time-string "%Y-%m-%d %H:%M:%S"
-                                                        created "UTC"))
-        (org-set-property "Modified" (format-time-string "%Y-%m-%d %H:%M:%S"
-                                                         updated "UTC"))
-        (when-let ((minutes (and estimate (/ estimate 60))))
-          (org-set-property "Effort" (format "%02d:%02d" (/ minutes 60) (% minutes 60))))
-        (when-let ((minutes (and remaining-estimate (/ remaining-estimate 60))))
-          (org-set-property "Left" (format "%02d:%02d" (/ minutes 60) (% minutes 60)))))
+          (org-set-property "Status" status)
+          (when reporter
+            (org-set-property "Reporter" reporter))
+          (org-set-property "Assignee" (or assignee ""))
+          (if (equal assignee (ejira--my-fullname))
+              (org-toggle-tag ejira-assigned-tagname 'on)
+            (org-toggle-tag ejira-assigned-tagname 'off))
 
-      (ejira--get-subheading (ejira--find-heading key) ejira-description-heading-name)
-      (ejira--get-subheading (ejira--find-heading key) ejira-comments-heading-name)
-      (ejira--set-heading-body-jira-markup
-       (ejira--find-task-subheading key ejira-description-heading-name)
-       description)
+          (org-set-property "Issuetype" type)
+          (org-set-property "Created" (format-time-string "%Y-%m-%d %H:%M:%S"
+                                                          created "UTC"))
+          (org-set-property "Modified" (format-time-string "%Y-%m-%d %H:%M:%S"
+                                                           updated "UTC"))
+          (when-let ((minutes (and estimate (/ estimate 60))))
+            (org-set-property "Effort" (format "%02d:%02d" (/ minutes 60) (% minutes 60))))
+          (when-let ((minutes (and remaining-estimate (/ remaining-estimate 60))))
+            (org-set-property "Left" (format "%02d:%02d" (/ minutes 60) (% minutes 60)))))
 
-      ;; Update existing, and insert missing comments
-      (mapc (-partial #'ejira--update-comment key) comments)
+        (ejira--get-subheading (ejira--find-heading key) ejira-description-heading-name)
+        (ejira--get-subheading (ejira--find-heading key) ejira-comments-heading-name)
+        (ejira--set-heading-body-jira-markup
+         (ejira--find-task-subheading key ejira-description-heading-name)
+         description)
 
-      ;; Delete removed comments
-      (ejira--kill-deleted-comments key (mapcar 'ejira-comment-id comments))
+        ;; Update existing, and insert missing comments
+        (mapc (-partial #'ejira--update-comment key) comments)
 
-      ;; Ensure comments are ordered by creation
-      (ejira--sort-comments key)
+        ;; Delete removed comments
+        (ejira--kill-deleted-comments key (mapcar 'ejira-comment-id comments))
 
-      ;; Refile to enforce the Jira hierarchy.  For parent/epic always enforce
-      ;; so subtasks and stories stay nested correctly.  For the project-level
-      ;; fallback, skip if the heading has been manually moved outside
-      ;; ejira-org-directory — use file-truename on both sides to handle symlinks.
-      (let* ((target (cond (parent) (epic) (t project)))
-             (heading-file (buffer-file-name
-                            (marker-buffer (ejira--find-heading key))))
-             (in-ejira-dir (string-prefix-p
-                            (file-truename (expand-file-name ejira-org-directory))
-                            (file-truename heading-file))))
-        (when (or parent epic in-ejira-dir)
-          (ejira--refile key target)))
-      (message "Updated %s: %s" key summary))))
+        ;; Ensure comments are ordered by creation
+        (ejira--sort-comments key)
+
+        ;; Refile to enforce the Jira hierarchy.  For parent/epic always enforce
+        ;; so subtasks and stories stay nested correctly.  For the project-level
+        ;; fallback, skip if the heading has been manually moved outside
+        ;; ejira-org-directory — use file-truename on both sides to handle symlinks.
+        (let* ((target (cond (parent) (epic) (t project)))
+               (heading-file (buffer-file-name
+                              (marker-buffer (ejira--find-heading key))))
+               (in-ejira-dir (string-prefix-p
+                              (file-truename (expand-file-name ejira-org-directory))
+                              (file-truename heading-file))))
+          (when (or parent epic in-ejira-dir)
+            (ejira--refile key target)))
+        (message "Updated %s: %s" key summary))))
 
 (defun ejira--update-comment (key comment)
   "Update comment list of item KEY with data from COMMENT."
@@ -640,7 +659,12 @@ of the document."
 
 (defun ejira--find-heading (id)
   "Find the item ID from agenda files, or return nil."
-  (org-id-find-id-in-file id (org-id-find-id-file id) t))
+  (when id
+    (or (and ejira--heading-cache (gethash id ejira--heading-cache))
+        (let ((m (org-id-find-id-in-file id (org-id-find-id-file id) t)))
+          (when (and m ejira--heading-cache)
+            (puthash id m ejira--heading-cache))
+          m))))
 
 
 (defun ejira--refile (source-id target-id)
@@ -652,7 +676,10 @@ of the document."
         (let ((org-log-refile nil))
           (org-refile nil nil
                       `(nil ,(buffer-file-name (marker-buffer target-m)) nil
-                            ,(marker-position target-m))))))))
+                            ,(marker-position target-m)))))
+      ;; The heading moved; evict from cache so the next lookup re-scans.
+      (when ejira--heading-cache
+        (remhash source-id ejira--heading-cache)))))
 
 (defun ejira--set-property (id property value)
   "Set PROPERTY of item ID into VALUE."

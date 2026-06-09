@@ -181,6 +181,14 @@ If DEEP set to t, update each issue with separate API call which pulls also
 comments. With SHALLOW, only update todo status and assignee."
   (ejira--update-project id)
 
+  ;; Expand the project buffer once so ejira--with-expand-all becomes a no-op
+  ;; inside the sync loop instead of save/restoring outline visibility per op.
+  (let ((ejira--syncing t)
+        (ejira--heading-cache (make-hash-table :test 'equal))
+        (proj-buf (find-file-noselect
+                   (expand-file-name (ejira--project-file-name id)))))
+    (with-current-buffer proj-buf (outline-show-all))
+
   ;; First, update all items that are marked as unresolved.
   ;;
   ;; Handles cases:
@@ -233,7 +241,7 @@ comments. With SHALLOW, only update todo status and assignee."
   ;; ejira--new-heading calls basic-save-buffer, leaving the final state unsaved.
   (when-let ((buf (find-buffer-visiting
                    (expand-file-name (ejira--project-file-name id)))))
-    (with-current-buffer buf (save-buffer))))
+    (with-current-buffer buf (save-buffer)))))
 
 ;;;###autoload
 (defun ejira-update-my-projects (&optional shallow)
@@ -242,10 +250,11 @@ With prefix argument SHALLOW, update only the todo state and assignee."
   (interactive "P")
   (let ((inhibit-message t)
         (message-log-max nil))
+    ;; Refresh locations before syncing so manually-refiled issues are found
+    ;; in their new file rather than triggering a spurious ejira--new-heading.
+    (org-id-update-id-locations nil t)
     (mapc (-rpartial #'ejira-update-project shallow) ejira-projects)
-    ;; One final scan to rebuild org-id-locations from disk and save the
-    ;; locations file.  Individual heading creation uses puthash directly to
-    ;; avoid a full rescan on every issue.
+    ;; Final scan to persist any new IDs added during this sync.
     (org-id-update-id-locations nil t))
   (message "ejira: sync finished"))
 
