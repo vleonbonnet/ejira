@@ -397,7 +397,7 @@ Return the first item matching JQL."
          (epic-meta (jiralib2-session-call
                      (format "/rest/api/2/issue/%s/editmeta" epic-key)))
          (issue-meta (jiralib2-session-call
-                      (format "/rest/api/2/issue/%s/editmeta" epic-key)))
+                      (format "/rest/api/2/issue/%s/editmeta" issue-key)))
 
          (epic-field (caar (-filter (lambda (field)
                                       (equal (alist-get 'name field) "Epic Link"))
