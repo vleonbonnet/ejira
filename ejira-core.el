@@ -256,7 +256,8 @@ The default value is applicable for:
 
         ;; We need to write empty file so that `org-id' will start tracking it.
         (unless exists-p
-          (write-region "" nil project-file-name))
+          (write-region "" nil project-file-name)
+          (add-to-list 'org-agenda-files project-file-name))
         (let ((project-buffer (or (find-buffer-visiting project-file-name)
                                   (find-file project-file-name))))
 
@@ -612,7 +613,7 @@ of the document."
          (org-set-property "ID" id)
          (org-beginning-of-line)
          (basic-save-buffer)
-         (org-id-add-location id (buffer-file-name buffer))
+         (org-id-update-id-locations (list (buffer-file-name buffer)))
          (point-marker))))))
 
 (defun ejira--find-heading (id)
