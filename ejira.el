@@ -228,7 +228,12 @@ comments. With SHALLOW, only update todo status and assignee."
   ;; ===========+===========
   ;; unresolved |
   ;; resolved   |
-  )
+
+  ;; Save the project buffer — issue updates modify it incrementally but only
+  ;; ejira--new-heading calls basic-save-buffer, leaving the final state unsaved.
+  (when-let ((buf (find-buffer-visiting
+                   (expand-file-name (ejira--project-file-name id)))))
+    (with-current-buffer buf (save-buffer))))
 
 ;;;###autoload
 (defun ejira-update-my-projects (&optional shallow)
