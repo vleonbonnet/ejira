@@ -575,7 +575,9 @@ If LEVEL is given, shift all heading by it."
 
 (defun ejira--set-todo-state (key state)
   "Set todo state of item KEY into STATE."
-  (ejira--with-point-on key (org-todo state)))
+  (ejira--with-point-on key
+    (unless (equal (org-get-todo-state) state)
+      (org-todo state))))
 
 (defun ejira--is-parent-p (child parent)
   "Return t if CHILD is a subheading of PARENT."
