@@ -639,9 +639,10 @@ of the document."
     (let ((target-m (or (ejira--find-heading target-id)
                         (error "Target %s not found" target-id))))
       (ejira--with-point-on source-id
-        (org-refile nil nil
-                    `(nil ,(buffer-file-name (marker-buffer target-m)) nil
-                          ,(marker-position target-m)))))))
+        (let ((org-log-refile nil))
+          (org-refile nil nil
+                      `(nil ,(buffer-file-name (marker-buffer target-m)) nil
+                            ,(marker-position target-m))))))))
 
 (defun ejira--set-property (id property value)
   "Set PROPERTY of item ID into VALUE."
