@@ -577,8 +577,14 @@ If LEVEL is given, shift all heading by it."
 (defun ejira--set-todo-state (key state)
   "Set todo state of item KEY into STATE."
   (ejira--with-point-on key
-    (unless (equal (org-get-todo-state) state)
-      (org-todo state))))
+    ;; state is a 1-based index into org-todo-keywords-1; resolve to string
+    ;; before comparing so the guard works for both numeric and string inputs.
+    (let ((target (if (numberp state) (nth (1- state) org-todo-keywords-1) state)))
+      (unless (equal (org-get-todo-state) target)
+        ;; Inhibit logbook: sync is not an interactive user action, state history
+        ;; lives in Jira not in the org LOGBOOK drawer.
+        (let ((org-inhibit-logging t))
+          (org-todo state))))))
 
 (defun ejira--is-parent-p (child parent)
   "Return t if CHILD is a subheading of PARENT."
