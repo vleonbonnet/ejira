@@ -240,8 +240,13 @@ comments. With SHALLOW, only update todo status and assignee."
   "Synchronize data on projects listed in `ejira-projects'.
 With prefix argument SHALLOW, update only the todo state and assignee."
   (interactive "P")
-  (mapc (-rpartial #'ejira-update-project shallow) ejira-projects)
-  (message "ejira: operation finished"))
+  (let ((inhibit-message t))
+    (mapc (-rpartial #'ejira-update-project shallow) ejira-projects)
+    ;; One final scan to rebuild org-id-locations from disk and save the
+    ;; locations file.  Individual heading creation uses puthash directly to
+    ;; avoid a full rescan on every issue.
+    (org-id-update-id-locations nil t))
+  (message "ejira: sync finished"))
 
 ;;;###autoload
 (defun ejira-set-deadline (arg &optional time)

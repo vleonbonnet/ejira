@@ -617,7 +617,9 @@ of the document."
          (org-set-property "ID" id)
          (org-beginning-of-line)
          (basic-save-buffer)
-         (org-id-update-id-locations (list (buffer-file-name buffer)))
+         (unless (hash-table-p org-id-locations)
+           (setq org-id-locations (make-hash-table :test 'equal)))
+         (puthash id (abbreviate-file-name (buffer-file-name buffer)) org-id-locations)
          (point-marker))))))
 
 (defun ejira--find-heading (id)
