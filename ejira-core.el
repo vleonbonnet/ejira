@@ -387,8 +387,18 @@ If the issue heading does not exist, fallback to full update."
       ;; Ensure comments are ordered by creation
       (ejira--sort-comments key)
 
-      ;; Finally, refile to the correct location
-      (ejira--refile key (cond (parent) (epic) (t project)))
+      ;; Refile to enforce the Jira hierarchy.  For parent/epic always enforce
+      ;; so subtasks and stories stay nested correctly.  For the project-level
+      ;; fallback, skip if the heading has been manually moved outside
+      ;; ejira-org-directory — use file-truename on both sides to handle symlinks.
+      (let* ((target (cond (parent) (epic) (t project)))
+             (heading-file (buffer-file-name
+                            (marker-buffer (ejira--find-heading key))))
+             (in-ejira-dir (string-prefix-p
+                            (file-truename (expand-file-name ejira-org-directory))
+                            (file-truename heading-file))))
+        (when (or parent epic in-ejira-dir)
+          (ejira--refile key target)))
       (message "Updated %s: %s" key summary))))
 
 (defun ejira--update-comment (key comment)
