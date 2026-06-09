@@ -599,16 +599,15 @@ of the document."
        (ejira--with-expand-all
          (goto-char (point-min))
 
-         ;; `forward-line' won't work as intended if the org document contains
-         ;; headers. We should jump to the parent.
-         (when parent (goto-char (ejira--find-heading parent)))
-         ;; insert-heading-respect-content does not respect content if we are
-         ;; before first heading in the file. Thus, we want to move to a safe
-         ;; location. In an empty buffer, the first line has the visibility
-         ;; setting, so this should always succeed.
-         (forward-line)
-
-         (org-insert-heading-respect-content t)
+         (if parent
+             ;; Jump to parent and insert one level deeper so the new
+             ;; heading is born as a child, not a sibling.
+             (progn
+               (goto-char (ejira--find-heading parent))
+               (org-insert-subheading t))
+           ;; No parent: insert after the first line (startup keyword).
+           (forward-line)
+           (org-insert-heading-respect-content t))
          (insert "<ejira new heading>")
          (org-set-property "ID" id)
          (org-beginning-of-line)
