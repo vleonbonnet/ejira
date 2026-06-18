@@ -7,13 +7,17 @@
 ;; Provides a dedicated major mode for reviewing pending push changes
 ;; before sending them to the Jira API.  Modeled on orgist-confirm.el.
 ;;
-;;   Ejira Push — SECBUG-908 (2 changes)
+;;   Ejira Push — 2 item(s), 3 change(s)
 ;;   ════════════════════════
-;;   ▶ summary:      "old title" → "new title"
-;;   ▶ description:  "old text…" → "new text…"
+;;   ▼ SECBUG-908  summary, description
+;;     ▶ summary:      "old" → "new"
+;;     ▶ description:  "old…" → "new…"
+;;   ▼ RNDSEC-3493  description
+;;     ▶ description:  "old…" → "new…"
 ;;
-;; TAB on a field line expands the full old/new text blocks.
-;; C-c C-c sends the request(s), C-c C-k aborts without sending.
+;; An item header (▼/▶) collapses its field list; a field header (▶/▼)
+;; expands the full old/new text.  C-c C-c sends every item's request,
+;; C-c C-k aborts without sending.
 
 ;;; Code:
 
@@ -24,6 +28,11 @@
 (defface ejira-confirm-title
   '((t :weight bold :height 1.2))
   "Face for the confirmation buffer title."
+  :group 'ejira)
+
+(defface ejira-confirm-item
+  '((t :weight bold :inherit font-lock-keyword-face))
+  "Face for item (issue/comment) names."
   :group 'ejira)
 
 (defface ejira-confirm-field-name
@@ -53,14 +62,16 @@
 
 ;;; Buffer-local state
 
-(defvar-local ejira-confirm--execute-fn nil
-  "Function called on confirm to send the pending requests.")
+(defvar-local ejira-confirm--groups nil
+  "List of item groups being reviewed.
+Each group is a plist (:title :changes :send) as passed to
+`ejira-confirm-show'.")
 
 (defvar-local ejira-confirm--nodes nil
   "List of collapsible nodes.
 Each node is a plist (:marker MARKER :overlay OVERLAY).")
 
-;;; Diff computation
+;;; Diff helpers
 
 (defun ejira-confirm--normalize (s)
   "Normalize string S for comparison: nil to empty, strip CR, trim."
@@ -76,34 +87,38 @@ FIELDS is a list of (NAME OLD NEW) string triples."
 
 ;;; Entry point
 
-(defun ejira-confirm-show (title changes execute-fn)
-  "Display confirmation buffer for pending push CHANGES.
-TITLE identifies the item being pushed (e.g. an issue key).
-CHANGES is a list of (FIELD-NAME OLD NEW) string triples.
-EXECUTE-FN is called with no arguments when the user confirms.
-It is NOT called on cancel."
-  (let ((buf (get-buffer-create "*ejira-confirm*")))
+(defun ejira-confirm-show (groups)
+  "Display a confirmation buffer for pending push GROUPS.
+GROUPS is a list of plists, each with:
+  :title    string identifying the item (e.g. an issue key)
+  :changes  list of (FIELD-NAME OLD NEW) string triples that differ
+  :send     thunk called with no arguments to push that item
+On confirm every group's :send thunk runs; on cancel none do."
+  (let ((buf (get-buffer-create "*ejira-confirm*"))
+        (n-items (length groups))
+        (n-changes (apply #'+ (mapcar (lambda (g) (length (plist-get g :changes)))
+                                      groups))))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
-        ;; Set mode BEFORE rendering so kill-all-local-variables
-        ;; doesn't wipe out buffer-local state set during rendering.
+        ;; Set mode BEFORE rendering so kill-all-local-variables does not
+        ;; wipe out buffer-local state populated during rendering.
         (ejira-confirm-mode)
-        (ejira-confirm--insert-header title (length changes))
-        (dolist (change changes)
-          (ejira-confirm--insert-field
-           (nth 0 change) (nth 1 change) (nth 2 change)))
+        (ejira-confirm--insert-header n-items n-changes)
+        (dolist (group groups)
+          (ejira-confirm--insert-group group))
         (ejira-confirm--insert-footer))
       (goto-char (point-min))
-      (setq ejira-confirm--execute-fn execute-fn))
+      (setq ejira-confirm--groups groups))
     (pop-to-buffer buf)))
 
 ;;; Rendering
 
-(defun ejira-confirm--insert-header (title count)
-  "Insert the buffer header for TITLE showing COUNT changes."
-  (let ((line (format "Ejira Push — %s (%d change%s)"
-                      title count (if (= count 1) "" "s"))))
+(defun ejira-confirm--insert-header (n-items n-changes)
+  "Insert the buffer header for N-ITEMS items and N-CHANGES changes."
+  (let ((line (format "Ejira Push — %d item%s, %d change%s"
+                      n-items (if (= n-items 1) "" "s")
+                      n-changes (if (= n-changes 1) "" "s"))))
     (insert (propertize line 'face 'ejira-confirm-title)
             "\n"
             (make-string (length line) ?═)
@@ -112,14 +127,39 @@ It is NOT called on cancel."
 (defun ejira-confirm--truncate (s)
   "Flatten and truncate S for one-line display."
   (let ((flat (string-trim (replace-regexp-in-string "[\n\r]+" " " (or s "")))))
-    (if (length> flat 60)
-        (concat "\"" (substring flat 0 60) "…\"")
+    (if (length> flat 55)
+        (concat "\"" (substring flat 0 55) "…\"")
       (format "%S" flat))))
+
+(defun ejira-confirm--insert-group (group)
+  "Insert a collapsible item section for GROUP."
+  (let* ((title (plist-get group :title))
+         (changes (plist-get group :changes))
+         (field-names (mapcar #'car changes))
+         (header-start (point)))
+    ;; Item header line (collapses the field list)
+    (insert (propertize "▼" 'ejira-confirm-arrow t)
+            " "
+            (propertize title 'face 'ejira-confirm-item)
+            (propertize (concat "  " (string-join field-names ", "))
+                        'face 'ejira-confirm-summary)
+            "\n")
+    (let ((body-start (point)))
+      (dolist (change changes)
+        (ejira-confirm--insert-field
+         (nth 0 change) (nth 1 change) (nth 2 change)))
+      ;; Overlay for the item body (all its field lines + details)
+      (let ((ov (make-overlay body-start (point))))
+        (overlay-put ov 'invisible nil)
+        (overlay-put ov 'ejira-confirm-node t)
+        (push (list :marker (copy-marker header-start) :overlay ov)
+              ejira-confirm--nodes)))))
 
 (defun ejira-confirm--insert-field (name old new)
   "Insert an expandable change line for field NAME showing OLD → NEW."
   (let ((header-start (point)))
-    (insert (propertize "▶" 'ejira-confirm-arrow t)
+    (insert "  "
+            (propertize "▶" 'ejira-confirm-arrow t)
             " "
             (propertize (format "%-14s" (concat name ":"))
                         'face 'ejira-confirm-field-name)
@@ -131,12 +171,12 @@ It is NOT called on cancel."
             "\n")
     ;; Full-text detail block (initially hidden)
     (let ((detail-start (point)))
-      (insert (propertize "    ── old ──\n" 'face 'ejira-confirm-summary))
+      (insert (propertize "      ── old ──\n" 'face 'ejira-confirm-summary))
       (dolist (line (split-string (ejira-confirm--normalize old) "\n"))
-        (insert "    " (propertize line 'face 'ejira-confirm-old-value) "\n"))
-      (insert (propertize "    ── new ──\n" 'face 'ejira-confirm-summary))
+        (insert "      " (propertize line 'face 'ejira-confirm-old-value) "\n"))
+      (insert (propertize "      ── new ──\n" 'face 'ejira-confirm-summary))
       (dolist (line (split-string (ejira-confirm--normalize new) "\n"))
-        (insert "    " (propertize line 'face 'ejira-confirm-new-value) "\n"))
+        (insert "      " (propertize line 'face 'ejira-confirm-new-value) "\n"))
       (let ((ov (make-overlay detail-start (point))))
         (overlay-put ov 'invisible t)
         (overlay-put ov 'ejira-confirm-node t)
@@ -151,16 +191,17 @@ It is NOT called on cancel."
           (propertize "C-c C-k" 'face 'ejira-confirm-key)
           "  Cancel    "
           (propertize "TAB" 'face 'ejira-confirm-key)
-          "  Toggle details\n"))
+          "  Toggle\n"))
 
 ;;; Interaction
 
 (defun ejira-confirm-execute ()
-  "Confirm and send the pending push requests."
+  "Confirm and send every pending item's push request."
   (interactive)
-  (let ((fn ejira-confirm--execute-fn))
+  (let ((groups ejira-confirm--groups))
     (quit-window t)
-    (funcall fn)))
+    (dolist (group groups)
+      (funcall (plist-get group :send)))))
 
 (defun ejira-confirm-cancel ()
   "Cancel the push and close the confirmation buffer."
@@ -169,7 +210,7 @@ It is NOT called on cancel."
   (message "ejira: push cancelled"))
 
 (defun ejira-confirm-toggle-section ()
-  "Toggle expand/collapse of the field details at point."
+  "Toggle expand/collapse of the node at point."
   (interactive)
   (when-let ((node (ejira-confirm--node-at-point)))
     (let* ((ov (plist-get node :overlay))
@@ -183,7 +224,7 @@ It is NOT called on cancel."
           (replace-match (if hidden "▼" "▶") t t))))))
 
 (defun ejira-confirm-next-section ()
-  "Move point to the next field heading."
+  "Move point to the next node heading."
   (interactive)
   (let ((pos (point)) (found nil))
     (dolist (node ejira-confirm--nodes)
@@ -193,7 +234,7 @@ It is NOT called on cancel."
     (when found (goto-char found))))
 
 (defun ejira-confirm-prev-section ()
-  "Move point to the previous field heading."
+  "Move point to the previous node heading."
   (interactive)
   (let ((pos (point)) (found nil))
     (dolist (node ejira-confirm--nodes)
@@ -203,14 +244,16 @@ It is NOT called on cancel."
     (when found (goto-char found))))
 
 (defun ejira-confirm--node-at-point ()
-  "Return the node plist for the heading at point, or nil."
+  "Return the node plist whose header line contains point, or nil.
+When both an item and a field node share the line region, prefer the one
+whose marker is closest to point (the field header)."
   (let ((line-beg (line-beginning-position))
         (line-end (line-end-position))
-        (best nil))
+        (best nil) (best-pos -1))
     (dolist (node ejira-confirm--nodes)
       (let ((m (marker-position (plist-get node :marker))))
-        (when (and (>= m line-beg) (<= m line-end))
-          (setq best node))))
+        (when (and (>= m line-beg) (<= m line-end) (> m best-pos))
+          (setq best node best-pos m))))
     best))
 
 ;;; Mode definition

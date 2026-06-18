@@ -45,6 +45,16 @@
   "When non-nil, `ejira-push-item-under-point' shows a review buffer
 of the pending changes before sending any request to the server.")
 
+(defvar ejira-push-on-save t
+  "When non-nil, saving any org buffer that contains ejira-managed headings
+offers to push locally-edited issues and comments through a review buffer.
+Managed headings are recognised by the :Pushhash: baseline set on sync, so
+this also covers nodes refiled out of `ejira-org-directory'.")
+
+(defvar ejira--pushing nil
+  "Bound to t while a push writes the :Pushhash: baseline back, so the
+resulting save does not re-trigger `ejira--push-on-save'.")
+
 (defvar ejira-update-jql-resolved-fn #'ejira-jql-all-resolved-project-tickets
   "Generates JQL used in `ejira-update-project' to find server-resolved items.
 Must take a project-id as a string, a list of keys, and return JQL as a string.")
@@ -210,67 +220,126 @@ Called from async callbacks once all network responses have arrived."
           (t
            (ejira--update-task id)))))
 
+(defun ejira--push-finalize (marker)
+  "Refresh MARKER's push baseline after a successful push and save its buffer.
+`ejira--pushing' is bound so the resulting save does not re-trigger
+`ejira--push-on-save'."
+  (org-with-point-at marker (ejira--update-push-baseline))
+  (let ((ejira--pushing t))
+    (with-current-buffer (marker-buffer marker)
+      (when (buffer-modified-p) (save-buffer)))))
+
+(defun ejira--push-plan-at-point ()
+  "Return a push plan for the ejira heading at point, or nil if not pushable.
+The plan is a plist (:title :changes :send): CHANGES is the org-space diff
+against the current server state (nil when nothing differs), and SEND is a
+thunk that pushes the item and refreshes its baseline.  The diff is computed
+in org-space so a freshly-synced item is idempotent (no heading-level noise)."
+  (let ((type (org-entry-get nil "TYPE")))
+    (cond
+     ((equal type "ejira-comment")
+      (let* ((ikey (org-entry-get nil "ID" t))
+             (commid (org-entry-get nil "CommId"))
+             (marker (point-marker))
+             (local-org (ejira--get-heading-body marker))
+             (remote-jira (ejira--alist-get
+                           (jiralib2-get-comment ikey commid) 'body))
+             (remote-org (ejira--expected-org-body marker remote-jira)))
+        (list :title (format "%s comment %s" ikey commid)
+              :changes (ejira-confirm-field-changes
+                        `(("body" ,remote-org ,local-org)))
+              :send (lambda ()
+                      (jiralib2-edit-comment
+                       ikey commid (ejira-parser-org-to-jira local-org))
+                      (ejira--push-finalize marker)
+                      (message "ejira: pushed comment %s of %s" commid ikey)))))
+     ((member type ejira-pushable-types)
+      (let* ((id (org-entry-get nil "ID"))
+             (marker (point-marker))
+             (desc-heading (ejira--find-child-heading ejira-description-heading-name))
+             (local-summary (ejira--strip-properties (org-get-heading t t t t)))
+             (local-org-desc (if desc-heading (ejira--get-heading-body desc-heading) ""))
+             (remote (jiralib2-get-issue id))
+             (remote-summary (ejira--alist-get remote 'fields 'summary))
+             (remote-org-desc (ejira--expected-org-body
+                               (or desc-heading marker)
+                               (ejira--alist-get remote 'fields 'description))))
+        (list :title id
+              :changes (ejira-confirm-field-changes
+                        `(("summary"     ,remote-summary  ,local-summary)
+                          ("description" ,remote-org-desc ,local-org-desc)))
+              :send (lambda ()
+                      (jiralib2-update-summary-description
+                       id local-summary (ejira-parser-org-to-jira local-org-desc))
+                      (ejira--push-finalize marker)
+                      (message "ejira: pushed %s" id))))))))
+
 (defun ejira-push-item-under-point ()
-  "Upload content of issue, project or comment under point to server.
-For a project, this includes the summary, for a task the summary and
-description, and for the comment the body.
-When `ejira-push-confirm' is non-nil, the current server state is
-fetched first and the pending changes are shown in a review buffer;
-nothing is sent until the user confirms with \\<ejira-confirm-mode-map>\\[ejira-confirm-execute]."
+  "Upload content of the issue or comment under point to the server.
+For a task this is the summary and description, for a comment the body.
+When `ejira-push-confirm' is non-nil the current server state is fetched
+first and pending changes are shown in a review buffer; nothing is sent
+until you confirm with \\<ejira-confirm-mode-map>\\[ejira-confirm-execute]."
   (interactive)
   (let* ((item (ejira-get-id-under-point))
-         (id (nth 1 item))
-         (type (nth 0 item)))
-    (cond ((equal type "ejira-comment")
-           (let* ((heading (nth 2 item))
-                  (local-org (ejira--get-heading-body heading))
-                  (send (lambda ()
-                          (jiralib2-edit-comment
-                           (car id) (cdr id) (ejira-parser-org-to-jira local-org))
-                          (message "ejira: pushed comment %s of %s" (cdr id) (car id)))))
-             (if (not ejira-push-confirm)
-                 (funcall send)
-               ;; Compare in org-space: the body stored on the last sync equals
-               ;; ejira--expected-org-body of the current remote, so an unchanged
-               ;; comment diffs to nothing and the push is a no-op.
-               (let* ((remote-jira (ejira--alist-get
-                                    (jiralib2-get-comment (car id) (cdr id)) 'body))
-                      (remote-org (ejira--expected-org-body heading remote-jira))
-                      (changes (ejira-confirm-field-changes
-                                `(("body" ,remote-org ,local-org)))))
-                 (if (null changes)
-                     (message "ejira: no changes to push")
-                   (ejira-confirm-show
-                    (format "%s comment %s" (car id) (cdr id)) changes send))))))
-          ((equal type "ejira-project")
-           (message "TODO"))
-          (t
-           (let* ((desc-heading (ejira--find-task-subheading
-                                 id ejira-description-heading-name))
-                  (local-summary (ejira--with-point-on id
-                                   (ejira--strip-properties (org-get-heading t t t t))))
-                  (local-org-desc (ejira--get-heading-body desc-heading))
-                  (send (lambda ()
-                          (jiralib2-update-summary-description
-                           id local-summary (ejira-parser-org-to-jira local-org-desc))
-                          (message "ejira: pushed %s" id))))
-             (if (not ejira-push-confirm)
-                 (funcall send)
-               ;; Diff in org-space (see comment above): summary is plain text;
-               ;; the description compares the local org body against what the
-               ;; current remote markup would parse to, making a freshly-synced
-               ;; issue idempotent (no spurious heading-level diffs).
-               (let* ((remote (jiralib2-get-issue id))
-                      (remote-summary (ejira--alist-get remote 'fields 'summary))
-                      (remote-org-desc (ejira--expected-org-body
-                                        desc-heading
-                                        (ejira--alist-get remote 'fields 'description)))
-                      (changes (ejira-confirm-field-changes
-                                `(("summary"     ,remote-summary  ,local-summary)
-                                  ("description" ,remote-org-desc ,local-org-desc)))))
-                 (if (null changes)
-                     (message "ejira: no changes to push")
-                   (ejira-confirm-show id changes send)))))))))
+         (type (nth 0 item))
+         (marker (nth 2 item)))
+    (if (equal type "ejira-project")
+        (message "TODO")
+      (org-with-point-at marker
+        (let ((plan (ejira--push-plan-at-point)))
+          (cond
+           ((not ejira-push-confirm) (funcall (plist-get plan :send)))
+           ((null (plist-get plan :changes)) (message "ejira: no changes to push"))
+           (t (ejira-confirm-show (list plan)))))))))
+
+(defun ejira--buffer-has-pushable-p ()
+  "Return non-nil if the current buffer contains any ejira-managed heading.
+Detected by the :Pushhash: baseline property, which travels with a subtree
+when it is refiled out of `ejira-org-directory'.  Cheap enough to run on every
+org save as a gate before the full dirty scan."
+  (save-restriction
+    (widen)
+    (save-excursion
+      (goto-char (point-min))
+      (re-search-forward "^[ \t]*:Pushhash:" nil t))))
+
+(defun ejira--dirty-heading-markers ()
+  "Return markers to pushable headings in the current buffer with local edits.
+`ejira--syncing' is bound so `ejira--with-expand-all' skips its per-heading
+outline save/restore — text extraction is fold-agnostic, and without this the
+scan is O(n^2) in heading count."
+  (let ((ejira--syncing t)
+        markers)
+    (org-with-wide-buffer
+     (goto-char (point-min))
+     (while (re-search-forward org-heading-regexp nil t)
+       (when (and (member (org-entry-get nil "TYPE") ejira-pushable-types)
+                  (ejira--locally-modified-p))
+         (push (point-marker) markers))
+       (goto-char (line-end-position))))
+    (nreverse markers)))
+
+(defun ejira--push-on-save ()
+  "Offer to push locally-edited ejira items after saving a managed buffer.
+Installed on `after-save-hook'.  Items are detected via their :Pushhash:
+baseline; only changed ones hit the network, and the review buffer is shown
+only when at least one item actually differs from the server."
+  (when (and ejira-push-on-save
+             (not ejira--pushing)
+             (not ejira--syncing)
+             (derived-mode-p 'org-mode)
+             (ejira--buffer-has-pushable-p))
+    (let ((plans (delq nil
+                       (mapcar (lambda (m)
+                                 (org-with-point-at m
+                                   (let ((plan (ejira--push-plan-at-point)))
+                                     (when (plist-get plan :changes) plan))))
+                               (ejira--dirty-heading-markers)))))
+      (when plans
+        (ejira-confirm-show plans)))))
+
+(add-hook 'after-save-hook #'ejira--push-on-save)
 
 (defun ejira-browse-issue-under-point ()
   "Open the current issue in external browser."

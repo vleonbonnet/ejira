@@ -435,7 +435,10 @@ If the issue heading does not exist, fallback to full update."
                                 (file-truename heading-file))))
             (when (or parent epic in-ejira-dir)
               (ejira--refile key target)))
-          (message "Updated %s: %s" key summary))))))
+          (message "Updated %s: %s" key summary))
+        ;; Refresh the push baseline even when the field update was skipped, so
+        ;; the on-disk content (== server) is always the reference for local edits.
+        (ejira--with-point-on key (ejira--update-push-baseline))))))
 
 (defun ejira--update-comment (key comment)
   "Update comment list of item KEY with data from COMMENT."
@@ -458,7 +461,8 @@ If the issue heading does not exist, fallback to full update."
                (ejira-comment-author comment)))
       (ejira--set-heading-body-jira-markup
        (point-marker)
-       (ejira-comment-body comment)))))
+       (ejira-comment-body comment))
+      (ejira--update-push-baseline))))
 
 (defun ejira--get-comment-heading (key id)
   "Get marker to comment ID of item KEY. Create heading if it does not exits."
@@ -619,6 +623,46 @@ If LEVEL is given, shift all heading by it."
   "Remove text properties from string S."
   (set-text-properties 0 (length s) nil s)
   s)
+
+(defconst ejira-pushable-types
+  '("ejira-issue" "ejira-story" "ejira-subtask" "ejira-epic" "ejira-comment")
+  "Heading TYPE values whose content can be pushed back to Jira.")
+
+(defun ejira--push-normalize (s)
+  "Normalize S for push fingerprinting: strip CR and trim surrounding space.
+Must match the comparison normalization in `ejira-confirm--normalize' so the
+hash flips only when a real (pushable) difference exists, not when refile or
+org editing nudges trailing whitespace."
+  (string-trim (replace-regexp-in-string "\r" "" (or s ""))))
+
+(defun ejira--heading-pushable-content ()
+  "Return the push-relevant content of the ejira heading at point, or nil.
+For an issue this is its summary plus description body; for a comment, its
+body.  Normalized so the fingerprint ignores cosmetic whitespace changes."
+  (let ((type (org-entry-get nil "TYPE")))
+    (cond
+     ((equal type "ejira-comment")
+      (ejira--push-normalize (ejira--get-heading-body (point-marker))))
+     ((member type ejira-pushable-types)
+      ;; Description is a direct child; find it point-locally to avoid org-id scans.
+      (let ((desc (ejira--find-child-heading ejira-description-heading-name)))
+        (concat (ejira--push-normalize (ejira--strip-properties (org-get-heading t t t t)))
+                "\0"
+                (ejira--push-normalize (if desc (ejira--get-heading-body desc) ""))))))))
+
+(defun ejira--update-push-baseline ()
+  "Store the :Pushhash: property fingerprinting the heading at point.
+A later save whose content hashes differently is treated as a local edit."
+  (when-let ((content (ejira--heading-pushable-content)))
+    (org-set-property "Pushhash" (md5 content))))
+
+(defun ejira--locally-modified-p ()
+  "Return non-nil if the ejira heading at point differs from its push baseline.
+Headings without a :Pushhash: baseline are treated as unmodified; the baseline
+is established on the next sync or push, never during a plain save."
+  (when-let ((baseline (org-entry-get nil "Pushhash"))
+             (content (ejira--heading-pushable-content)))
+    (not (equal baseline (md5 content)))))
 
 (defun ejira--normalize-end-spacing ()
   "Ensure exactly one blank line after every :END: drawer closer in the current buffer."
