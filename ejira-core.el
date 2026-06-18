@@ -435,10 +435,12 @@ If the issue heading does not exist, fallback to full update."
                                 (file-truename heading-file))))
             (when (or parent epic in-ejira-dir)
               (ejira--refile key target)))
-          (message "Updated %s: %s" key summary))
-        ;; Refresh the push baseline even when the field update was skipped, so
-        ;; the on-disk content (== server) is always the reference for local edits.
-        (ejira--with-point-on key (ejira--update-push-baseline))))))
+          (message "Updated %s: %s" key summary)
+          ;; Record the push baseline from the content we just wrote so later
+          ;; local edits are detectable.  Kept inside the guard: an unchanged
+          ;; item keeps its still-valid baseline and pays nothing — recomputing
+          ;; it for every item turned a no-op sync into O(items) body scans.
+          (ejira--with-point-on key (ejira--update-push-baseline)))))))
 
 (defun ejira--update-comment (key comment)
   "Update comment list of item KEY with data from COMMENT."
