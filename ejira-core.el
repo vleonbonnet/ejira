@@ -482,12 +482,16 @@ If the issue heading does not exist, fallback to full update."
            (point-marker))))))
 
 (defun ejira--sort-comments (key)
-  "Sort comments of item KEY by creation time."
+  "Sort comments of item KEY by creation time.
+Skipped unless there are at least two comments: `org-sort-entries' on an
+empty or single-entry subtree is pointless and, with a live org-element
+cache in a displayed buffer, can wedge into an uninterruptible loop."
   (org-with-point-at (ejira--get-subheading (ejira--find-heading key)
                                             ejira-comments-heading-name)
-    (condition-case nil
-        (org-sort-entries nil ?r nil #'time-less-p "Created" nil)
-      (user-error nil))))  ;; User error thrown if no subheadings
+    (when (> (length (org-map-entries t "TYPE=\"ejira-comment\"" 'tree)) 1)
+      (condition-case nil
+          (org-sort-entries nil ?r nil #'time-less-p "Created" nil)
+        (user-error nil)))))  ;; User error thrown if no subheadings
 
 (defun ejira--kill-deleted-comments (key ids)
   "Kill all comments of item KEY whoes ids are not found from IDS."
@@ -575,7 +579,8 @@ If LEVEL is given, shift all heading by it."
     (concat
      (s-trim
       (ejira-parser-jira-to-org
-       (r "" ""    ; Windows line-endings
+       (r "
+" ""    ; Windows line-endings
           (r " " " " ; Non-breaking space, JIRA likes these, Emacs doesn't
              (decode-coding-string (or body "") 'utf-8)))
        level))

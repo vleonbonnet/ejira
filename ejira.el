@@ -137,6 +137,17 @@ This is the function used in `ejira-update-project'. Override with
                                                 error-thrown)))))))
       (fetch 0))))
 
+(defvar ejira--trace-file nil
+  "When set to a file path, `ejira--apply-sync' appends timestamped phase
+traces there.  Debugging aid for locating where a sync stalls; nil disables it.")
+
+(defun ejira--trace (fmt &rest args)
+  "Append a timestamped FMT/ARGS line to `ejira--trace-file' when set."
+  (when ejira--trace-file
+    (write-region (concat (format-time-string "%H:%M:%S.%3N ")
+                          (apply #'format fmt args) "\n")
+                  nil ejira--trace-file 'append 'silent)))
+
 (defun ejira--apply-sync (projects unresolved-items resolved-items shallow)
   "Apply UNRESOLVED-ITEMS and RESOLVED-ITEMS to org files for PROJECTS.
 Called from async callbacks once all network responses have arrived."
@@ -149,14 +160,21 @@ Called from async callbacks once all network responses have arrived."
     (let ((ejira--syncing t)
           (ejira--heading-cache (make-hash-table :test 'equal))
           (save-silently t)
+          ;; Disable the org-element cache during the bulk programmatic edits.
+          ;; In a displayed buffer the cache reacts to every modification and can
+          ;; wedge into an uninterruptible loop (notably under org-sort-entries);
+          ;; rebuilt lazily on next access after the sync.
+          (org-element-use-cache nil)
           ;; Suppress all per-operation noise (org-todo, org-priority, org-refile,
           ;; basic-save-buffer "Wrote X", etc.) for the duration of the sync.
           ;; message-log-max is checked by the C message_dolog function, so it
           ;; suppresses *Messages* logging regardless of how message is called.
           ;; "ejira: sync finished" is printed after this let, stays visible.
           (message-log-max nil))
+      (ejira--trace "START unresolved=%d resolved=%d" (length unresolved-items) (length resolved-items))
       ;; Refresh org-id locations so manually-refiled issues are found.
       (org-id-update-id-locations nil t)
+      (ejira--trace "after org-id-update #1")
       ;; Save fold state (char positions, no markers — survives revert of unmodified buffers).
       (let ((vis-saves
              (delq nil
@@ -174,6 +192,7 @@ Called from async callbacks once all network responses have arrived."
             (when (and (not (buffer-modified-p)) (file-exists-p buffer-file-name))
               (revert-buffer t t t))
             (outline-show-all)))
+        (ejira--trace "after revert+expand, starting loop")
         ;; Process all fetched items.
         (let ((update-fn (if shallow
                              (lambda (i)
@@ -185,6 +204,7 @@ Called from async callbacks once all network responses have arrived."
                            (lambda (i) (ejira--update-task (ejira--parse-item i))))))
           (mapc update-fn unresolved-items)
           (mapc update-fn resolved-items))
+        (ejira--trace "after loop")
         ;; Normalize: ensure exactly one blank line after every :END: closer.
         ;; ejira--set-heading-body handles body content spacing, but does not
         ;; insert blanks between a heading's property drawer and its child headings.
@@ -193,17 +213,24 @@ Called from async callbacks once all network responses have arrived."
                            (expand-file-name (ejira--project-file-name id)))))
             (with-current-buffer buf
               (ejira--normalize-end-spacing))))
+        (ejira--trace "after normalize")
         ;; Save all modified project buffers, then restore fold state.
         (dolist (id projects)
           (when-let ((buf (find-buffer-visiting
                            (expand-file-name (ejira--project-file-name id)))))
             (with-current-buffer buf (save-buffer))))
+        (ejira--trace "after save")
         ;; Restore fold state for any buffer that was open before the sync.
         (dolist (entry vis-saves)
           (with-current-buffer (car entry)
-            (org-fold-core-regions (cdr entry) :override t))))
-      ;; Persist any new IDs created during this sync.
-      (org-id-update-id-locations nil t)))
+            (org-fold-core-regions (cdr entry) :override t)))
+        (ejira--trace "after fold-restore"))
+      ;; Persist the id->file table. ejira--new-heading already registers new
+      ;; IDs in `org-id-locations' in memory, so a plain save suffices — a
+      ;; second full org-id-update-id-locations rescan of every org-id file
+      ;; (seconds, even minutes cold) is wasteful here.
+      (org-id-locations-save)
+      (ejira--trace "after org-id-locations-save (DONE)")))
   (message "ejira: sync finished"))
 
 (defun ejira-pull-item-under-point ()
@@ -400,6 +427,8 @@ comments. With SHALLOW, only update todo status and assignee."
   ;; inside the sync loop instead of save/restoring outline visibility per op.
   (let* ((ejira--syncing t)
          (ejira--heading-cache (make-hash-table :test 'equal))
+         ;; See ejira--apply-sync: disable org-element cache during bulk edits.
+         (org-element-use-cache nil)
          (proj-buf (find-file-noselect
                     (expand-file-name (ejira--project-file-name id))))
          (vis-save (with-current-buffer proj-buf (org-fold-core-get-regions))))
@@ -487,7 +516,13 @@ parallel, then applies all updates synchronously when both arrive."
     (cl-labels
         ((maybe-apply ()
            (when (= pending 0)
-             (ejira--apply-sync projects all-unresolved all-resolved shallow))))
+             ;; Defer onto a zero-delay timer so the (long, synchronous) apply
+             ;; runs in the command loop where C-g works.  The request.el
+             ;; success callback fires from the curl process sentinel, where
+             ;; `inhibit-quit' is t — running apply-sync there makes it
+             ;; uninterruptible, so any slowness becomes a hard freeze.
+             (run-at-time 0 nil #'ejira--apply-sync
+                          projects all-unresolved all-resolved shallow))))
       (message "ejira: fetching...")
       ;; Fire unresolved query for all projects in one round-trip.
       (cl-incf pending)
