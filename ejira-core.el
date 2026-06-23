@@ -93,7 +93,7 @@ The default value is applicable for:
   :group 'ejira
   :tag "JIRA state map"
   :type '(alist :key-type (string :tag "JIRA State")
-		:value-type (number :tag "org-todo")))
+        :value-type (number :tag "org-todo")))
 
 (defcustom ejira-todo-state-fn
   (lambda (status _resolution)
@@ -570,8 +570,7 @@ If LEVEL is given, shift all heading by it."
     (concat
      (s-trim
       (ejira-parser-jira-to-org
-       (r "
-" ""    ; Windows line-endings
+       (r "" ""    ; Windows line-endings
           (r " " " " ; Non-breaking space, JIRA likes these, Emacs doesn't
              (decode-coding-string (or body "") 'utf-8)))
        level))
