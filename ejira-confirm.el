@@ -93,8 +93,6 @@
   "List of plists (:marker MARKER :overlay OVERLAY :level LEVEL).
 LEVEL is one of: project item field.")
 
-(defvar-local ejira-confirm--todo-keywords nil
-  "Snapshot of `org-todo-keywords-1' captured from the org buffer at show time.")
 
 ;;; ── String helpers ───────────────────────────────────────────────────────────
 
@@ -103,13 +101,8 @@ LEVEL is one of: project item field.")
   (string-trim (replace-regexp-in-string "\r" "" (or s ""))))
 
 (defun ejira-confirm--for-display (s)
-  "Normalize S and strip org inline markup markers for plain display."
-  (let ((r (ejira-confirm--normalize s)))
-    (dolist (ch '("*" "/" "=" "~" "+"))
-      (setq r (replace-regexp-in-string
-               (concat (regexp-quote ch) "\\([^" ch "\n]+\\)" (regexp-quote ch))
-               "\\1" r)))
-    r))
+  "Return S normalized for display (CR stripped, trimmed). Raw markup preserved."
+  (ejira-confirm--normalize s))
 
 (defun ejira-confirm--truncate (s)
   "Flatten and truncate S to at most 55 chars for one-line display."
@@ -118,21 +111,6 @@ LEVEL is one of: project item field.")
         (concat (substring flat 0 55) "…")
       flat)))
 
-(defun ejira-confirm--jira-state-for-org (org-state)
-  "Return the Jira state name corresponding to ORG-STATE keyword.
-Uses `ejira-confirm--todo-keywords' when in the confirm buffer (captured at
-show time), falling back to `org-todo-keywords-1' in org buffers."
-  (when (and (stringp org-state) (> (length org-state) 0)
-             (boundp 'ejira-todo-states-alist))
-    (let* ((keywords (or (and (boundp 'ejira-confirm--todo-keywords)
-                              ejira-confirm--todo-keywords)
-                         (and (boundp 'org-todo-keywords-1)
-                              org-todo-keywords-1)))
-           (pos (when keywords
-                  (cl-position org-state keywords :test #'string=)))
-           (idx (when pos (1+ pos))))
-      (or (when idx (car (rassoc idx ejira-todo-states-alist)))
-          org-state))))
 
 ;;; ── Diff helpers ─────────────────────────────────────────────────────────────
 
@@ -288,12 +266,23 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
          (preview (plist-get plan :preview)))
     (pcase op
       ('create
-       (let* ((label (pcase object ('subtask "subtask") ('comment "comment") (_ "new")))
-              ;; State from fields for the header; translate to Jira state name
+       (let* ((label      (pcase object ('subtask "subtask") ('comment "comment") (_ "new")))
               (state-entry (cl-assoc "state" fields :test #'string=))
               (state-val   (when state-entry (nth 1 state-entry)))
-              (jira-state  (ejira-confirm--jira-state-for-org state-val))
-              (clean (replace-regexp-in-string "^new [a-z]+: " "" (or title "")))
+              (clean       (replace-regexp-in-string "^new [a-z]+: " "" (or title "")))
+              ;; Truncate title so the whole visible header fits within ~100 chars.
+              ;; Fixed prefix: "    ▶ + LABEL: " = 4+1+1+1+1+1+(length label)+2 = 11+(length label)
+              ;; Plus state and one space separator if state present.
+              (prefix-len  (+ 11 (length label)
+                               (if (and state-val (> (length state-val) 0))
+                                   (1+ (length state-val))
+                                 0)))
+              (title-max   (max 20 (- 100 prefix-len)))
+              (title-disp  (let ((flat (string-trim
+                                        (replace-regexp-in-string "[\n\r]+" " " clean))))
+                             (if (> (length flat) title-max)
+                                 (concat (substring flat 0 title-max) "…")
+                               flat)))
               (header-start (point)))
          (insert "    "
                  (propertize "▶" 'ejira-confirm-arrow t)
@@ -302,22 +291,18 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
                  " "
                  (propertize label 'face 'ejira-confirm-item)
                  ": "
-                 (if (and jira-state (> (length jira-state) 0))
-                     (concat (propertize jira-state 'face 'ejira-confirm-new-value) "  ")
+                 (if (and state-val (> (length state-val) 0))
+                     (concat (propertize state-val 'face 'ejira-confirm-summary) " ")
                    "")
-                 (propertize (ejira-confirm--truncate clean) 'face 'ejira-confirm-item)
+                 (propertize title-disp 'face 'ejira-confirm-item)
                  "\n")
          (let ((body-start (point)))
            (cond
             (fields
              (dolist (f fields)
                (let ((fname (nth 0 f)) (fval (nth 1 f)))
-                 ;; Translate state value to Jira name when displaying state field
-                 (let ((display-val (if (string= fname "state")
-                                        (or (ejira-confirm--jira-state-for-org fval) fval)
-                                      fval)))
-                   (when (and display-val (> (length display-val) 0))
-                     (ejira-confirm--insert-new-field fname display-val 8))))))
+                 (when (and fval (> (length fval) 0))
+                   (ejira-confirm--insert-new-field fname fval 8)))))
             ((and preview (> (length preview) 0))
              (ejira-confirm--insert-new-field "body" preview 8)))
            (ejira-confirm--register-node header-start body-start 'item t))))
@@ -373,17 +358,15 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
          (header-start (point)))
     (pcase op
       ('create
-       ;; Extract state for header
        (let* ((state-entry (cl-assoc "state" fields :test #'string=))
-              (state-val   (when state-entry (nth 1 state-entry)))
-              (jira-state  (ejira-confirm--jira-state-for-org state-val)))
+              (state-val   (when state-entry (nth 1 state-entry))))
          (insert "  "
                  (propertize "▶" 'ejira-confirm-arrow t)
                  " "
                  (propertize "+" 'face 'ejira-confirm-new)
                  "  "
-                 (if (and jira-state (> (length jira-state) 0))
-                     (concat (propertize jira-state 'face 'ejira-confirm-new-value) "  ")
+                 (if (and state-val (> (length state-val) 0))
+                     (concat (propertize state-val 'face 'ejira-confirm-summary) " ")
                    "")
                  (propertize title 'face 'ejira-confirm-item)
                  "\n")
@@ -392,11 +375,8 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
             (fields
              (dolist (f fields)
                (let ((fname (nth 0 f)) (fval (nth 1 f)))
-                 (let ((display-val (if (string= fname "state")
-                                        (or (ejira-confirm--jira-state-for-org fval) fval)
-                                      fval)))
-                   (when (and display-val (> (length display-val) 0))
-                     (ejira-confirm--insert-new-field fname display-val 6))))))
+                 (when (and fval (> (length fval) 0))
+                   (ejira-confirm--insert-new-field fname fval 6)))))
             ((and preview (> (length preview) 0))
              (ejira-confirm--insert-new-field "body" preview 6)))
            (ejira-confirm--register-node header-start body-start 'item t))))
@@ -485,21 +465,18 @@ ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
 
 (defun ejira-confirm-show (plans)
   "Display confirmation buffer for pending push PLANS."
-  ;; Capture org-todo-keywords-1 now while we're in the org buffer context.
-  (let* ((todo-kws (and (boundp 'org-todo-keywords-1) org-todo-keywords-1))
-         (grouped  (ejira-confirm--group-by-project-issue plans))
-         (counts   (let ((c nil))
-                     (dolist (p plans c)
-                       (let* ((op (plist-get p :op))
-                              (cell (assq op c)))
-                         (if cell (setcdr cell (1+ (cdr cell)))
-                           (push (cons op 1) c))))))
+  (let* ((grouped (ejira-confirm--group-by-project-issue plans))
+         (counts  (let ((c nil))
+                    (dolist (p plans c)
+                      (let* ((op (plist-get p :op))
+                             (cell (assq op c)))
+                        (if cell (setcdr cell (1+ (cdr cell)))
+                          (push (cons op 1) c))))))
          (buf (get-buffer-create "*ejira-confirm*")))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
         (ejira-confirm-mode)
-        (setq ejira-confirm--todo-keywords todo-kws)
         (ejira-confirm--insert-header (length plans) counts)
         (dolist (group grouped)
           (ejira-confirm--insert-project (car group) (cdr group)))
