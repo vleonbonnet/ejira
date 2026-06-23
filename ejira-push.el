@@ -13,7 +13,99 @@
 offers to push locally-edited issues and comments through a review buffer.")
 
 (defvar ejira--pushing nil
-  "Bound to t while a push writes the :Pushhash: baseline back.")
+  "Bound to t while a push batch is executing (inhibits re-scan on save).")
+
+(defun ejira--transition-to-org-state (key org-state todo-keywords)
+  "Try to transition Jira issue KEY to the state mapped from ORG-STATE.
+TODO-KEYWORDS is the buffer's org-todo-keywords-1 list used for index lookup.
+Returns t on success, nil if no matching transition was found or the call failed."
+  (when (and (stringp org-state)
+             (> (length org-state) 0)
+             todo-keywords
+             (boundp 'ejira-todo-states-alist))
+    (let* ((pos (cl-position org-state todo-keywords :test #'string=))
+           (idx (when pos (1+ pos))))
+      (when idx
+        (let* ((target-states
+                (delq nil (mapcar (lambda (e)
+                                    (when (= (cdr e) idx) (car e)))
+                                  ejira-todo-states-alist)))
+               (actions (condition-case nil
+                            (jiralib2-get-actions key)
+                          (error nil)))
+               (action (cl-find-if (lambda (a) (member (cdr a) target-states))
+                                   actions)))
+          (when action
+            (condition-case nil
+                (progn (jiralib2-do-action key (car action)) t)
+              (error nil))))))))
+
+(defun ejira--finalize-new-issue (new-key marker orig-state todo-keywords)
+  "Post-create housekeeping for a newly-created Jira issue NEW-KEY.
+Sets the org ID property, updates org-id-locations, tries to transition the Jira
+issue to ORIG-STATE before refreshing so the Pushhash is stamped with the final
+state.  If the transition is unavailable, force-sets the org state locally and
+updates the baseline so the next scan does not see a spurious dirty heading."
+  (org-with-point-at marker (org-set-property "ID" new-key))
+  (puthash new-key
+           (abbreviate-file-name (buffer-file-name (marker-buffer marker)))
+           org-id-locations)
+  (ejira--transition-to-org-state new-key orig-state todo-keywords)
+  (ejira--update-task new-key)
+  (when (and (stringp orig-state) (> (length orig-state) 0))
+    (let* ((m (ejira--find-heading new-key))
+           (cur (when m (org-with-point-at m
+                          (substring-no-properties (or (org-get-todo-state) ""))))))
+      (when (and m (not (equal cur orig-state)))
+        (org-with-point-at m (org-todo orig-state))
+        (org-with-point-at m (ejira--update-push-baseline))))))
+
+(defun ejira--push-scan-issue-children (parent-marker project-key)
+  "Return a list of child plists for the new issue heading at PARENT-MARKER.
+Each child plist has keys :marker :title :state :body.
+Only scans direct children (depth 1) — Jira subtasks cannot have subtasks."
+  (ignore project-key)
+  (let (children)
+    (org-with-wide-buffer
+     (save-excursion
+       (goto-char parent-marker)
+       (let* ((parent-level (org-current-level))
+              (end (save-excursion (org-end-of-subtree t) (point))))
+         (while (and (outline-next-heading) (< (point) end))
+           (when (= (org-current-level) (1+ parent-level))
+             (let* ((type       (org-entry-get nil "TYPE"))
+                    (todo-state (org-get-todo-state))
+                    (heading    (org-get-heading t t t t)))
+               (when (and todo-state
+                          (not type)
+                          (not (equal heading ejira-description-heading-name))
+                          (not (equal heading ejira-comments-heading-name)))
+                 (push (list :marker (point-marker)
+                             :title  (ejira--strip-properties heading)
+                             :state  (substring-no-properties (or todo-state ""))
+                             :body   (ejira--get-heading-body (point-marker)))
+                       children))))))))
+    (nreverse children)))
+
+(defun ejira--push-create-cascaded-subtask (parent-key project-key child todo-keywords)
+  "Create a Jira subtask for CHILD under PARENT-KEY in PROJECT-KEY.
+CHILD is a plist with :marker :title :state :body.
+TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
+  (let* ((child-marker (plist-get child :marker))
+         (orig-state   (plist-get child :state))
+         (summary (org-with-point-at child-marker
+                    (ejira--strip-properties (org-get-heading t t t t))))
+         (desc-heading (org-with-point-at child-marker
+                         (ejira--find-child-heading ejira-description-heading-name)))
+         (desc (if desc-heading
+                   (ejira-parser-org-to-jira (ejira--get-heading-body desc-heading))
+                 ""))
+         (result (jiralib2-create-issue
+                  project-key ejira-subtask-type-name
+                  summary desc
+                  `(parent . ((key . ,parent-key)))))
+         (new-key (ejira--alist-get result 'key)))
+    (ejira--finalize-new-issue new-key child-marker orig-state todo-keywords)))
 
 (defun ejira--push-finalize (marker)
   "Refresh MARKER's push baseline after a successful push and save its buffer."
@@ -149,14 +241,16 @@ offers to push locally-edited issues and comments through a review buffer.")
                                                :project-key project-key))
                              ops)))
                     ((equal parent-type "ejira-project")
-                     (push (list :op 'create
-                                 :object 'issue
-                                 :key nil
-                                 :project parent-id
-                                 :parent-issue nil
-                                 :marker marker
-                                 :data (list :project-key parent-id))
-                           ops)))))
+                     (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                       (push (list :op 'create
+                                   :object 'issue
+                                   :key nil
+                                   :project parent-id
+                                   :parent-issue nil
+                                   :marker marker
+                                   :data (list :project-key parent-id
+                                               :children children))
+                             ops))))))
                ;; Rule G: New comment draft — heading directly under Comments,
                ;; no CommId yet.  Catches manually-added plain headings and
                ;; org-capture stubs (TYPE=ejira-comment, no CommId).
@@ -404,7 +498,10 @@ offers to push locally-edited issues and comments through a review buffer.")
                              :fields fields
                              :send (let ((marker marker) (project-key project-key)
                                          (parent-key parent-key)
-                                         (orig-state local-state))
+                                         (orig-state local-state)
+                                         (todo-kws (org-with-point-at marker
+                                                      (when (boundp 'org-todo-keywords-1)
+                                                        org-todo-keywords-1))))
                                      (lambda ()
                                        (let* ((summary (org-with-point-at marker
                                                           (ejira--strip-properties
@@ -421,28 +518,11 @@ offers to push locally-edited issues and comments through a review buffer.")
                                                        summary desc
                                                        `(parent . ((key . ,parent-key)))))
                                               (new-key (ejira--alist-get result 'key)))
-                                         (org-with-point-at marker
-                                           (org-set-property "ID" new-key))
-                                         (puthash new-key
-                                                  (abbreviate-file-name
-                                                   (buffer-file-name (marker-buffer marker)))
-                                                  org-id-locations)
-                                         (ejira--update-task new-key)
-                                         ;; Jira always creates issues in the project's initial
-                                         ;; state; ejira--update-task overwrites the local org
-                                         ;; state with that initial state.  Restore the original
-                                         ;; state so the user's intent is preserved.
-                                         (when (and (stringp orig-state) (> (length orig-state) 0))
-                                           (let* ((m (ejira--find-heading new-key))
-                                                  (cur (when m
-                                                         (org-with-point-at m
-                                                           (substring-no-properties
-                                                            (or (org-get-todo-state) ""))))))
-                                             (when (and m (not (equal cur orig-state)))
-                                               (org-with-point-at m
-                                                 (org-todo orig-state))))))))))))
+                                         (ejira--finalize-new-issue
+                                          new-key marker orig-state todo-kws))))))))
          ((and (eq op-type 'create) (eq object 'issue))
           (let* ((project-key (plist-get data :project-key))
+                 (children    (plist-get data :children))
                  (heading-title (org-with-point-at marker
                                   (ejira--strip-properties (org-get-heading t t t t))))
                  (local-body (ejira--get-heading-body marker))
@@ -457,7 +537,13 @@ offers to push locally-edited issues and comments through a review buffer.")
                              :title (format "new issue: %s" heading-title)
                              :parent-issue nil
                              :fields fields
-                             :send (let ((marker marker) (project-key project-key))
+                             :children children
+                             :send (let ((marker marker) (project-key project-key)
+                                         (orig-state local-state)
+                                         (children children)
+                                         (todo-kws (org-with-point-at marker
+                                                      (when (boundp 'org-todo-keywords-1)
+                                                        org-todo-keywords-1))))
                                      (lambda ()
                                        (let* ((summary (org-with-point-at marker
                                                           (ejira--strip-properties
@@ -474,13 +560,15 @@ offers to push locally-edited issues and comments through a review buffer.")
                                                        (or ejira-story-type-name "Task")
                                                        summary desc))
                                               (new-key (ejira--alist-get result 'key)))
-                                         (org-with-point-at marker
-                                           (org-set-property "ID" new-key))
-                                         (puthash new-key
-                                                  (abbreviate-file-name
-                                                   (buffer-file-name (marker-buffer marker)))
-                                                  org-id-locations)
-                                         (ejira--update-task new-key))))))))
+                                         (ejira--finalize-new-issue
+                                          new-key marker orig-state todo-kws)
+                                         (dolist (child children)
+                                           (condition-case err
+                                               (ejira--push-create-cascaded-subtask
+                                                new-key project-key child todo-kws)
+                                             (error
+                                              (message "ejira: cascade subtask failed: %s"
+                                                       (error-message-string err))))))))))))
          ((and (eq op-type 'create) (eq object 'comment))
           (let* ((issue-key (plist-get data :issue-key))
                  (preview (let ((body (ejira--get-heading-body marker)))

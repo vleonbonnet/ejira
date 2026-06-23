@@ -28,6 +28,10 @@
 
 (require 'cl-lib)
 
+(defvar ejira--pushing nil
+  "Bound to t while ejira-push is executing a batch; inhibits re-scan on save.
+Defined in ejira-push.el; declared here so ejira-confirm-execute can bind it.")
+
 ;;; ── Faces ────────────────────────────────────────────────────────────────────
 
 (defface ejira-confirm-title
@@ -351,10 +355,11 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
 
 (defun ejira-confirm--insert-item (plan)
   "Insert a top-level plan item (no parent issue)."
-  (let* ((op      (plist-get plan :op))
-         (title   (plist-get plan :title))
-         (fields  (plist-get plan :fields))
-         (preview (plist-get plan :preview))
+  (let* ((op       (plist-get plan :op))
+         (title    (plist-get plan :title))
+         (fields   (plist-get plan :fields))
+         (preview  (plist-get plan :preview))
+         (children (plist-get plan :children))
          (header-start (point)))
     (pcase op
       ('create
@@ -379,6 +384,22 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
                    (ejira-confirm--insert-new-field fname fval 6)))))
             ((and preview (> (length preview) 0))
              (ejira-confirm--insert-new-field "body" preview 6)))
+           (dolist (child children)
+             (let* ((child-title (plist-get child :title))
+                    (child-state (plist-get child :state))
+                    (child-body  (plist-get child :body))
+                    (child-plan  (list :op 'create
+                                       :object 'subtask
+                                       :title (format "new subtask: %s" child-title)
+                                       :fields (delq nil
+                                                     (list (list "title" child-title)
+                                                           (when (and child-state
+                                                                      (> (length child-state) 0))
+                                                             (list "state" child-state))
+                                                           (when (and child-body
+                                                                      (> (length child-body) 0))
+                                                             (list "description" child-body)))))))
+               (ejira-confirm--insert-subitem child-plan)))
            (ejira-confirm--register-node header-start body-start 'item t))))
       ('update
        ;; Standalone update not inside an issue node (fallback)
@@ -492,12 +513,15 @@ ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
   (interactive)
   (let ((plans ejira-confirm--plans))
     (quit-window t)
-    (dolist (plan plans)
-      (condition-case err
-          (funcall (plist-get plan :send))
-        (error (message "ejira: push failed for %s: %s"
-                        (plist-get plan :title)
-                        (error-message-string err)))))))
+    ;; Bind ejira--pushing for the entire batch so that any org saves triggered
+    ;; by state restoration or property writes do not re-invoke ejira--push-on-save.
+    (let ((ejira--pushing t))
+      (dolist (plan plans)
+        (condition-case err
+            (funcall (plist-get plan :send))
+          (error (message "ejira: push failed for %s: %s"
+                          (plist-get plan :title)
+                          (error-message-string err))))))))
 
 (defun ejira-confirm-cancel ()
   "Cancel the push and close the confirmation buffer."
