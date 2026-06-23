@@ -52,7 +52,8 @@ offers to push locally-edited issues and comments through a review buffer.")
                  (push (list :op 'delete
                              :object 'comment
                              :key (org-entry-get nil "CommId")
-                             :project nil
+                             :project (when-let ((ik (org-entry-get nil "ID" t))) (car (split-string ik "-")))
+                             :parent-issue (org-entry-get nil "ID" t)
                              :marker marker
                              :data (list :issue-key (org-entry-get nil "ID" t)
                                          :commid (org-entry-get nil "CommId")
@@ -65,13 +66,12 @@ offers to push locally-edited issues and comments through a review buffer.")
                           (not (equal type "ejira-comment"))
                           (ejira--locally-modified-p)
                           (not pending-delete))
-                 (let ((proj (condition-case nil
-                                 (ejira--get-project id)
-                               (error nil))))
+                 (let ((proj (car (split-string id "-"))))
                    (push (list :op 'update
                                :object 'issue
                                :key id
                                :project proj
+                               :parent-issue id
                                :marker marker
                                :data nil)
                          ops)))
@@ -82,13 +82,12 @@ offers to push locally-edited issues and comments through a review buffer.")
                           (not pending-delete))
                  (let* ((commid (org-entry-get nil "CommId"))
                         (issue-key (org-entry-get nil "ID" t))
-                        (proj (condition-case nil
-                                  (ejira--get-project issue-key)
-                                (error nil))))
+                        (proj (car (split-string issue-key "-"))))
                    (push (list :op 'update
                                :object 'comment
                                :key commid
                                :project proj
+                               :parent-issue issue-key
                                :marker marker
                                :data (list :issue-key issue-key
                                            :commid commid))
@@ -98,7 +97,8 @@ offers to push locally-edited issues and comments through a review buffer.")
                  (push (list :op 'update
                              :object 'status
                              :key id
-                             :project (condition-case nil (ejira--get-project id) (error nil))
+                             :project (car (split-string id "-"))
+                             :parent-issue id
                              :marker marker
                              :data (list :action-name pending-transition))
                        ops))
@@ -107,7 +107,8 @@ offers to push locally-edited issues and comments through a review buffer.")
                  (push (list :op 'update
                              :object 'issuetype
                              :key id
-                             :project (condition-case nil (ejira--get-project id) (error nil))
+                             :project (car (split-string id "-"))
+                             :parent-issue id
                              :marker marker
                              :data (list :new-type pending-issuetype
                                          :old-type (org-entry-get nil "Issuetype")))
@@ -117,7 +118,8 @@ offers to push locally-edited issues and comments through a review buffer.")
                  (push (list :op 'update
                              :object 'epic
                              :key id
-                             :project (condition-case nil (ejira--get-project id) (error nil))
+                             :project (car (split-string id "-"))
+                             :parent-issue id
                              :marker marker
                              :data (list :new-epic pending-epic))
                        ops))
@@ -136,13 +138,12 @@ offers to push locally-edited issues and comments through a review buffer.")
                    (cond
                     ((member parent-type '("ejira-issue" "ejira-story"
                                           "ejira-epic" "ejira-subtask"))
-                     (let ((project-key (condition-case nil
-                                            (ejira--get-project parent-id)
-                                          (error nil))))
+                     (let ((project-key (car (split-string parent-id "-"))))
                        (push (list :op 'create
                                    :object 'subtask
                                    :key nil
                                    :project project-key
+                                   :parent-issue parent-id
                                    :marker marker
                                    :data (list :parent-key parent-id
                                                :project-key project-key))
@@ -152,6 +153,7 @@ offers to push locally-edited issues and comments through a review buffer.")
                                  :object 'issue
                                  :key nil
                                  :project parent-id
+                                 :parent-issue nil
                                  :marker marker
                                  :data (list :project-key parent-id))
                            ops)))))
@@ -171,15 +173,13 @@ offers to push locally-edited issues and comments through a review buffer.")
                              (org-up-heading-safe)
                              (when (org-up-heading-safe)
                                (org-entry-get nil "ID")))))
-                        (proj (when issue-key
-                                (condition-case nil
-                                    (ejira--get-project issue-key)
-                                  (error nil)))))
+                        (proj (when issue-key (car (split-string issue-key "-")))))
                    (when issue-key
                      (push (list :op 'create
                                  :object 'comment
                                  :key nil
                                  :project proj
+                                 :parent-issue issue-key
                                  :marker marker
                                  :data (list :issue-key issue-key))
                            ops)))))
@@ -212,7 +212,7 @@ offers to push locally-edited issues and comments through a review buffer.")
               (condition-case err
                   (apply #'jiralib2-jql-search
                          (format "key in (%s)" (s-join ", " keys))
-                         (ejira--get-fields-to-sync))
+                         '("summary" "description" "assignee" "priority" "duedate"))
                 (error
                  (message "ejira: failed to fetch remote state: %s"
                           (error-message-string err))
@@ -252,7 +252,8 @@ offers to push locally-edited issues and comments through a review buffer.")
                            `(("summary"     ,remote-summary  ,local-summary)
                              ("description" ,(or remote-desc-org "") ,local-desc-org)
                              ("assignee"    ,remote-assignee ,local-assignee)
-                             ("priority"    ,(or remote-priority-name "") ,(or local-priority-name ""))
+                             ,@(when local-priority-name
+                                 `(("priority" ,(or remote-priority-name "") ,local-priority-name)))
                              ("deadline"    ,(or remote-deadline "") ,(or local-deadline "")))))
                  (summary-changed (assoc "summary" changes))
                  (desc-changed (assoc "description" changes))
@@ -264,6 +265,7 @@ offers to push locally-edited issues and comments through a review buffer.")
                           :object 'issue
                           :project project
                           :title key
+                          :parent-issue key
                           :changes changes
                           :send (let ((key key) (marker marker)
                                       (local-summary local-summary)
@@ -321,6 +323,7 @@ offers to push locally-edited issues and comments through a review buffer.")
                                :object 'comment
                                :project project
                                :title (format "%s comment %s" issue-key commid)
+                               :parent-issue issue-key
                                :changes changes
                                :send (let ((issue-key issue-key) (commid commid) (marker marker))
                                        (lambda ()
@@ -335,6 +338,7 @@ offers to push locally-edited issues and comments through a review buffer.")
                              :object 'status
                              :project project
                              :title key
+                             :parent-issue key
                              :changes `(("transition" "" ,action-name))
                              :send (let ((key key) (marker marker) (action-name action-name))
                                      (lambda ()
@@ -357,6 +361,7 @@ offers to push locally-edited issues and comments through a review buffer.")
                              :object 'issuetype
                              :project project
                              :title key
+                             :parent-issue key
                              :changes `(("issuetype" ,(or old-type "") ,new-type))
                              :send (let ((key key) (marker marker) (new-type new-type))
                                      (lambda ()
@@ -370,6 +375,7 @@ offers to push locally-edited issues and comments through a review buffer.")
                              :object 'epic
                              :project project
                              :title key
+                             :parent-issue key
                              :changes `(("epic" "" ,new-epic))
                              :send (let ((key key) (marker marker) (new-epic new-epic))
                                      (lambda ()
@@ -382,17 +388,19 @@ offers to push locally-edited issues and comments through a review buffer.")
                  (project-key (plist-get data :project-key))
                  (heading-title (org-with-point-at marker
                                   (ejira--strip-properties (org-get-heading t t t t))))
-                 (preview (let ((body (ejira--get-heading-body marker)))
-                            (if (and body (> (length body) 0))
-                                (substring body 0 (min 80 (length body)))
-                              "(no body)"))))
+                 (local-body (ejira--get-heading-body marker))
+                 (local-state (org-with-point-at marker
+                                (substring-no-properties (or (org-get-todo-state) ""))))
+                 (fields `(("state" ,local-state)
+                           ("description" ,(or local-body "")))))
             (setq plan (list :op 'create
                              :object 'subtask
                              :project project-key
                              :title (format "new subtask: %s"
                                             (substring heading-title
                                                        0 (min 60 (length heading-title))))
-                             :preview preview
+                             :parent-issue parent-key
+                             :fields fields
                              :send (let ((marker marker) (project-key project-key)
                                          (parent-key parent-key))
                                      (lambda ()
@@ -422,15 +430,17 @@ offers to push locally-edited issues and comments through a review buffer.")
           (let* ((project-key (plist-get data :project-key))
                  (heading-title (org-with-point-at marker
                                   (ejira--strip-properties (org-get-heading t t t t))))
-                 (preview (let ((body (ejira--get-heading-body marker)))
-                            (if (and body (> (length body) 0))
-                                (substring body 0 (min 80 (length body)))
-                              "(no body)"))))
+                 (local-body (ejira--get-heading-body marker))
+                 (local-state (org-with-point-at marker
+                                (substring-no-properties (or (org-get-todo-state) ""))))
+                 (fields `(("state" ,local-state)
+                           ("description" ,(or local-body "")))))
             (setq plan (list :op 'create
                              :object 'issue
                              :project project-key
                              :title (format "new issue: %s" heading-title)
-                             :preview preview
+                             :parent-issue nil
+                             :fields fields
                              :send (let ((marker marker) (project-key project-key))
                                      (lambda ()
                                        (let* ((summary (org-with-point-at marker
@@ -465,6 +475,7 @@ offers to push locally-edited issues and comments through a review buffer.")
                              :object 'comment
                              :project project
                              :title (format "new comment on %s" issue-key)
+                             :parent-issue issue-key
                              :preview preview
                              :send (let ((marker marker) (issue-key issue-key))
                                      (lambda ()
@@ -485,6 +496,7 @@ offers to push locally-edited issues and comments through a review buffer.")
                              :object 'comment
                              :project project
                              :title (format "delete comment on %s" issue-key)
+                             :parent-issue issue-key
                              :preview (or body "(empty)")
                              :send (let ((issue-key issue-key) (commid commid) (marker marker))
                                      (lambda ()

@@ -5,19 +5,21 @@
 ;;; Commentary:
 
 ;; Provides a dedicated major mode for reviewing pending push changes
-;; before sending them to the Jira API.  Modeled on orgist-confirm.el.
+;; before sending them to the Jira API.
 ;;
-;; Three-level tree: project > item > field
+;; Tree layout: project > issue-node > field / subitem > field
 ;;
-;;   Ejira Push — 3 item(s): 1 new, 1 modified, 1 deleted
-;;   ═══════════════════════════════════════════════════════
-;;   ▼ RNDSEC  2 new, 1 modified
-;;     + new subtask: My heading title
-;;     ▶ ✎ RNDSEC-123  summary, assignee
-;;       ── old ──
-;;       ...
-;;     ✗ delete comment on RNDSEC-456  ⚠ permanent
-;;       "Comment body preview…"
+;;   Ejira Push — 3 items: 1 new, 1 modified
+;;   ══════════════════════════════════════════
+;;   ▼ RNDSEC  1 new, 1 modified
+;;     ▼ ✎ RNDSEC-123  summary, 1 new subtask
+;;       ▶ summary:     "old title" → "new title"
+;;       ▶ + subtask: My new task
+;;           ▶ state:        TODO
+;;           ▶ description:  "Body text…"
+;;
+;; Overlay visibility: project/issue nodes start expanded (▼); field and
+;; subitem nodes start collapsed (▶).  TAB or click ▶/▼ to toggle.
 ;;
 ;; C-c C-c sends all items, C-c C-k aborts.  TAB toggles sections.
 
@@ -25,10 +27,10 @@
 
 (require 'cl-lib)
 
-;;; Faces
+;;; ── Faces ────────────────────────────────────────────────────────────────────
 
 (defface ejira-confirm-title
-  '((t :weight bold :height 1.2))
+  '((t :weight bold))
   "Face for the confirmation buffer title."
   :group 'ejira)
 
@@ -59,7 +61,7 @@
 
 (defface ejira-confirm-summary
   '((t :inherit font-lock-comment-face))
-  "Face for summary text."
+  "Face for summary/dim text."
   :group 'ejira)
 
 (defface ejira-confirm-key
@@ -82,7 +84,7 @@
   "Face for deletion warning text."
   :group 'ejira)
 
-;;; Buffer-local state
+;;; ── Buffer-local state ───────────────────────────────────────────────────────
 
 (defvar-local ejira-confirm--plans nil)
 
@@ -90,48 +92,340 @@
   "List of plists (:marker MARKER :overlay OVERLAY :level LEVEL).
 LEVEL is one of: project item field.")
 
-;;; Diff helpers
+;;; ── Diff helpers ─────────────────────────────────────────────────────────────
 
 (defun ejira-confirm--normalize (s)
-  "Normalize string S for comparison: nil to empty, strip CR, trim."
+  "Normalize S for comparison and display: nil→\"\", strip CR, trim."
   (string-trim (replace-regexp-in-string "\r" "" (or s ""))))
 
 (defun ejira-confirm-field-changes (fields)
-  "Filter FIELDS down to entries whose old and new values differ.
+  "Filter FIELDS to entries whose old and new values differ.
 FIELDS is a list of (NAME OLD NEW) string triples."
   (cl-remove-if (lambda (f)
                   (equal (ejira-confirm--normalize (nth 1 f))
                          (ejira-confirm--normalize (nth 2 f))))
                 fields))
 
-;;; Grouping helpers
+;;; ── Grouping ─────────────────────────────────────────────────────────────────
 
-(defun ejira-confirm--group-by-project (plans)
-  "Return alist (project-key . plans-list) sorted alphabetically."
+(defun ejira-confirm--group-by-project-issue (plans)
+  "Return alist (project . alist(issue-or-nil . plans)) sorted by project."
   (let (groups)
     (dolist (plan plans)
-      (let* ((proj (or (plist-get plan :project) "?"))
-             (cell (assoc proj groups)))
-        (if cell (setcdr cell (append (cdr cell) (list plan)))
-          (push (cons proj (list plan)) groups))))
+      (let* ((proj  (or (plist-get plan :project) "?"))
+             (issue (plist-get plan :parent-issue))
+             (proj-cell (or (assoc proj groups)
+                            (let ((c (cons proj nil)))
+                              (push c groups) c)))
+             (issue-cell (or (assoc issue (cdr proj-cell))
+                             (let ((c (cons issue nil)))
+                               (setcdr proj-cell
+                                       (append (cdr proj-cell) (list c)))
+                               c))))
+        (setcdr issue-cell (append (cdr issue-cell) (list plan)))))
     (sort groups (lambda (a b) (string< (car a) (car b))))))
 
-(defun ejira-confirm--count-ops (plans)
-  "Return alist of (op-symbol . count) for PLANS."
-  (let ((counts '()))
-    (dolist (plan plans)
-      (let* ((op (plist-get plan :op))
-             (cell (assq op counts)))
-        (if cell (setcdr cell (1+ (cdr cell)))
-          (push (cons op 1) counts))))
-    counts))
+;;; ── Summary helpers ──────────────────────────────────────────────────────────
 
-;;; Entry point
+(defun ejira-confirm--op-summary (plans &optional prefix)
+  "One-line count summary for PLANS, optionally prefixed with PREFIX."
+  (let* ((n-create (cl-count-if (lambda (p) (eq (plist-get p :op) 'create)) plans))
+         (n-update (cl-count-if (lambda (p) (eq (plist-get p :op) 'update)) plans))
+         (n-delete (cl-count-if (lambda (p) (eq (plist-get p :op) 'delete)) plans))
+         (parts nil))
+    (when (> n-create 0) (push (format "%d new"      n-create) parts))
+    (when (> n-update 0) (push (format "%d modified" n-update) parts))
+    (when (> n-delete 0) (push (format "%d deleted"  n-delete) parts))
+    (if parts
+        (concat (or prefix "  ") (string-join (nreverse parts) ", "))
+      "")))
+
+(defun ejira-confirm--issue-summary (plans)
+  "One-line summary for an issue node header given its PLANS."
+  (let* ((update  (cl-find-if (lambda (p) (and (eq (plist-get p :op) 'update)
+                                               (eq (plist-get p :object) 'issue)))
+                              plans))
+         (creates (cl-remove-if-not (lambda (p) (eq (plist-get p :op) 'create)) plans))
+         (deletes (cl-remove-if-not (lambda (p) (eq (plist-get p :op) 'delete)) plans))
+         (parts nil))
+    (when update
+      (when-let ((fields (mapcar #'car (plist-get update :changes))))
+        (push (string-join fields ", ") parts)))
+    (let ((n-sub (cl-count-if (lambda (p) (eq (plist-get p :object) 'subtask)) creates))
+          (n-cmt (cl-count-if (lambda (p) (eq (plist-get p :object) 'comment)) creates))
+          (n-iss (cl-count-if (lambda (p) (eq (plist-get p :object) 'issue))   creates)))
+      (when (> n-sub 0) (push (format "%d new subtask%s" n-sub (if (= n-sub 1) "" "s")) parts))
+      (when (> n-cmt 0) (push (format "%d new comment%s" n-cmt (if (= n-cmt 1) "" "s")) parts))
+      (when (> n-iss 0) (push (format "%d new issue%s"   n-iss (if (= n-iss 1) "" "s")) parts)))
+    (when (> (length deletes) 0)
+      (push (format "%d deleted" (length deletes)) parts))
+    (if parts (concat "  " (string-join (nreverse parts) ", ")) "")))
+
+;;; ── Node registry ────────────────────────────────────────────────────────────
+;;
+;; Each collapsible section registers itself via ejira-confirm--register-node.
+;; Visibility rules:
+;;   project / issue-node → start VISIBLE  (▼, start-hidden=nil)
+;;   subitem / top-level-item → start HIDDEN  (▶, start-hidden=t)
+;;   diff-field / new-field → start HIDDEN  (▶, start-hidden=t)
+
+(defun ejira-confirm--register-node (header-start detail-start level start-hidden)
+  "Register a collapsible overlay from DETAIL-START to point.
+HEADER-START is the beginning of the header line; LEVEL is a symbol.
+When START-HIDDEN is non-nil the body starts invisible."
+  (let ((ov (make-overlay detail-start (point))))
+    (overlay-put ov 'invisible start-hidden)
+    (overlay-put ov 'ejira-confirm-node t)
+    (push (list :marker (copy-marker header-start) :overlay ov :level level)
+          ejira-confirm--nodes)))
+
+;;; ── Core field primitives ────────────────────────────────────────────────────
+;;
+;; Both insert-diff-field and insert-new-field:
+;;   • render a one-line header row with ▶ (fields always start collapsed)
+;;   • register a hidden overlay for the expanded body
+;;   • push a node entry onto ejira-confirm--nodes
+
+(defun ejira-confirm--truncate (s)
+  "Flatten and truncate S for one-line display."
+  (let ((flat (string-trim (replace-regexp-in-string "[\n\r]+" " " (or s "")))))
+    (if (length> flat 55)
+        (concat "\"" (substring flat 0 55) "…\"")
+      (format "%S" flat))))
+
+(defun ejira-confirm--insert-diff-field (name old new indent)
+  "Insert an expandable OLD → NEW diff row for field NAME at INDENT spaces."
+  (let ((pad  (make-string indent ?\s))
+        (bpad (make-string (+ indent 4) ?\s))
+        (header-start (point)))
+    (insert pad
+            (propertize "▶" 'ejira-confirm-arrow t)
+            " "
+            (propertize (format "%-14s" (concat name ":")) 'face 'ejira-confirm-field-name)
+            (propertize (ejira-confirm--truncate old) 'face 'ejira-confirm-old-value)
+            " → "
+            (propertize (ejira-confirm--truncate new) 'face 'ejira-confirm-new-value)
+            "\n")
+    (let ((detail-start (point)))
+      (insert (propertize (concat bpad "── old ──\n") 'face 'ejira-confirm-summary))
+      (dolist (line (split-string (ejira-confirm--normalize old) "\n"))
+        (insert bpad (propertize line 'face 'ejira-confirm-old-value) "\n"))
+      (insert (propertize (concat bpad "── new ──\n") 'face 'ejira-confirm-summary))
+      (dolist (line (split-string (ejira-confirm--normalize new) "\n"))
+        (insert bpad (propertize line 'face 'ejira-confirm-new-value) "\n"))
+      (ejira-confirm--register-node header-start detail-start 'field t))))
+
+(defun ejira-confirm--insert-new-field (name value indent)
+  "Insert an expandable new-value row for field NAME at INDENT spaces."
+  (let ((pad  (make-string indent ?\s))
+        (bpad (make-string (+ indent 4) ?\s))
+        (header-start (point)))
+    (insert pad
+            (propertize "▶" 'ejira-confirm-arrow t)
+            " "
+            (propertize (format "%-14s" (concat name ":")) 'face 'ejira-confirm-field-name)
+            (propertize (ejira-confirm--truncate value) 'face 'ejira-confirm-new-value)
+            "\n")
+    (let ((detail-start (point)))
+      (dolist (line (split-string (ejira-confirm--normalize value) "\n"))
+        (insert bpad (propertize line 'face 'ejira-confirm-new-value) "\n"))
+      (ejira-confirm--register-node header-start detail-start 'field t))))
+
+;;; ── Subitem (create/delete inside an issue node) ─────────────────────────────
+;;
+;; Subitems start collapsed (▶).  Expanding one reveals its fields, which are
+;; themselves individually collapsible via insert-new-field.
+
+(defun ejira-confirm--insert-subitem (plan)
+  "Insert a create/delete plan inside an issue node at indent=4."
+  (let* ((op      (plist-get plan :op))
+         (object  (plist-get plan :object))
+         (title   (plist-get plan :title))
+         (fields  (plist-get plan :fields))
+         (preview (plist-get plan :preview)))
+    (pcase op
+      ('create
+       (let* ((label (pcase object ('subtask "subtask") ('comment "comment") (_ "new")))
+              (clean (replace-regexp-in-string "^new [a-z]+: " "" (or title "")))
+              (header-start (point)))
+         (insert "    "
+                 (propertize "▶" 'ejira-confirm-arrow t)
+                 " "
+                 (propertize "+" 'face 'ejira-confirm-new)
+                 " "
+                 (propertize (concat label ": " clean) 'face 'ejira-confirm-item)
+                 "\n")
+         (let ((body-start (point)))
+           (cond
+            (fields
+             (dolist (f fields)
+               (let ((fname (nth 0 f)) (fval (nth 1 f)))
+                 (when (and fval (> (length fval) 0))
+                   (ejira-confirm--insert-new-field fname fval 8)))))
+            ((and preview (> (length preview) 0))
+             (ejira-confirm--insert-new-field "body" preview 8)))
+           (ejira-confirm--register-node header-start body-start 'item t))))
+      ('delete
+       (insert "    "
+               (propertize "✗" 'face 'ejira-confirm-deleted)
+               " "
+               (propertize (or title "") 'face 'ejira-confirm-deleted)
+               "  "
+               (propertize "⚠ permanent" 'face 'ejira-confirm-warning)
+               "\n")
+       (when (and preview (> (length preview) 0))
+         (let ((header-start (point)))
+           (ejira-confirm--insert-new-field "body" preview 8)))))))
+
+;;; ── Issue node ───────────────────────────────────────────────────────────────
+;;
+;; Issue nodes start expanded (▼).  They contain diff-fields for any updates
+;; and subitem entries for creates/deletes — all of which start collapsed.
+
+(defun ejira-confirm--insert-issue-node (issue-key plans)
+  "Insert a collapsible issue node for ISSUE-KEY containing PLANS."
+  (let* ((summary     (ejira-confirm--issue-summary plans))
+         (update-plan (cl-find-if (lambda (p) (and (eq (plist-get p :op) 'update)
+                                                   (eq (plist-get p :object) 'issue)))
+                                  plans))
+         (sub-plans   (cl-remove update-plan plans))
+         (header-start (point)))
+    (insert "  "
+            (propertize "▼" 'ejira-confirm-arrow t)
+            " "
+            (if update-plan "✎ " "")
+            (propertize issue-key 'face 'ejira-confirm-item)
+            (propertize summary 'face 'ejira-confirm-summary)
+            "\n")
+    (let ((body-start (point)))
+      (when update-plan
+        (dolist (change (plist-get update-plan :changes))
+          (ejira-confirm--insert-diff-field
+           (nth 0 change) (nth 1 change) (nth 2 change) 4)))
+      (dolist (plan sub-plans)
+        (ejira-confirm--insert-subitem plan))
+      (ejira-confirm--register-node header-start body-start 'item nil))))
+
+;;; ── Top-level item (new issue with no parent) ────────────────────────────────
+
+(defun ejira-confirm--insert-item (plan)
+  "Insert a top-level plan item (no parent issue)."
+  (let* ((op      (plist-get plan :op))
+         (title   (plist-get plan :title))
+         (fields  (plist-get plan :fields))
+         (preview (plist-get plan :preview))
+         (header-start (point)))
+    (pcase op
+      ('create
+       (insert "  "
+               (propertize "▶" 'ejira-confirm-arrow t)
+               " "
+               (propertize "+" 'face 'ejira-confirm-new)
+               "  "
+               (propertize title 'face 'ejira-confirm-item)
+               "\n")
+       (let ((body-start (point)))
+         (cond
+          (fields
+           (dolist (f fields)
+             (let ((fname (nth 0 f)) (fval (nth 1 f)))
+               (when (and fval (> (length fval) 0))
+                 (ejira-confirm--insert-new-field fname fval 6)))))
+          ((and preview (> (length preview) 0))
+           (ejira-confirm--insert-new-field "body" preview 6)))
+         (ejira-confirm--register-node header-start body-start 'item t)))
+      ('update
+       ;; Standalone update not inside an issue node (fallback, shouldn't normally happen)
+       (let* ((changes (plist-get plan :changes))
+              (field-names (mapcar #'car changes)))
+         (insert "  "
+                 (propertize "▼" 'ejira-confirm-arrow t)
+                 " ✎ "
+                 (propertize title 'face 'ejira-confirm-item)
+                 (propertize (concat "  " (string-join field-names ", "))
+                             'face 'ejira-confirm-summary)
+                 "\n")
+         (let ((body-start (point)))
+           (dolist (change changes)
+             (ejira-confirm--insert-diff-field
+              (nth 0 change) (nth 1 change) (nth 2 change) 4))
+           (ejira-confirm--register-node header-start body-start 'item nil))))
+      ('delete
+       (insert "  "
+               (propertize "✗" 'face 'ejira-confirm-deleted)
+               " "
+               (propertize title 'face 'ejira-confirm-deleted)
+               "  "
+               (propertize "⚠ permanent" 'face 'ejira-confirm-warning)
+               "\n")
+       (when (and preview (> (length preview) 0))
+         (let ((body-start (point)))
+           (ejira-confirm--insert-new-field "body" preview 6)))))))
+
+;;; ── Project section ──────────────────────────────────────────────────────────
+;;
+;; Project sections start expanded (▼).
+
+(defun ejira-confirm--insert-project (project-key issue-groups)
+  "Insert a collapsible project section.
+ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
+  (let* ((all-plans  (mapcan (lambda (g) (copy-sequence (cdr g))) issue-groups))
+         (summary    (ejira-confirm--op-summary all-plans))
+         (header-start (point)))
+    (insert (propertize "▼" 'ejira-confirm-arrow t)
+            " "
+            (propertize project-key 'face 'ejira-confirm-project)
+            (propertize summary 'face 'ejira-confirm-summary)
+            "\n")
+    (let ((body-start (point)))
+      (dolist (group issue-groups)
+        (let ((issue-key (car group))
+              (plans     (cdr group)))
+          (if issue-key
+              (ejira-confirm--insert-issue-node issue-key plans)
+            (dolist (plan plans)
+              (ejira-confirm--insert-item plan)))))
+      (insert "\n")
+      (ejira-confirm--register-node header-start body-start 'project nil))))
+
+;;; ── Header / footer ──────────────────────────────────────────────────────────
+
+(defun ejira-confirm--insert-header (n counts)
+  "Insert buffer header for N items with op COUNTS alist."
+  (let* ((n-create (alist-get 'create counts 0))
+         (n-update (alist-get 'update counts 0))
+         (n-delete (alist-get 'delete counts 0))
+         (parts nil))
+    (when (> n-create 0) (push (format "%d new"      n-create) parts))
+    (when (> n-update 0) (push (format "%d modified" n-update) parts))
+    (when (> n-delete 0) (push (format "%d deleted"  n-delete) parts))
+    (let ((line (format "Ejira Push — %d item%s%s"
+                        n
+                        (if (= n 1) "" "s")
+                        (if parts (concat ": " (string-join (nreverse parts) ", ")) ""))))
+      (insert (propertize line 'face 'ejira-confirm-title)
+              "\n"
+              (make-string (string-width line) ?═)
+              "\n\n"))))
+
+(defun ejira-confirm--insert-footer ()
+  "Insert the keybinding footer."
+  (insert "\n"
+          (propertize "C-c C-c" 'face 'ejira-confirm-key) "  Push    "
+          (propertize "C-c C-k" 'face 'ejira-confirm-key) "  Cancel    "
+          (propertize "TAB"     'face 'ejira-confirm-key) "  Toggle\n"))
+
+;;; ── Entry point ──────────────────────────────────────────────────────────────
 
 (defun ejira-confirm-show (plans)
   "Display confirmation buffer for pending push PLANS."
-  (let* ((grouped (ejira-confirm--group-by-project plans))
-         (counts (ejira-confirm--count-ops plans))
+  (let* ((grouped (ejira-confirm--group-by-project-issue plans))
+         (counts  (let ((c nil))
+                    (dolist (p plans c)
+                      (let* ((op (plist-get p :op))
+                             (cell (assq op c)))
+                        (if cell (setcdr cell (1+ (cdr cell)))
+                          (push (cons op 1) c))))))
          (buf (get-buffer-create "*ejira-confirm*")))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
@@ -145,167 +439,7 @@ FIELDS is a list of (NAME OLD NEW) string triples."
       (setq ejira-confirm--plans plans))
     (pop-to-buffer buf)))
 
-;;; Rendering
-
-(defun ejira-confirm--insert-header (n counts)
-  "Insert buffer header for N items with op COUNTS alist."
-  (let* ((parts nil)
-         (n-create (alist-get 'create counts 0))
-         (n-update (alist-get 'update counts 0))
-         (n-delete (alist-get 'delete counts 0)))
-    (when (> n-create 0) (push (format "%d new" n-create) parts))
-    (when (> n-update 0) (push (format "%d modified" n-update) parts))
-    (when (> n-delete 0) (push (format "%d deleted" n-delete) parts))
-    (let ((line (format "Ejira Push — %d item%s%s"
-                        n
-                        (if (= n 1) "" "s")
-                        (if parts
-                            (concat ": " (string-join (nreverse parts) ", "))
-                          ""))))
-      (insert (propertize line 'face 'ejira-confirm-title)
-              "\n"
-              (make-string (length line) ?═)
-              "\n\n"))))
-
-(defun ejira-confirm--project-op-summary (plans)
-  "Return a summary string of op counts for PLANS within one project."
-  (let* ((counts (ejira-confirm--count-ops plans))
-         (parts nil)
-         (n-create (alist-get 'create counts 0))
-         (n-update (alist-get 'update counts 0))
-         (n-delete (alist-get 'delete counts 0)))
-    (when (> n-create 0) (push (format "%d new" n-create) parts))
-    (when (> n-update 0) (push (format "%d modified" n-update) parts))
-    (when (> n-delete 0) (push (format "%d deleted" n-delete) parts))
-    (if parts
-        (concat "  " (string-join (nreverse parts) ", "))
-      "")))
-
-(defun ejira-confirm--insert-project (project-key plans)
-  "Insert a collapsible project section for PROJECT-KEY with PLANS."
-  (let* ((summary (ejira-confirm--project-op-summary plans))
-         (header-start (point)))
-    (insert (propertize "▼" 'ejira-confirm-arrow t)
-            " "
-            (propertize project-key 'face 'ejira-confirm-project)
-            (propertize summary 'face 'ejira-confirm-summary)
-            "\n")
-    (let ((body-start (point)))
-      (dolist (plan plans)
-        (ejira-confirm--insert-item plan))
-      (insert "\n")
-      (let ((ov (make-overlay body-start (point))))
-        (overlay-put ov 'invisible nil)
-        (overlay-put ov 'ejira-confirm-node t)
-        (push (list :marker (copy-marker header-start) :overlay ov :level 'project)
-              ejira-confirm--nodes)))))
-
-(defun ejira-confirm--truncate (s)
-  "Flatten and truncate S for one-line display."
-  (let ((flat (string-trim (replace-regexp-in-string "[\n\r]+" " " (or s "")))))
-    (if (length> flat 55)
-        (concat "\"" (substring flat 0 55) "…\"")
-      (format "%S" flat))))
-
-(defun ejira-confirm--insert-item (plan)
-  "Insert a rendered item line for PLAN.  Dispatches on :op."
-  (let ((op (plist-get plan :op))
-        (title (plist-get plan :title)))
-    (pcase op
-      ('create
-       (let* ((preview (plist-get plan :preview))
-              (header-start (point)))
-         (insert "  "
-                 (propertize "+" 'face 'ejira-confirm-new)
-                 "  "
-                 (propertize title 'face 'ejira-confirm-item)
-                 "\n")
-         (when (and preview (> (length preview) 0))
-           (let ((detail-start (point)))
-             (insert "       "
-                     (propertize (ejira-confirm--truncate preview)
-                                 'face 'ejira-confirm-summary)
-                     "\n")
-             (let ((ov (make-overlay detail-start (point))))
-               (overlay-put ov 'invisible t)
-               (overlay-put ov 'ejira-confirm-node t)
-               (push (list :marker (copy-marker header-start) :overlay ov :level 'item)
-                     ejira-confirm--nodes))))))
-
-      ('update
-       (let* ((changes (plist-get plan :changes))
-              (field-names (mapcar #'car changes))
-              (header-start (point)))
-         (insert "  "
-                 (propertize "▶" 'ejira-confirm-arrow t)
-                 " ✎ "
-                 (propertize title 'face 'ejira-confirm-item)
-                 (propertize (concat "  " (string-join field-names ", "))
-                             'face 'ejira-confirm-summary)
-                 "\n")
-         (let ((detail-start (point)))
-           (dolist (change changes)
-             (ejira-confirm--insert-field
-              (nth 0 change) (nth 1 change) (nth 2 change)))
-           (let ((ov (make-overlay detail-start (point))))
-             (overlay-put ov 'invisible t)
-             (overlay-put ov 'ejira-confirm-node t)
-             (push (list :marker (copy-marker header-start) :overlay ov :level 'item)
-                   ejira-confirm--nodes)))))
-
-      ('delete
-       (let ((preview (plist-get plan :preview)))
-         (insert "  "
-                 (propertize "✗" 'face 'ejira-confirm-deleted)
-                 " "
-                 (propertize title 'face 'ejira-confirm-deleted)
-                 "  "
-                 (propertize "⚠ permanent" 'face 'ejira-confirm-warning)
-                 "\n")
-         (when (and preview (> (length preview) 0))
-           (insert "    "
-                   (propertize (ejira-confirm--truncate preview)
-                               'face 'ejira-confirm-old-value)
-                   "\n")))))))
-
-(defun ejira-confirm--insert-field (name old new)
-  "Insert an expandable change line for field NAME showing OLD → NEW."
-  (let ((header-start (point)))
-    (insert "    "
-            (propertize "▶" 'ejira-confirm-arrow t)
-            " "
-            (propertize (format "%-14s" (concat name ":"))
-                        'face 'ejira-confirm-field-name)
-            (propertize (ejira-confirm--truncate old)
-                        'face 'ejira-confirm-old-value)
-            " → "
-            (propertize (ejira-confirm--truncate new)
-                        'face 'ejira-confirm-new-value)
-            "\n")
-    (let ((detail-start (point)))
-      (insert (propertize "        ── old ──\n" 'face 'ejira-confirm-summary))
-      (dolist (line (split-string (ejira-confirm--normalize old) "\n"))
-        (insert "        " (propertize line 'face 'ejira-confirm-old-value) "\n"))
-      (insert (propertize "        ── new ──\n" 'face 'ejira-confirm-summary))
-      (dolist (line (split-string (ejira-confirm--normalize new) "\n"))
-        (insert "        " (propertize line 'face 'ejira-confirm-new-value) "\n"))
-      (let ((ov (make-overlay detail-start (point))))
-        (overlay-put ov 'invisible t)
-        (overlay-put ov 'ejira-confirm-node t)
-        (push (list :marker (copy-marker header-start) :overlay ov :level 'field)
-              ejira-confirm--nodes)))))
-
-(defun ejira-confirm--insert-footer ()
-  "Insert the keybinding footer."
-  (insert "\n"
-          (propertize "C-c C-c" 'face 'ejira-confirm-key)
-          "  Push    "
-          (propertize "C-c C-k" 'face 'ejira-confirm-key)
-          "  Cancel    "
-          (propertize "TAB" 'face 'ejira-confirm-key)
-          "  Toggle\n"))
-
-;;; Interaction
+;;; ── Interaction ──────────────────────────────────────────────────────────────
 
 (defun ejira-confirm-execute ()
   "Confirm and execute all pending push operations."
@@ -329,20 +463,22 @@ FIELDS is a list of (NAME OLD NEW) string triples."
   "Toggle expand/collapse of the node at point."
   (interactive)
   (when-let ((node (ejira-confirm--node-at-point)))
-    (let* ((ov (plist-get node :overlay))
+    (let* ((ov     (plist-get node :overlay))
            (marker (plist-get node :marker))
            (hidden (overlay-get ov 'invisible))
            (inhibit-read-only t))
       (overlay-put ov 'invisible (not hidden))
       (save-excursion
         (goto-char marker)
+        ;; hidden=t means was collapsed (▶), now expanding → swap to ▼
+        ;; hidden=nil means was expanded (▼), now collapsing → swap to ▶
         (when (search-forward (if hidden "▶" "▼") (line-end-position) t)
           (replace-match (if hidden "▼" "▶") t t))))))
 
 (defun ejira-confirm-next-section ()
   "Move point to the next node heading."
   (interactive)
-  (let ((pos (point)) (found nil))
+  (let ((pos (point)) found)
     (dolist (node ejira-confirm--nodes)
       (let ((m (marker-position (plist-get node :marker))))
         (when (and (> m pos) (or (not found) (< m found)))
@@ -352,7 +488,7 @@ FIELDS is a list of (NAME OLD NEW) string triples."
 (defun ejira-confirm-prev-section ()
   "Move point to the previous node heading."
   (interactive)
-  (let ((pos (point)) (found nil))
+  (let ((pos (point)) found)
     (dolist (node ejira-confirm--nodes)
       (let ((m (marker-position (plist-get node :marker))))
         (when (and (< m pos) (or (not found) (> m found)))
@@ -360,9 +496,7 @@ FIELDS is a list of (NAME OLD NEW) string triples."
     (when found (goto-char found))))
 
 (defun ejira-confirm--node-at-point ()
-  "Return the node plist whose header line contains point, or nil.
-When both an item and a field node share the line region, prefer the one
-whose marker is closest to point (the field header)."
+  "Return the innermost node whose header line contains point."
   (let ((line-beg (line-beginning-position))
         (line-end (line-end-position))
         (best nil) (best-pos -1))
@@ -372,28 +506,24 @@ whose marker is closest to point (the field header)."
           (setq best node best-pos m))))
     best))
 
-;;; Mode definition
+;;; ── Mode ─────────────────────────────────────────────────────────────────────
 
 (defvar ejira-confirm-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
     (keymap-set map "C-c C-c" #'ejira-confirm-execute)
     (keymap-set map "C-c C-k" #'ejira-confirm-cancel)
-    (keymap-set map "TAB" #'ejira-confirm-toggle-section)
-    (keymap-set map "<tab>" #'ejira-confirm-toggle-section)
-    (keymap-set map "n" #'ejira-confirm-next-section)
-    (keymap-set map "p" #'ejira-confirm-prev-section)
-    (keymap-set map "q" #'ejira-confirm-cancel)
-    map)
-  "Keymap for `ejira-confirm-mode'.")
+    (keymap-set map "TAB"     #'ejira-confirm-toggle-section)
+    (keymap-set map "<tab>"   #'ejira-confirm-toggle-section)
+    (keymap-set map "n"       #'ejira-confirm-next-section)
+    (keymap-set map "p"       #'ejira-confirm-prev-section)
+    (keymap-set map "q"       #'ejira-confirm-cancel)
+    map))
 
 (define-derived-mode ejira-confirm-mode special-mode "Ejira-Confirm"
-  "Major mode for confirming ejira push changes.
-
-\\{ejira-confirm-mode-map}"
+  "Major mode for confirming ejira push changes.\n\n\\{ejira-confirm-mode-map}"
   (setq-local revert-buffer-function #'ignore)
   (setq truncate-lines t))
 
 (provide 'ejira-confirm)
-
 ;;; ejira-confirm.el ends here
