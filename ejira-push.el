@@ -391,7 +391,8 @@ offers to push locally-edited issues and comments through a review buffer.")
                  (local-body (ejira--get-heading-body marker))
                  (local-state (org-with-point-at marker
                                 (substring-no-properties (or (org-get-todo-state) ""))))
-                 (fields `(("state" ,local-state)
+                 (fields `(("title" ,heading-title)
+                           ("state" ,local-state)
                            ("description" ,(or local-body "")))))
             (setq plan (list :op 'create
                              :object 'subtask
@@ -433,7 +434,8 @@ offers to push locally-edited issues and comments through a review buffer.")
                  (local-body (ejira--get-heading-body marker))
                  (local-state (org-with-point-at marker
                                 (substring-no-properties (or (org-get-todo-state) ""))))
-                 (fields `(("state" ,local-state)
+                 (fields `(("title" ,heading-title)
+                           ("state" ,local-state)
                            ("description" ,(or local-body "")))))
             (setq plan (list :op 'create
                              :object 'issue

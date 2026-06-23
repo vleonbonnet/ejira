@@ -13,15 +13,16 @@
 ;;   ══════════════════════════════════════════
 ;;   ▼ RNDSEC  1 new, 1 modified
 ;;     ▼ ✎ RNDSEC-123  summary, 1 new subtask
-;;       ▶ summary:     "old title" → "new title"
-;;       ▶ + subtask: My new task
-;;           ▶ state:        TODO
+;;       ▶ summary:     old title → new title
+;;       ▶ + subtask: TODO  My new task
+;;             title:        My new task
 ;;           ▶ description:  "Body text…"
 ;;
 ;; Overlay visibility: project/issue nodes start expanded (▼); field and
-;; subitem nodes start collapsed (▶).  TAB or click ▶/▼ to toggle.
+;; subitem nodes start collapsed (▶).  Short single-line fields are shown
+;; inline with no toggle.  TAB toggles any collapsible section.
 ;;
-;; C-c C-c sends all items, C-c C-k aborts.  TAB toggles sections.
+;; C-c C-c sends all items, C-c C-k aborts.
 
 ;;; Code:
 
@@ -92,11 +93,48 @@
   "List of plists (:marker MARKER :overlay OVERLAY :level LEVEL).
 LEVEL is one of: project item field.")
 
-;;; ── Diff helpers ─────────────────────────────────────────────────────────────
+(defvar-local ejira-confirm--todo-keywords nil
+  "Snapshot of `org-todo-keywords-1' captured from the org buffer at show time.")
+
+;;; ── String helpers ───────────────────────────────────────────────────────────
 
 (defun ejira-confirm--normalize (s)
-  "Normalize S for comparison and display: nil→\"\", strip CR, trim."
+  "Strip CR and trim S; nil becomes \"\"."
   (string-trim (replace-regexp-in-string "\r" "" (or s ""))))
+
+(defun ejira-confirm--for-display (s)
+  "Normalize S and strip org inline markup markers for plain display."
+  (let ((r (ejira-confirm--normalize s)))
+    (dolist (ch '("*" "/" "=" "~" "+"))
+      (setq r (replace-regexp-in-string
+               (concat (regexp-quote ch) "\\([^" ch "\n]+\\)" (regexp-quote ch))
+               "\\1" r)))
+    r))
+
+(defun ejira-confirm--truncate (s)
+  "Flatten and truncate S to at most 55 chars for one-line display."
+  (let ((flat (string-trim (replace-regexp-in-string "[\n\r]+" " " (or s "")))))
+    (if (length> flat 55)
+        (concat (substring flat 0 55) "…")
+      flat)))
+
+(defun ejira-confirm--jira-state-for-org (org-state)
+  "Return the Jira state name corresponding to ORG-STATE keyword.
+Uses `ejira-confirm--todo-keywords' when in the confirm buffer (captured at
+show time), falling back to `org-todo-keywords-1' in org buffers."
+  (when (and (stringp org-state) (> (length org-state) 0)
+             (boundp 'ejira-todo-states-alist))
+    (let* ((keywords (or (and (boundp 'ejira-confirm--todo-keywords)
+                              ejira-confirm--todo-keywords)
+                         (and (boundp 'org-todo-keywords-1)
+                              org-todo-keywords-1)))
+           (pos (when keywords
+                  (cl-position org-state keywords :test #'string=)))
+           (idx (when pos (1+ pos))))
+      (or (when idx (car (rassoc idx ejira-todo-states-alist)))
+          org-state))))
+
+;;; ── Diff helpers ─────────────────────────────────────────────────────────────
 
 (defun ejira-confirm-field-changes (fields)
   "Filter FIELDS to entries whose old and new values differ.
@@ -167,7 +205,8 @@ FIELDS is a list of (NAME OLD NEW) string triples."
 ;; Visibility rules:
 ;;   project / issue-node → start VISIBLE  (▼, start-hidden=nil)
 ;;   subitem / top-level-item → start HIDDEN  (▶, start-hidden=t)
-;;   diff-field / new-field → start HIDDEN  (▶, start-hidden=t)
+;;   multi-line fields → start HIDDEN  (▶, start-hidden=t)
+;;   single-line fields → rendered inline, no overlay
 
 (defun ejira-confirm--register-node (header-start detail-start level start-hidden)
   "Register a collapsible overlay from DETAIL-START to point.
@@ -181,60 +220,64 @@ When START-HIDDEN is non-nil the body starts invisible."
 
 ;;; ── Core field primitives ────────────────────────────────────────────────────
 ;;
-;; Both insert-diff-field and insert-new-field:
-;;   • render a one-line header row with ▶ (fields always start collapsed)
-;;   • register a hidden overlay for the expanded body
-;;   • push a node entry onto ejira-confirm--nodes
-
-(defun ejira-confirm--truncate (s)
-  "Flatten and truncate S for one-line display."
-  (let ((flat (string-trim (replace-regexp-in-string "[\n\r]+" " " (or s "")))))
-    (if (length> flat 55)
-        (concat "\"" (substring flat 0 55) "…\"")
-      (format "%S" flat))))
+;; insert-diff-field: expandable OLD → NEW diff, always collapsible.
+;; insert-new-field: single-line values shown inline; multi-line get overlay.
 
 (defun ejira-confirm--insert-diff-field (name old new indent)
   "Insert an expandable OLD → NEW diff row for field NAME at INDENT spaces."
-  (let ((pad  (make-string indent ?\s))
-        (bpad (make-string (+ indent 4) ?\s))
-        (header-start (point)))
+  (let* ((pad      (make-string indent ?\s))
+         (bpad     (make-string (+ indent 4) ?\s))
+         (old-disp (ejira-confirm--for-display old))
+         (new-disp (ejira-confirm--for-display new))
+         (header-start (point)))
     (insert pad
             (propertize "▶" 'ejira-confirm-arrow t)
             " "
             (propertize (format "%-14s" (concat name ":")) 'face 'ejira-confirm-field-name)
-            (propertize (ejira-confirm--truncate old) 'face 'ejira-confirm-old-value)
+            (propertize (ejira-confirm--truncate old-disp) 'face 'ejira-confirm-old-value)
             " → "
-            (propertize (ejira-confirm--truncate new) 'face 'ejira-confirm-new-value)
+            (propertize (ejira-confirm--truncate new-disp) 'face 'ejira-confirm-new-value)
             "\n")
     (let ((detail-start (point)))
       (insert (propertize (concat bpad "── old ──\n") 'face 'ejira-confirm-summary))
-      (dolist (line (split-string (ejira-confirm--normalize old) "\n"))
+      (dolist (line (split-string old-disp "\n"))
         (insert bpad (propertize line 'face 'ejira-confirm-old-value) "\n"))
       (insert (propertize (concat bpad "── new ──\n") 'face 'ejira-confirm-summary))
-      (dolist (line (split-string (ejira-confirm--normalize new) "\n"))
+      (dolist (line (split-string new-disp "\n"))
         (insert bpad (propertize line 'face 'ejira-confirm-new-value) "\n"))
       (ejira-confirm--register-node header-start detail-start 'field t))))
 
 (defun ejira-confirm--insert-new-field (name value indent)
-  "Insert an expandable new-value row for field NAME at INDENT spaces."
-  (let ((pad  (make-string indent ?\s))
-        (bpad (make-string (+ indent 4) ?\s))
-        (header-start (point)))
-    (insert pad
-            (propertize "▶" 'ejira-confirm-arrow t)
-            " "
-            (propertize (format "%-14s" (concat name ":")) 'face 'ejira-confirm-field-name)
-            (propertize (ejira-confirm--truncate value) 'face 'ejira-confirm-new-value)
-            "\n")
-    (let ((detail-start (point)))
-      (dolist (line (split-string (ejira-confirm--normalize value) "\n"))
-        (insert bpad (propertize line 'face 'ejira-confirm-new-value) "\n"))
-      (ejira-confirm--register-node header-start detail-start 'field t))))
+  "Insert a new-value field for NAME at INDENT spaces.
+Single-line values are shown inline (no toggle); multi-line get a collapsible overlay."
+  (let* ((pad   (make-string indent ?\s))
+         (clean (ejira-confirm--for-display value))
+         (lines (split-string clean "\n")))
+    (if (= (length lines) 1)
+        ;; Single-line: show inline, no expand toggle
+        (insert pad
+                "  "
+                (propertize (format "%-14s" (concat name ":")) 'face 'ejira-confirm-field-name)
+                (propertize clean 'face 'ejira-confirm-new-value)
+                "\n")
+      ;; Multi-line: collapsible overlay, starts collapsed
+      (let ((bpad (make-string (+ indent 4) ?\s))
+            (header-start (point)))
+        (insert pad
+                (propertize "▶" 'ejira-confirm-arrow t)
+                " "
+                (propertize (format "%-14s" (concat name ":")) 'face 'ejira-confirm-field-name)
+                (propertize (ejira-confirm--truncate clean) 'face 'ejira-confirm-new-value)
+                "\n")
+        (let ((detail-start (point)))
+          (dolist (line lines)
+            (insert bpad (propertize line 'face 'ejira-confirm-new-value) "\n"))
+          (ejira-confirm--register-node header-start detail-start 'field t))))))
 
 ;;; ── Subitem (create/delete inside an issue node) ─────────────────────────────
 ;;
-;; Subitems start collapsed (▶).  Expanding one reveals its fields, which are
-;; themselves individually collapsible via insert-new-field.
+;; Subitems start collapsed (▶).  Header shows Jira state before the title.
+;; Expanding reveals all fields (title, state, description, …).
 
 (defun ejira-confirm--insert-subitem (plan)
   "Insert a create/delete plan inside an issue node at indent=4."
@@ -246,6 +289,10 @@ When START-HIDDEN is non-nil the body starts invisible."
     (pcase op
       ('create
        (let* ((label (pcase object ('subtask "subtask") ('comment "comment") (_ "new")))
+              ;; State from fields for the header; translate to Jira state name
+              (state-entry (cl-assoc "state" fields :test #'string=))
+              (state-val   (when state-entry (nth 1 state-entry)))
+              (jira-state  (ejira-confirm--jira-state-for-org state-val))
               (clean (replace-regexp-in-string "^new [a-z]+: " "" (or title "")))
               (header-start (point)))
          (insert "    "
@@ -253,15 +300,24 @@ When START-HIDDEN is non-nil the body starts invisible."
                  " "
                  (propertize "+" 'face 'ejira-confirm-new)
                  " "
-                 (propertize (concat label ": " clean) 'face 'ejira-confirm-item)
+                 (propertize label 'face 'ejira-confirm-item)
+                 ": "
+                 (if (and jira-state (> (length jira-state) 0))
+                     (concat (propertize jira-state 'face 'ejira-confirm-new-value) "  ")
+                   "")
+                 (propertize (ejira-confirm--truncate clean) 'face 'ejira-confirm-item)
                  "\n")
          (let ((body-start (point)))
            (cond
             (fields
              (dolist (f fields)
                (let ((fname (nth 0 f)) (fval (nth 1 f)))
-                 (when (and fval (> (length fval) 0))
-                   (ejira-confirm--insert-new-field fname fval 8)))))
+                 ;; Translate state value to Jira name when displaying state field
+                 (let ((display-val (if (string= fname "state")
+                                        (or (ejira-confirm--jira-state-for-org fval) fval)
+                                      fval)))
+                   (when (and display-val (> (length display-val) 0))
+                     (ejira-confirm--insert-new-field fname display-val 8))))))
             ((and preview (> (length preview) 0))
              (ejira-confirm--insert-new-field "body" preview 8)))
            (ejira-confirm--register-node header-start body-start 'item t))))
@@ -317,26 +373,36 @@ When START-HIDDEN is non-nil the body starts invisible."
          (header-start (point)))
     (pcase op
       ('create
-       (insert "  "
-               (propertize "▶" 'ejira-confirm-arrow t)
-               " "
-               (propertize "+" 'face 'ejira-confirm-new)
-               "  "
-               (propertize title 'face 'ejira-confirm-item)
-               "\n")
-       (let ((body-start (point)))
-         (cond
-          (fields
-           (dolist (f fields)
-             (let ((fname (nth 0 f)) (fval (nth 1 f)))
-               (when (and fval (> (length fval) 0))
-                 (ejira-confirm--insert-new-field fname fval 6)))))
-          ((and preview (> (length preview) 0))
-           (ejira-confirm--insert-new-field "body" preview 6)))
-         (ejira-confirm--register-node header-start body-start 'item t)))
+       ;; Extract state for header
+       (let* ((state-entry (cl-assoc "state" fields :test #'string=))
+              (state-val   (when state-entry (nth 1 state-entry)))
+              (jira-state  (ejira-confirm--jira-state-for-org state-val)))
+         (insert "  "
+                 (propertize "▶" 'ejira-confirm-arrow t)
+                 " "
+                 (propertize "+" 'face 'ejira-confirm-new)
+                 "  "
+                 (if (and jira-state (> (length jira-state) 0))
+                     (concat (propertize jira-state 'face 'ejira-confirm-new-value) "  ")
+                   "")
+                 (propertize title 'face 'ejira-confirm-item)
+                 "\n")
+         (let ((body-start (point)))
+           (cond
+            (fields
+             (dolist (f fields)
+               (let ((fname (nth 0 f)) (fval (nth 1 f)))
+                 (let ((display-val (if (string= fname "state")
+                                        (or (ejira-confirm--jira-state-for-org fval) fval)
+                                      fval)))
+                   (when (and display-val (> (length display-val) 0))
+                     (ejira-confirm--insert-new-field fname display-val 6))))))
+            ((and preview (> (length preview) 0))
+             (ejira-confirm--insert-new-field "body" preview 6)))
+           (ejira-confirm--register-node header-start body-start 'item t))))
       ('update
-       ;; Standalone update not inside an issue node (fallback, shouldn't normally happen)
-       (let* ((changes (plist-get plan :changes))
+       ;; Standalone update not inside an issue node (fallback)
+       (let* ((changes     (plist-get plan :changes))
               (field-names (mapcar #'car changes)))
          (insert "  "
                  (propertize "▼" 'ejira-confirm-arrow t)
@@ -363,11 +429,9 @@ When START-HIDDEN is non-nil the body starts invisible."
            (ejira-confirm--insert-new-field "body" preview 6)))))))
 
 ;;; ── Project section ──────────────────────────────────────────────────────────
-;;
-;; Project sections start expanded (▼).
 
 (defun ejira-confirm--insert-project (project-key issue-groups)
-  "Insert a collapsible project section.
+  "Insert a collapsible project section (starts expanded).
 ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
   (let* ((all-plans  (mapcan (lambda (g) (copy-sequence (cdr g))) issue-groups))
          (summary    (ejira-confirm--op-summary all-plans))
@@ -403,9 +467,11 @@ ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
                         n
                         (if (= n 1) "" "s")
                         (if parts (concat ": " (string-join (nreverse parts) ", ")) ""))))
+      ;; Apply the same face to both title and separator so they share identical
+      ;; font metrics and string-width matches visual width exactly.
       (insert (propertize line 'face 'ejira-confirm-title)
               "\n"
-              (make-string (string-width line) ?═)
+              (propertize (make-string (string-width line) ?═) 'face 'ejira-confirm-title)
               "\n\n"))))
 
 (defun ejira-confirm--insert-footer ()
@@ -419,18 +485,21 @@ ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
 
 (defun ejira-confirm-show (plans)
   "Display confirmation buffer for pending push PLANS."
-  (let* ((grouped (ejira-confirm--group-by-project-issue plans))
-         (counts  (let ((c nil))
-                    (dolist (p plans c)
-                      (let* ((op (plist-get p :op))
-                             (cell (assq op c)))
-                        (if cell (setcdr cell (1+ (cdr cell)))
-                          (push (cons op 1) c))))))
+  ;; Capture org-todo-keywords-1 now while we're in the org buffer context.
+  (let* ((todo-kws (and (boundp 'org-todo-keywords-1) org-todo-keywords-1))
+         (grouped  (ejira-confirm--group-by-project-issue plans))
+         (counts   (let ((c nil))
+                     (dolist (p plans c)
+                       (let* ((op (plist-get p :op))
+                              (cell (assq op c)))
+                         (if cell (setcdr cell (1+ (cdr cell)))
+                           (push (cons op 1) c))))))
          (buf (get-buffer-create "*ejira-confirm*")))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
         (ejira-confirm-mode)
+        (setq ejira-confirm--todo-keywords todo-kws)
         (ejira-confirm--insert-header (length plans) counts)
         (dolist (group grouped)
           (ejira-confirm--insert-project (car group) (cdr group)))
@@ -470,8 +539,8 @@ ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
       (overlay-put ov 'invisible (not hidden))
       (save-excursion
         (goto-char marker)
-        ;; hidden=t means was collapsed (▶), now expanding → swap to ▼
-        ;; hidden=nil means was expanded (▼), now collapsing → swap to ▶
+        ;; hidden=t → was collapsed (▶), now expanding → swap to ▼
+        ;; hidden=nil → was expanded (▼), now collapsing → swap to ▶
         (when (search-forward (if hidden "▶" "▼") (line-end-position) t)
           (replace-match (if hidden "▼" "▶") t t))))))
 
