@@ -306,7 +306,7 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
               (condition-case err
                   (apply #'jiralib2-jql-search
                          (format "key in (%s)" (s-join ", " keys))
-                         '("summary" "description" "assignee" "priority" "duedate"))
+                         '("summary" "description" "assignee" "priority" "duedate" "status"))
                 (error
                  (message "ejira: failed to fetch remote state: %s"
                           (error-message-string err))
@@ -342,18 +342,33 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                  (remote-priority-name (when item
                                          (ejira--alist-get item 'fields 'priority 'name)))
                  (remote-deadline (when item (ejira--alist-get item 'fields 'duedate)))
+                 (remote-status-name (when item (ejira--alist-get item 'fields 'status 'name)))
+                 (local-state (org-with-point-at marker
+                                (substring-no-properties (or (org-get-todo-state) ""))))
+                 (todo-kws (org-with-point-at marker org-todo-keywords-1))
+                 (local-state-jira-names
+                  (when (and local-state todo-kws (boundp 'ejira-todo-states-alist))
+                    (let* ((pos (cl-position local-state todo-kws :test #'string=))
+                           (idx (when pos (1+ pos))))
+                      (when idx
+                        (delq nil (mapcar (lambda (e) (when (= (cdr e) idx) (car e)))
+                                          ejira-todo-states-alist))))))
+                 (state-matches (member remote-status-name local-state-jira-names))
                  (changes (ejira-confirm-field-changes
                            `(("summary"     ,remote-summary  ,local-summary)
                              ("description" ,(or remote-desc-org "") ,local-desc-org)
                              ("assignee"    ,remote-assignee ,local-assignee)
                              ,@(when local-priority-name
                                  `(("priority" ,(or remote-priority-name "") ,local-priority-name)))
-                             ("deadline"    ,(or remote-deadline "") ,(or local-deadline "")))))
+                             ("deadline"    ,(or remote-deadline "") ,(or local-deadline ""))
+                             ,@(when (and local-state remote-status-name (not state-matches))
+                                 `(("state" ,(or remote-status-name "") ,local-state))))))
                  (summary-changed (assoc "summary" changes))
                  (desc-changed (assoc "description" changes))
                  (assignee-changed (assoc "assignee" changes))
                  (priority-changed (assoc "priority" changes))
-                 (deadline-changed (assoc "deadline" changes)))
+                 (deadline-changed (assoc "deadline" changes))
+                 (state-changed (assoc "state" changes)))
             (when changes
               (push (list :op 'update
                           :object 'issue
@@ -367,11 +382,14 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                                       (local-assignee local-assignee)
                                       (local-priority-name local-priority-name)
                                       (local-deadline local-deadline)
+                                      (local-state local-state)
+                                      (todo-kws todo-kws)
                                       (summary-changed summary-changed)
                                       (desc-changed desc-changed)
                                       (assignee-changed assignee-changed)
                                       (priority-changed priority-changed)
-                                      (deadline-changed deadline-changed))
+                                      (deadline-changed deadline-changed)
+                                      (state-changed state-changed))
                                   (lambda ()
                                     (when (or summary-changed desc-changed)
                                       (jiralib2-update-summary-description
@@ -387,6 +405,8 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                                     (when deadline-changed
                                       (jiralib2-update-issue
                                        key `(duedate . ,(or local-deadline ""))))
+                                    (when state-changed
+                                      (ejira--transition-to-org-state key local-state todo-kws))
                                     (ejira--push-finalize marker))))
                     plans))))))
     (dolist (op (nreverse other-ops))

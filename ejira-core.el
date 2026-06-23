@@ -664,7 +664,10 @@ body.  Normalized so the fingerprint ignores cosmetic whitespace changes."
                 (ejira--push-normalize
                  (or (when-let ((d (org-get-deadline-time (point-marker))))
                        (format-time-string "%Y-%m-%d" d))
-                     ""))))))))
+                     ""))
+                "\0"
+                (ejira--push-normalize
+                 (or (org-get-todo-state) ""))))))))
 
 (defun ejira--update-push-baseline ()
   "Store the :Pushhash: property fingerprinting the heading at point.
