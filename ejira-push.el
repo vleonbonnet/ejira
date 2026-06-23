@@ -16,29 +16,27 @@ offers to push locally-edited issues and comments through a review buffer.")
   "Bound to t while a push batch is executing (inhibits re-scan on save).")
 
 (defun ejira--transition-to-org-state (key org-state todo-keywords)
-  "Try to transition Jira issue KEY to the state mapped from ORG-STATE.
+  "Transition Jira issue KEY to the state mapped from ORG-STATE.
 TODO-KEYWORDS is the buffer's org-todo-keywords-1 list used for index lookup.
-Returns t on success, nil if no matching transition was found or the call failed."
-  (when (and (stringp org-state)
-             (> (length org-state) 0)
-             todo-keywords
-             (boundp 'ejira-todo-states-alist))
-    (let* ((pos (cl-position org-state todo-keywords :test #'string=))
-           (idx (when pos (1+ pos))))
-      (when idx
-        (let* ((target-states
-                (delq nil (mapcar (lambda (e)
-                                    (when (= (cdr e) idx) (car e)))
-                                  ejira-todo-states-alist)))
-               (actions (condition-case nil
-                            (jiralib2-get-actions key)
-                          (error nil)))
-               (action (cl-find-if (lambda (a) (member (cdr a) target-states))
-                                   actions)))
-          (when action
-            (condition-case nil
-                (progn (jiralib2-do-action key (car action)) t)
-              (error nil))))))))
+Signals an error if no matching transition is available or the API call fails."
+  (unless (and (stringp org-state) (> (length org-state) 0)
+               todo-keywords (boundp 'ejira-todo-states-alist))
+    (error "ejira: cannot transition %s — missing state or todo-states-alist" key))
+  (let* ((pos (cl-position org-state todo-keywords :test #'string=))
+         (idx (when pos (1+ pos))))
+    (unless idx
+      (error "ejira: org state %S not found in todo-keywords for %s" org-state key))
+    (let* ((target-states
+            (delq nil (mapcar (lambda (e)
+                                (when (= (cdr e) idx) (car e)))
+                              ejira-todo-states-alist)))
+           (actions (jiralib2-get-actions key))
+           (action (cl-find-if (lambda (a) (member (cdr a) target-states))
+                               actions)))
+      (unless action
+        (error "ejira: no Jira transition to %S available for %s (tried: %s)"
+               org-state key (mapconcat #'identity target-states ", ")))
+      (jiralib2-do-action key (car action)))))
 
 (defun ejira--finalize-new-issue (new-key marker orig-state todo-keywords)
   "Post-create housekeeping for a newly-created Jira issue NEW-KEY.

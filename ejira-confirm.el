@@ -526,13 +526,26 @@ ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
     (quit-window t)
     ;; Bind ejira--pushing for the entire batch so that any org saves triggered
     ;; by state restoration or property writes do not re-invoke ejira--push-on-save.
-    (let ((ejira--pushing t))
+    (let ((ejira--pushing t)
+          (failures nil))
       (dolist (plan plans)
         (condition-case err
             (funcall (plist-get plan :send))
-          (error (message "ejira: push failed for %s: %s"
-                          (plist-get plan :title)
-                          (error-message-string err))))))))
+          (error
+           (push (format "• %s
+  %s" (plist-get plan :title) (error-message-string err))
+                 failures))))
+      (when failures
+        (display-warning
+         'ejira
+         (concat "The following push operations failed "
+                 "(headings remain dirty for retry):
+
+"
+                 (mapconcat #'identity (nreverse failures) "
+
+"))
+         :error)))))
 
 (defun ejira-confirm-cancel ()
   "Cancel the push and close the confirmation buffer."
