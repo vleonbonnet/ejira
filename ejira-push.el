@@ -611,22 +611,33 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
         (when plan (push plan plans))))
     (nreverse plans)))
 
+(defmacro ejira--with-pre-scan (buf &rest body)
+  "Pre-expand BUF once and bind `ejira--pre-scanning' t for BODY.
+This reduces the scan+build pipeline from N×outline-show-all to one call."
+  (declare (indent 1))
+  `(with-current-buffer ,buf
+     (org-save-outline-visibility t
+       (outline-show-all)
+       (let ((ejira--pre-scanning t))
+         ,@body))))
+
 (defun ejira-push-at-point ()
   "Scan the ejira heading at point and show ejira-confirm for it."
   (interactive)
-  (let* ((ops (ejira--push-scan-buffer (current-buffer)))
-         (point-ops (cl-remove-if-not
-                     (lambda (op)
-                       (let ((m (plist-get op :marker)))
-                         (and m (equal (marker-buffer m) (current-buffer))
-                              (= (save-excursion (goto-char m)
-                                                 (line-beginning-position))
-                                 (line-beginning-position)))))
-                     ops))
-         (plans (when point-ops (ejira--push-build-plans point-ops))))
-    (if plans
-        (ejira-confirm-show plans)
-      (message "ejira: nothing to push at point"))))
+  (ejira--with-pre-scan (current-buffer)
+    (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+           (point-ops (cl-remove-if-not
+                       (lambda (op)
+                         (let ((m (plist-get op :marker)))
+                           (and m (equal (marker-buffer m) (current-buffer))
+                                (= (save-excursion (goto-char m)
+                                                   (line-beginning-position))
+                                   (line-beginning-position)))))
+                       ops))
+           (plans (when point-ops (ejira--push-build-plans point-ops))))
+      (if plans
+          (ejira-confirm-show plans)
+        (message "ejira: nothing to push at point")))))
 
 (defun ejira--push-on-save ()
   "Offer to push locally-edited ejira items after saving a managed buffer."
@@ -635,10 +646,11 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
              (not ejira--syncing)
              (derived-mode-p 'org-mode)
              (ejira--buffer-has-pushable-p))
-    (let* ((ops (ejira--push-scan-buffer (current-buffer)))
-           (plans (when ops (ejira--push-build-plans ops))))
-      (when plans
-        (ejira-confirm-show plans)))))
+    (ejira--with-pre-scan (current-buffer)
+      (let* ((ops   (ejira--push-scan-buffer (current-buffer)))
+             (plans (when ops (ejira--push-build-plans ops))))
+        (when plans
+          (ejira-confirm-show plans))))))
 
 (add-hook 'after-save-hook #'ejira--push-on-save)
 

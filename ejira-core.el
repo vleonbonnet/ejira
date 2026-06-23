@@ -300,11 +300,17 @@ Avoids repeated linear file scans for the same heading.  Markers auto-update
 on buffer edits, so they stay valid through property changes.  Entries for
 refiled headings are evicted after the refile.")
 
+(defvar ejira--pre-scanning nil
+  "Bound to t when the buffer is pre-expanded for a push scan+build pass.
+Like `ejira--syncing', causes `ejira--with-expand-all' to skip the per-call
+`outline-show-all' since the caller already widened and showed everything.")
+
 (defmacro ejira--with-expand-all (&rest body)
   "Evalate BODY while all outline contents are visible.
-During sync (`ejira--syncing' t) the buffer is pre-expanded once and
-this macro becomes a bare progn to avoid repeated save/restore overhead."
-  `(if ejira--syncing
+During sync (`ejira--syncing' t) or a push scan (`ejira--pre-scanning' t)
+the buffer is pre-expanded once and this macro becomes a bare progn to
+avoid repeated save/restore overhead."
+  `(if (or ejira--syncing ejira--pre-scanning)
        (progn ,@body)
      (org-save-outline-visibility t
        (outline-show-all)

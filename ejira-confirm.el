@@ -327,6 +327,15 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
 ;; Issue nodes start expanded (▼).  They contain diff-fields for any updates
 ;; and subitem entries for creates/deletes — all of which start collapsed.
 
+(defun ejira-confirm--issue-title (key)
+  "Return the org heading title for Jira KEY, or nil if not found."
+  (when (and (stringp key) (fboundp 'ejira--find-heading))
+    (condition-case nil
+        (when-let ((m (ejira--find-heading key)))
+          (org-with-point-at m
+            (org-no-properties (org-get-heading t t t t))))
+      (error nil))))
+
 (defun ejira-confirm--insert-issue-node (issue-key plans)
   "Insert a collapsible issue node for ISSUE-KEY containing PLANS."
   (let* ((summary     (ejira-confirm--issue-summary plans))
@@ -334,12 +343,16 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
                                                    (eq (plist-get p :object) 'issue)))
                                   plans))
          (sub-plans   (cl-remove update-plan plans))
+         (title       (ejira-confirm--issue-title issue-key))
          (header-start (point)))
     (insert "  "
             (propertize "▼" 'ejira-confirm-arrow t)
             " "
             (if update-plan "✎ " "")
             (propertize issue-key 'face 'ejira-confirm-item)
+            (if (and title (not (string-empty-p title)))
+                (concat " " (propertize title 'face 'ejira-confirm-summary))
+              "")
             (propertize summary 'face 'ejira-confirm-summary)
             "\n")
     (let ((body-start (point)))
