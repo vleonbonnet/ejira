@@ -43,7 +43,7 @@ Signals an error if no matching transition is available or the API call fails."
 Sets the org ID property, updates org-id-locations, tries to transition the Jira
 issue to ORIG-STATE before refreshing so the Pushhash is stamped with the final
 state.  If the transition is unavailable, force-sets the org state locally and
-updates the baseline so the next scan does not see a spurious dirty heading."
+leaves the heading dirty so the next save retries the state push."
   (org-with-point-at marker (org-set-property "ID" new-key))
   (puthash new-key
            (abbreviate-file-name (buffer-file-name (marker-buffer marker)))
@@ -59,8 +59,10 @@ updates the baseline so the next scan does not see a spurious dirty heading."
            (cur (when m (org-with-point-at m
                           (substring-no-properties (or (org-get-todo-state) ""))))))
       (when (and m (not (equal cur orig-state)))
-        (org-with-point-at m (org-todo orig-state))
-        (org-with-point-at m (ejira--update-push-baseline))))))
+        ;; Force local state but do NOT re-baseline: the Pushhash from
+        ;; ejira--update-task reflects the Jira state, so the heading stays
+        ;; dirty and the next save will push the state transition.
+        (org-with-point-at m (org-todo orig-state))))))
 
 (defun ejira--push-scan-issue-children (parent-marker project-key)
   "Return a list of child plists for the new issue heading at PARENT-MARKER.
