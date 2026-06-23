@@ -503,8 +503,9 @@ cache in a displayed buffer, can wedge into an uninterruptible loop."
      (org-with-point-at (ejira--get-subheading (ejira--find-heading key)
                                                ejira-comments-heading-name)
        (org-map-entries
-        `(unless (member (org-entry-get (point-marker) "CommId") ',ids)
-           (point-marker))
+        `(let ((cid (org-entry-get (point-marker) "CommId")))
+           (when (and cid (not (member cid ',ids)))
+             (point-marker)))
         "TYPE=\"ejira-comment\""
         'tree)))))
 
@@ -528,26 +529,16 @@ cache in a displayed buffer, can wedge into an uninterruptible loop."
     (org-capture nil "x")))
 
 (defun ejira--post-capture-comment ()
-  "Push the captured comment to server."
+  "Stage captured comment for push via ejira-confirm on next save."
   (unless org-note-abort
-    (if-let ((m (save-excursion
-                  (when (search-backward "<new comment>" nil t)
-                    (beginning-of-line)
-                    (point-marker)))))
-
-        (when (and (equal (org-entry-get m "TYPE") "ejira-comment"))
-          (org-with-wide-buffer
-           (ejira--with-expand-all
-             (let* ((issue-id (org-entry-get m "ID" t))
-                    (comment (ejira--parse-comment
-                              (jiralib2-add-comment
-                               issue-id
-                               (ejira-parser-org-to-jira (ejira--get-heading-body  m))))))
-
-               (org-set-property "CommId" (ejira-comment-id comment))
-               (ejira--update-comment issue-id comment))))))))
-
-(add-hook 'org-capture-prepare-finalize-hook #'ejira--post-capture-comment)
+    (when-let ((m (save-excursion
+                    (when (search-backward "<new comment>" nil t)
+                      (beginning-of-line)
+                      (point-marker)))))
+      (when (equal (org-entry-get m "TYPE") "ejira-comment")
+        ;; Initialise pushhash so the heading is baseline-clean.  The scan
+        ;; detects it as a new-comment draft (TYPE=ejira-comment, no CommId).
+        (org-with-point-at m (ejira--update-push-baseline))))))
 
 (defun ejira--heading-body-level (heading)
   "Return the heading-shift level used when parsing JIRA body under HEADING."
@@ -653,9 +644,22 @@ body.  Normalized so the fingerprint ignores cosmetic whitespace changes."
      ((member type ejira-pushable-types)
       ;; Description is a direct child; find it point-locally to avoid org-id scans.
       (let ((desc (ejira--find-child-heading ejira-description-heading-name)))
-        (concat (ejira--push-normalize (ejira--strip-properties (org-get-heading t t t t)))
+        (concat (ejira--push-normalize
+                 (ejira--strip-properties (org-get-heading t t t t)))
                 "\0"
-                (ejira--push-normalize (if desc (ejira--get-heading-body desc) ""))))))))
+                (ejira--push-normalize
+                 (if desc (ejira--get-heading-body desc) ""))
+                "\0"
+                (ejira--push-normalize
+                 (or (org-entry-get nil "Assignee") ""))
+                "\0"
+                (ejira--push-normalize
+                 (or (org-entry-get nil "PRIORITY") ""))
+                "\0"
+                (ejira--push-normalize
+                 (or (when-let ((d (org-get-deadline-time (point-marker))))
+                       (format-time-string "%Y-%m-%d" d))
+                     ""))))))))
 
 (defun ejira--update-push-baseline ()
   "Store the :Pushhash: property fingerprinting the heading at point.
@@ -892,26 +896,31 @@ With EXCLUDE-COMMENT do not include comments in the search."
   (nth 1 (ejira-get-id-under-point nil t)))
 
 (defun ejira--delete-comment (key id)
-  "Delete comment ID of item KEY."
-  (jiralib2-delete-comment key id)
-  (ejira--update-task key))
+  "Stage comment ID of item KEY for deletion via ejira-confirm on next save."
+  (when-let ((m (ejira--find-child-heading-property "CommId" id)))
+    (org-with-point-at m
+      (org-set-property "PendingDelete" "t")))
+  (message "ejira: comment deletion staged — save buffer to confirm."))
 
 (defun ejira--progress-item (key)
-  "Progress the item KEY."
+  "Stage a Jira status transition for KEY via ejira-confirm on next save."
   (let* ((actions (jiralib2-get-actions key))
          (selected (rassoc (completing-read "Action: " (mapcar 'cdr actions))
                            actions)))
-    (jiralib2-do-action key (car selected))
-    (ejira--update-task key)))
+    (when selected
+      (ejira--with-point-on key
+        (org-set-property "PendingTransition" (cdr selected)))
+      (message "ejira: transition '%s' staged — save buffer to confirm."
+               (cdr selected)))))
 
 (defun ejira--assign-issue (key &optional to-me)
-  "Assign issue KEY. With TO-ME set to t assign it to me."
+  "Assign issue KEY locally. With TO-ME set to t assign it to me.
+The actual Jira write happens via ejira-push on next save."
   (let* ((jira-users (ejira--get-assignable-users key))
          (fullname (if to-me
                        (cdr (assoc jiralib2-user-login-name jira-users))
                      (completing-read "Assignee: " (mapcar 'cdr jira-users))))
          (username (car (rassoc fullname jira-users))))
-    (jiralib2-assign-issue key username)
     (ejira--with-point-on key
       (org-set-property "Assignee" (if username fullname "")))
 
@@ -978,10 +987,10 @@ With SHALLOW update only todo state."
                    (jiralib2-get-assignable-users issue-key)))))
 
 (defun ejira--set-epic (item epic)
-  "Set item ITEM to have epic EPIC. Refile accordingly."
-  (message "item: '%s' epic: '%s'" item epic)
-  (jiralib2-update-issue item `(,ejira-epic-field . ,epic))
-  (ejira--update-task item))
+  "Stage epic change for ITEM to EPIC via ejira-confirm on next save."
+  (ejira--with-point-on item
+    (org-set-property "PendingEpic" (or epic "")))
+  (message "ejira: epic change staged — save buffer to confirm."))
 
 (defun ejira--select-id-or-nil (prompt candidates)
   "Select a candidate from CANDIDATES or nil. Display PROMPT."

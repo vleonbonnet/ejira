@@ -35,25 +35,10 @@
 (require 'dash)
 (require 'ejira-core)
 (require 'ejira-confirm)
+(require 'ejira-push)
 
 
 
-(defvar ejira-push-deadline-changes t
-  "Sync deadlines to server when updated with `ejira-set-deadline'.")
-
-(defvar ejira-push-confirm t
-  "When non-nil, `ejira-push-item-under-point' shows a review buffer
-of the pending changes before sending any request to the server.")
-
-(defvar ejira-push-on-save t
-  "When non-nil, saving any org buffer that contains ejira-managed headings
-offers to push locally-edited issues and comments through a review buffer.
-Managed headings are recognised by the :Pushhash: baseline set on sync, so
-this also covers nodes refiled out of `ejira-org-directory'.")
-
-(defvar ejira--pushing nil
-  "Bound to t while a push writes the :Pushhash: baseline back, so the
-resulting save does not re-trigger `ejira--push-on-save'.")
 
 (defvar ejira-update-jql-resolved-fn #'ejira-jql-all-resolved-project-tickets
   "Generates JQL used in `ejira-update-project' to find server-resolved items.
@@ -65,21 +50,16 @@ Must take a project-id as a string, a list of keys, and return JQL as a string."
 Used by both `ejira-update-my-projects' (full list) and `ejira-update-project'
 (single-element list). Must take a list of project-id strings and return JQL.")
 
-(defun ejira-add-comment (to-clocked)
-  "Capture new comment to issue under point.
-With prefix-argument TO-CLOCKED add comment to currently clocked issue."
-  (interactive "P")
-  (ejira--capture-comment (if to-clocked
-                              (ejira--get-clocked-issue)
-                            (ejira-issue-id-under-point))))
 
 (defun ejira-delete-comment ()
-  "Delete comment under point."
+  "Stage a comment deletion. Confirmed via ejira-confirm on next save."
   (interactive)
   (let* ((item (ejira-get-id-under-point "ejira-comment"))
          (id (nth 1 item)))
-    (when (y-or-n-p (format "Delete comment %s? " (cdr id)))
-      (ejira--delete-comment (car id) (cdr id)))))
+    (when (y-or-n-p (format "Stage comment %s for deletion? " (cdr id)))
+      (org-with-point-at (nth 2 item)
+        (org-set-property "PendingDelete" "t"))
+      (message "ejira: comment deletion staged — save buffer to confirm."))))
 
 (defun ejira-jql-all-unresolved-multi-project-tickets (project-ids)
   "Default multi-project JQL for `ejira-update-jql-unresolved-multi-fn'.
@@ -247,126 +227,11 @@ Called from async callbacks once all network responses have arrived."
           (t
            (ejira--update-task id)))))
 
-(defun ejira--push-finalize (marker)
-  "Refresh MARKER's push baseline after a successful push and save its buffer.
-`ejira--pushing' is bound so the resulting save does not re-trigger
-`ejira--push-on-save'."
-  (org-with-point-at marker (ejira--update-push-baseline))
-  (let ((ejira--pushing t))
-    (with-current-buffer (marker-buffer marker)
-      (when (buffer-modified-p) (save-buffer)))))
-
-(defun ejira--push-plan-at-point ()
-  "Return a push plan for the ejira heading at point, or nil if not pushable.
-The plan is a plist (:title :changes :send): CHANGES is the org-space diff
-against the current server state (nil when nothing differs), and SEND is a
-thunk that pushes the item and refreshes its baseline.  The diff is computed
-in org-space so a freshly-synced item is idempotent (no heading-level noise)."
-  (let ((type (org-entry-get nil "TYPE")))
-    (cond
-     ((equal type "ejira-comment")
-      (let* ((ikey (org-entry-get nil "ID" t))
-             (commid (org-entry-get nil "CommId"))
-             (marker (point-marker))
-             (local-org (ejira--get-heading-body marker))
-             (remote-jira (ejira--alist-get
-                           (jiralib2-get-comment ikey commid) 'body))
-             (remote-org (ejira--expected-org-body marker remote-jira)))
-        (list :title (format "%s comment %s" ikey commid)
-              :changes (ejira-confirm-field-changes
-                        `(("body" ,remote-org ,local-org)))
-              :send (lambda ()
-                      (jiralib2-edit-comment
-                       ikey commid (ejira-parser-org-to-jira local-org))
-                      (ejira--push-finalize marker)
-                      (message "ejira: pushed comment %s of %s" commid ikey)))))
-     ((member type ejira-pushable-types)
-      (let* ((id (org-entry-get nil "ID"))
-             (marker (point-marker))
-             (desc-heading (ejira--find-child-heading ejira-description-heading-name))
-             (local-summary (ejira--strip-properties (org-get-heading t t t t)))
-             (local-org-desc (if desc-heading (ejira--get-heading-body desc-heading) ""))
-             (remote (jiralib2-get-issue id))
-             (remote-summary (ejira--alist-get remote 'fields 'summary))
-             (remote-org-desc (ejira--expected-org-body
-                               (or desc-heading marker)
-                               (ejira--alist-get remote 'fields 'description))))
-        (list :title id
-              :changes (ejira-confirm-field-changes
-                        `(("summary"     ,remote-summary  ,local-summary)
-                          ("description" ,remote-org-desc ,local-org-desc)))
-              :send (lambda ()
-                      (jiralib2-update-summary-description
-                       id local-summary (ejira-parser-org-to-jira local-org-desc))
-                      (ejira--push-finalize marker)
-                      (message "ejira: pushed %s" id))))))))
 
 (defun ejira-push-item-under-point ()
-  "Upload content of the issue or comment under point to the server.
-For a task this is the summary and description, for a comment the body.
-When `ejira-push-confirm' is non-nil the current server state is fetched
-first and pending changes are shown in a review buffer; nothing is sent
-until you confirm with \\<ejira-confirm-mode-map>\\[ejira-confirm-execute]."
+  "Push the ejira item at point through ejira-confirm."
   (interactive)
-  (let* ((item (ejira-get-id-under-point))
-         (type (nth 0 item))
-         (marker (nth 2 item)))
-    (if (equal type "ejira-project")
-        (message "TODO")
-      (org-with-point-at marker
-        (let ((plan (ejira--push-plan-at-point)))
-          (cond
-           ((not ejira-push-confirm) (funcall (plist-get plan :send)))
-           ((null (plist-get plan :changes)) (message "ejira: no changes to push"))
-           (t (ejira-confirm-show (list plan)))))))))
-
-(defun ejira--buffer-has-pushable-p ()
-  "Return non-nil if the current buffer contains any ejira-managed heading.
-Detected by the :Pushhash: baseline property, which travels with a subtree
-when it is refiled out of `ejira-org-directory'.  Cheap enough to run on every
-org save as a gate before the full dirty scan."
-  (save-restriction
-    (widen)
-    (save-excursion
-      (goto-char (point-min))
-      (re-search-forward "^[ \t]*:Pushhash:" nil t))))
-
-(defun ejira--dirty-heading-markers ()
-  "Return markers to pushable headings in the current buffer with local edits.
-`ejira--syncing' is bound so `ejira--with-expand-all' skips its per-heading
-outline save/restore — text extraction is fold-agnostic, and without this the
-scan is O(n^2) in heading count."
-  (let ((ejira--syncing t)
-        markers)
-    (org-with-wide-buffer
-     (goto-char (point-min))
-     (while (re-search-forward org-heading-regexp nil t)
-       (when (and (member (org-entry-get nil "TYPE") ejira-pushable-types)
-                  (ejira--locally-modified-p))
-         (push (point-marker) markers))
-       (goto-char (line-end-position))))
-    (nreverse markers)))
-
-(defun ejira--push-on-save ()
-  "Offer to push locally-edited ejira items after saving a managed buffer.
-Installed on `after-save-hook'.  Items are detected via their :Pushhash:
-baseline; only changed ones hit the network, and the review buffer is shown
-only when at least one item actually differs from the server."
-  (when (and ejira-push-on-save
-             (not ejira--pushing)
-             (not ejira--syncing)
-             (derived-mode-p 'org-mode)
-             (ejira--buffer-has-pushable-p))
-    (let ((plans (delq nil
-                       (mapcar (lambda (m)
-                                 (org-with-point-at m
-                                   (let ((plan (ejira--push-plan-at-point)))
-                                     (when (plist-get plan :changes) plan))))
-                               (ejira--dirty-heading-markers)))))
-      (when plans
-        (ejira-confirm-show plans)))))
-
-(add-hook 'after-save-hook #'ejira--push-on-save)
+  (ejira-push-at-point))
 
 (defun ejira-browse-issue-under-point ()
   "Open the current issue in external browser."
@@ -374,48 +239,23 @@ only when at least one item actually differs from the server."
   (browse-url (concat (replace-regexp-in-string "/*$" "" jiralib2-url) "/browse/" (ejira-issue-id-under-point))))
 
 
-(defun ejira--heading-to-item (heading project-id type &rest args)
-  "Create an item from HEADING of TYPE into PROJECT-ID with parameters ARGS."
-  (let* ((summary (ejira--strip-properties (org-get-heading t t t t)))
-         (description (ejira-parser-org-to-jira (ejira--get-heading-body heading)))
-         (item (ejira--parse-item
-                (apply #'jiralib2-create-issue project-id
-                       type summary description args))))
-
-    (ejira--update-task (ejira-task-key item))
-    (ejira-task-key item)))
 
 (defun ejira-heading-to-task (focus)
-  "Make the current org-heading into a JIRA task.
-With prefix argument FOCUS, focus the issue after creating."
+  "Mark the current heading as a pending Jira issue creation.
+Ensure it has a TODO state; save the buffer to stage creation via ejira-confirm.
+FOCUS is accepted for compatibility but has no effect until confirmed."
   (interactive "P")
-  (let* ((heading (save-excursion
-                    (if (outline-on-heading-p t)
-                        (beginning-of-line)
-                      (outline-back-to-heading))
-                    (point-marker)))
-         (project-id (ejira--select-project))
-         (key (when project-id (ejira--heading-to-item heading project-id "Task"))))
-
-    (when (and key focus)
-      (ejira-focus-on-issue key))))
+  (unless (org-get-todo-state)
+    (org-todo (car org-todo-keywords-1)))
+  (message "ejira: heading marked as pending issue — save buffer to stage."))
 
 (defun ejira-heading-to-subtask (focus)
-  "Make the current org-heading into a JIRA subtask.
-With prefix argument FOCUS, focus the issue after creating."
+  "Mark the current heading as a pending Jira subtask creation.
+Save the buffer to stage creation via ejira-confirm."
   (interactive "P")
-  (let* ((heading (save-excursion
-                    (if (outline-on-heading-p t)
-                        (beginning-of-line)
-                      (outline-back-to-heading))
-                    (point-marker)))
-         (story (ejira--select-story))
-         (project-id (ejira--get-project story))
-         (key (when project-id(ejira--heading-to-item heading project-id
-                                                      ejira-subtask-type-name
-                                                      `(parent . ((key . ,story)))))))
-    (when (and key focus)
-      (ejira-focus-on-issue key))))
+  (unless (org-get-todo-state)
+    (org-todo (car org-todo-keywords-1)))
+  (message "ejira: heading marked as pending subtask — save buffer to stage."))
 
 (defun ejira-update-project (id &optional shallow)
   "Update all issues in project ID.
@@ -546,27 +386,18 @@ parallel, then applies all updates synchronously when both arrive."
 
 ;;;###autoload
 (defun ejira-set-deadline (arg &optional time)
-  "Wrapper around `org-deadline' which pushes the changed deadline to server.
-ARG and TIME get passed on to `org-deadline'."
+  "Set deadline of issue under point. Save buffer to stage push."
   (interactive "P")
   (ejira--with-point-on (ejira-issue-id-under-point)
-    (org-deadline arg time)
-    (when ejira-push-deadline-changes
-      (let ((deadline (org-get-deadline-time (point-marker))))
-        (jiralib2-update-issue (ejira-issue-id-under-point)
-                               `(duedate . ,(when deadline
-                                              (format-time-string "%Y-%m-%d"
-                                                                  deadline))))))))
+    (org-deadline arg time)))
 
 ;;;###autoload
 (defun ejira-set-priority ()
-  "Set priority of the issue under point."
+  "Set priority of the issue under point. Save buffer to stage push."
   (interactive)
   (ejira--with-point-on (ejira-issue-id-under-point)
     (let ((p (completing-read "Priority: "
                               (mapcar #'car ejira-priorities-alist))))
-      (jiralib2-update-issue (ejira-issue-id-under-point)
-                             `(priority . ((name . ,p))))
       (org-priority (alist-get p ejira-priorities-alist nil nil #'equal)))))
 
 ;;;###autoload
@@ -578,31 +409,42 @@ With prefix-argument TO-ME assign to me."
 
 ;;;###autoload
 (defun ejira-progress-issue ()
-  "Progress the issue under point with a selected action."
+  "Stage a Jira status transition. The actual transition is confirmed via ejira-confirm on save."
   (interactive)
-  (ejira--progress-item (ejira-issue-id-under-point)))
+  (let* ((key (ejira-issue-id-under-point))
+         (actions (jiralib2-get-actions key))
+         (selected (rassoc
+                    (completing-read "Action: " (mapcar #'cdr actions))
+                    actions)))
+    (when selected
+      (ejira--with-point-on key
+        (org-set-property "PendingTransition" (cdr selected)))
+      (message "ejira: transition '%s' staged — save buffer to confirm."
+               (cdr selected)))))
 
 ;;;###autoload
 (defun ejira-set-issuetype ()
-  "Select a new issuetype for the issue under point."
+  "Stage an issuetype change for the issue under point."
   (interactive)
   (let* ((id (ejira-get-id-under-point nil t))
-         (ejira-type (nth 0 id))
-         (key (if (equal ejira-type "ejira-comment")
-                  (user-error "Cannot set type of comment")
-                (nth 1 id)))
+         (key (nth 1 id))
          (type (ejira--select-issuetype)))
-    (jiralib2-set-issue-type key  type)
-    (ejira--update-task key)))
+    (when type
+      (ejira--with-point-on key
+        (org-set-property "PendingIssuetype" type))
+      (message "ejira: issuetype '%s' staged — save buffer to confirm." type))))
 
 ;;;###autoload
 (defun ejira-set-epic ()
-  "Select a new epic for issue under point."
+  "Stage an epic change for the issue under point."
   (interactive)
-  (ejira--set-epic (ejira-issue-id-under-point)
-                   (ejira--select-id-or-nil
-                    "Select epic: "
-                    (ejira--get-headings-in-agenda-files :type "ejira-epic"))))
+  (let* ((id (ejira-issue-id-under-point))
+         (epic (ejira--select-id-or-nil
+                "Select epic: "
+                (ejira--get-headings-in-agenda-files :type "ejira-epic"))))
+    (ejira--with-point-on id
+      (org-set-property "PendingEpic" (or epic "")))
+    (message "ejira: epic change staged — save buffer to confirm.")))
 
 ;;;###autoload
 (defun ejira-focus-on-issue (key)

@@ -7,17 +7,19 @@
 ;; Provides a dedicated major mode for reviewing pending push changes
 ;; before sending them to the Jira API.  Modeled on orgist-confirm.el.
 ;;
-;;   Ejira Push — 2 item(s), 3 change(s)
-;;   ════════════════════════
-;;   ▼ SECBUG-908  summary, description
-;;     ▶ summary:      "old" → "new"
-;;     ▶ description:  "old…" → "new…"
-;;   ▼ RNDSEC-3493  description
-;;     ▶ description:  "old…" → "new…"
+;; Three-level tree: project > item > field
 ;;
-;; An item header (▼/▶) collapses its field list; a field header (▶/▼)
-;; expands the full old/new text.  C-c C-c sends every item's request,
-;; C-c C-k aborts without sending.
+;;   Ejira Push — 3 item(s): 1 new, 1 modified, 1 deleted
+;;   ═══════════════════════════════════════════════════════
+;;   ▼ RNDSEC  2 new, 1 modified
+;;     + new subtask: My heading title
+;;     ▶ ✎ RNDSEC-123  summary, assignee
+;;       ── old ──
+;;       ...
+;;     ✗ delete comment on RNDSEC-456  ⚠ permanent
+;;       "Comment body preview…"
+;;
+;; C-c C-c sends all items, C-c C-k aborts.  TAB toggles sections.
 
 ;;; Code:
 
@@ -28,6 +30,11 @@
 (defface ejira-confirm-title
   '((t :weight bold :height 1.2))
   "Face for the confirmation buffer title."
+  :group 'ejira)
+
+(defface ejira-confirm-project
+  '((t :weight bold :inherit font-lock-keyword-face))
+  "Face for project section headers."
   :group 'ejira)
 
 (defface ejira-confirm-item
@@ -60,16 +67,28 @@
   "Face for keybinding hints."
   :group 'ejira)
 
+(defface ejira-confirm-new
+  '((t :foreground "#44aa44" :weight bold))
+  "Face for new item markers (+)."
+  :group 'ejira)
+
+(defface ejira-confirm-deleted
+  '((t :foreground "#cc4444" :weight bold))
+  "Face for deleted item markers (✗)."
+  :group 'ejira)
+
+(defface ejira-confirm-warning
+  '((t :foreground "#cc8800" :weight bold))
+  "Face for deletion warning text."
+  :group 'ejira)
+
 ;;; Buffer-local state
 
-(defvar-local ejira-confirm--groups nil
-  "List of item groups being reviewed.
-Each group is a plist (:title :changes :send) as passed to
-`ejira-confirm-show'.")
+(defvar-local ejira-confirm--plans nil)
 
 (defvar-local ejira-confirm--nodes nil
-  "List of collapsible nodes.
-Each node is a plist (:marker MARKER :overlay OVERLAY).")
+  "List of plists (:marker MARKER :overlay OVERLAY :level LEVEL).
+LEVEL is one of: project item field.")
 
 ;;; Diff helpers
 
@@ -85,44 +104,101 @@ FIELDS is a list of (NAME OLD NEW) string triples."
                          (ejira-confirm--normalize (nth 2 f))))
                 fields))
 
+;;; Grouping helpers
+
+(defun ejira-confirm--group-by-project (plans)
+  "Return alist (project-key . plans-list) sorted alphabetically."
+  (let (groups)
+    (dolist (plan plans)
+      (let* ((proj (or (plist-get plan :project) "?"))
+             (cell (assoc proj groups)))
+        (if cell (setcdr cell (append (cdr cell) (list plan)))
+          (push (cons proj (list plan)) groups))))
+    (sort groups (lambda (a b) (string< (car a) (car b))))))
+
+(defun ejira-confirm--count-ops (plans)
+  "Return alist of (op-symbol . count) for PLANS."
+  (let ((counts '()))
+    (dolist (plan plans)
+      (let* ((op (plist-get plan :op))
+             (cell (assq op counts)))
+        (if cell (setcdr cell (1+ (cdr cell)))
+          (push (cons op 1) counts))))
+    counts))
+
 ;;; Entry point
 
-(defun ejira-confirm-show (groups)
-  "Display a confirmation buffer for pending push GROUPS.
-GROUPS is a list of plists, each with:
-  :title    string identifying the item (e.g. an issue key)
-  :changes  list of (FIELD-NAME OLD NEW) string triples that differ
-  :send     thunk called with no arguments to push that item
-On confirm every group's :send thunk runs; on cancel none do."
-  (let ((buf (get-buffer-create "*ejira-confirm*"))
-        (n-items (length groups))
-        (n-changes (apply #'+ (mapcar (lambda (g) (length (plist-get g :changes)))
-                                      groups))))
+(defun ejira-confirm-show (plans)
+  "Display confirmation buffer for pending push PLANS."
+  (let* ((grouped (ejira-confirm--group-by-project plans))
+         (counts (ejira-confirm--count-ops plans))
+         (buf (get-buffer-create "*ejira-confirm*")))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
-        ;; Set mode BEFORE rendering so kill-all-local-variables does not
-        ;; wipe out buffer-local state populated during rendering.
         (ejira-confirm-mode)
-        (ejira-confirm--insert-header n-items n-changes)
-        (dolist (group groups)
-          (ejira-confirm--insert-group group))
+        (ejira-confirm--insert-header (length plans) counts)
+        (dolist (group grouped)
+          (ejira-confirm--insert-project (car group) (cdr group)))
         (ejira-confirm--insert-footer))
       (goto-char (point-min))
-      (setq ejira-confirm--groups groups))
+      (setq ejira-confirm--plans plans))
     (pop-to-buffer buf)))
 
 ;;; Rendering
 
-(defun ejira-confirm--insert-header (n-items n-changes)
-  "Insert the buffer header for N-ITEMS items and N-CHANGES changes."
-  (let ((line (format "Ejira Push — %d item%s, %d change%s"
-                      n-items (if (= n-items 1) "" "s")
-                      n-changes (if (= n-changes 1) "" "s"))))
-    (insert (propertize line 'face 'ejira-confirm-title)
-            "\n"
-            (make-string (length line) ?═)
-            "\n\n")))
+(defun ejira-confirm--insert-header (n counts)
+  "Insert buffer header for N items with op COUNTS alist."
+  (let* ((parts nil)
+         (n-create (alist-get 'create counts 0))
+         (n-update (alist-get 'update counts 0))
+         (n-delete (alist-get 'delete counts 0)))
+    (when (> n-create 0) (push (format "%d new" n-create) parts))
+    (when (> n-update 0) (push (format "%d modified" n-update) parts))
+    (when (> n-delete 0) (push (format "%d deleted" n-delete) parts))
+    (let ((line (format "Ejira Push — %d item%s%s"
+                        n
+                        (if (= n 1) "" "s")
+                        (if parts
+                            (concat ": " (string-join (nreverse parts) ", "))
+                          ""))))
+      (insert (propertize line 'face 'ejira-confirm-title)
+              "\n"
+              (make-string (length line) ?═)
+              "\n\n"))))
+
+(defun ejira-confirm--project-op-summary (plans)
+  "Return a summary string of op counts for PLANS within one project."
+  (let* ((counts (ejira-confirm--count-ops plans))
+         (parts nil)
+         (n-create (alist-get 'create counts 0))
+         (n-update (alist-get 'update counts 0))
+         (n-delete (alist-get 'delete counts 0)))
+    (when (> n-create 0) (push (format "%d new" n-create) parts))
+    (when (> n-update 0) (push (format "%d modified" n-update) parts))
+    (when (> n-delete 0) (push (format "%d deleted" n-delete) parts))
+    (if parts
+        (concat "  " (string-join (nreverse parts) ", "))
+      "")))
+
+(defun ejira-confirm--insert-project (project-key plans)
+  "Insert a collapsible project section for PROJECT-KEY with PLANS."
+  (let* ((summary (ejira-confirm--project-op-summary plans))
+         (header-start (point)))
+    (insert (propertize "▼" 'ejira-confirm-arrow t)
+            " "
+            (propertize project-key 'face 'ejira-confirm-project)
+            (propertize summary 'face 'ejira-confirm-summary)
+            "\n")
+    (let ((body-start (point)))
+      (dolist (plan plans)
+        (ejira-confirm--insert-item plan))
+      (insert "\n")
+      (let ((ov (make-overlay body-start (point))))
+        (overlay-put ov 'invisible nil)
+        (overlay-put ov 'ejira-confirm-node t)
+        (push (list :marker (copy-marker header-start) :overlay ov :level 'project)
+              ejira-confirm--nodes)))))
 
 (defun ejira-confirm--truncate (s)
   "Flatten and truncate S for one-line display."
@@ -131,34 +207,71 @@ On confirm every group's :send thunk runs; on cancel none do."
         (concat "\"" (substring flat 0 55) "…\"")
       (format "%S" flat))))
 
-(defun ejira-confirm--insert-group (group)
-  "Insert a collapsible item section for GROUP."
-  (let* ((title (plist-get group :title))
-         (changes (plist-get group :changes))
-         (field-names (mapcar #'car changes))
-         (header-start (point)))
-    ;; Item header line (collapses the field list)
-    (insert (propertize "▼" 'ejira-confirm-arrow t)
-            " "
-            (propertize title 'face 'ejira-confirm-item)
-            (propertize (concat "  " (string-join field-names ", "))
-                        'face 'ejira-confirm-summary)
-            "\n")
-    (let ((body-start (point)))
-      (dolist (change changes)
-        (ejira-confirm--insert-field
-         (nth 0 change) (nth 1 change) (nth 2 change)))
-      ;; Overlay for the item body (all its field lines + details)
-      (let ((ov (make-overlay body-start (point))))
-        (overlay-put ov 'invisible nil)
-        (overlay-put ov 'ejira-confirm-node t)
-        (push (list :marker (copy-marker header-start) :overlay ov)
-              ejira-confirm--nodes)))))
+(defun ejira-confirm--insert-item (plan)
+  "Insert a rendered item line for PLAN.  Dispatches on :op."
+  (let ((op (plist-get plan :op))
+        (title (plist-get plan :title)))
+    (pcase op
+      ('create
+       (let* ((preview (plist-get plan :preview))
+              (header-start (point)))
+         (insert "  "
+                 (propertize "+" 'face 'ejira-confirm-new)
+                 "  "
+                 (propertize title 'face 'ejira-confirm-item)
+                 "\n")
+         (when (and preview (> (length preview) 0))
+           (let ((detail-start (point)))
+             (insert "       "
+                     (propertize (ejira-confirm--truncate preview)
+                                 'face 'ejira-confirm-summary)
+                     "\n")
+             (let ((ov (make-overlay detail-start (point))))
+               (overlay-put ov 'invisible t)
+               (overlay-put ov 'ejira-confirm-node t)
+               (push (list :marker (copy-marker header-start) :overlay ov :level 'item)
+                     ejira-confirm--nodes))))))
+
+      ('update
+       (let* ((changes (plist-get plan :changes))
+              (field-names (mapcar #'car changes))
+              (header-start (point)))
+         (insert "  "
+                 (propertize "▶" 'ejira-confirm-arrow t)
+                 " ✎ "
+                 (propertize title 'face 'ejira-confirm-item)
+                 (propertize (concat "  " (string-join field-names ", "))
+                             'face 'ejira-confirm-summary)
+                 "\n")
+         (let ((detail-start (point)))
+           (dolist (change changes)
+             (ejira-confirm--insert-field
+              (nth 0 change) (nth 1 change) (nth 2 change)))
+           (let ((ov (make-overlay detail-start (point))))
+             (overlay-put ov 'invisible t)
+             (overlay-put ov 'ejira-confirm-node t)
+             (push (list :marker (copy-marker header-start) :overlay ov :level 'item)
+                   ejira-confirm--nodes)))))
+
+      ('delete
+       (let ((preview (plist-get plan :preview)))
+         (insert "  "
+                 (propertize "✗" 'face 'ejira-confirm-deleted)
+                 " "
+                 (propertize title 'face 'ejira-confirm-deleted)
+                 "  "
+                 (propertize "⚠ permanent" 'face 'ejira-confirm-warning)
+                 "\n")
+         (when (and preview (> (length preview) 0))
+           (insert "    "
+                   (propertize (ejira-confirm--truncate preview)
+                               'face 'ejira-confirm-old-value)
+                   "\n")))))))
 
 (defun ejira-confirm--insert-field (name old new)
   "Insert an expandable change line for field NAME showing OLD → NEW."
   (let ((header-start (point)))
-    (insert "  "
+    (insert "    "
             (propertize "▶" 'ejira-confirm-arrow t)
             " "
             (propertize (format "%-14s" (concat name ":"))
@@ -169,18 +282,17 @@ On confirm every group's :send thunk runs; on cancel none do."
             (propertize (ejira-confirm--truncate new)
                         'face 'ejira-confirm-new-value)
             "\n")
-    ;; Full-text detail block (initially hidden)
     (let ((detail-start (point)))
-      (insert (propertize "      ── old ──\n" 'face 'ejira-confirm-summary))
+      (insert (propertize "        ── old ──\n" 'face 'ejira-confirm-summary))
       (dolist (line (split-string (ejira-confirm--normalize old) "\n"))
-        (insert "      " (propertize line 'face 'ejira-confirm-old-value) "\n"))
-      (insert (propertize "      ── new ──\n" 'face 'ejira-confirm-summary))
+        (insert "        " (propertize line 'face 'ejira-confirm-old-value) "\n"))
+      (insert (propertize "        ── new ──\n" 'face 'ejira-confirm-summary))
       (dolist (line (split-string (ejira-confirm--normalize new) "\n"))
-        (insert "      " (propertize line 'face 'ejira-confirm-new-value) "\n"))
+        (insert "        " (propertize line 'face 'ejira-confirm-new-value) "\n"))
       (let ((ov (make-overlay detail-start (point))))
         (overlay-put ov 'invisible t)
         (overlay-put ov 'ejira-confirm-node t)
-        (push (list :marker (copy-marker header-start) :overlay ov)
+        (push (list :marker (copy-marker header-start) :overlay ov :level 'field)
               ejira-confirm--nodes)))))
 
 (defun ejira-confirm--insert-footer ()
@@ -196,12 +308,16 @@ On confirm every group's :send thunk runs; on cancel none do."
 ;;; Interaction
 
 (defun ejira-confirm-execute ()
-  "Confirm and send every pending item's push request."
+  "Confirm and execute all pending push operations."
   (interactive)
-  (let ((groups ejira-confirm--groups))
+  (let ((plans ejira-confirm--plans))
     (quit-window t)
-    (dolist (group groups)
-      (funcall (plist-get group :send)))))
+    (dolist (plan plans)
+      (condition-case err
+          (funcall (plist-get plan :send))
+        (error (message "ejira: push failed for %s: %s"
+                        (plist-get plan :title)
+                        (error-message-string err)))))))
 
 (defun ejira-confirm-cancel ()
   "Cancel the push and close the confirmation buffer."
