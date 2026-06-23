@@ -612,14 +612,15 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
     (nreverse plans)))
 
 (defmacro ejira--with-pre-scan (buf &rest body)
-  "Pre-expand BUF once and bind `ejira--pre-scanning' t for BODY.
-This reduces the scan+build pipeline from N×outline-show-all to one call."
+  "Bind `ejira--pre-scanning' t while scanning BUF for pending operations.
+Causes all `ejira--with-expand-all' calls to skip their per-call
+`outline-show-all', which is safe because org structural navigation
+(org-goto-first-child, re-search-forward, org-narrow-to-subtree, etc.)
+operates on buffer text regardless of fold state."
   (declare (indent 1))
   `(with-current-buffer ,buf
-     (org-save-outline-visibility t
-       (outline-show-all)
-       (let ((ejira--pre-scanning t))
-         ,@body))))
+     (let ((ejira--pre-scanning t))
+       ,@body)))
 
 (defun ejira-push-at-point ()
   "Scan the ejira heading at point and show ejira-confirm for it."
