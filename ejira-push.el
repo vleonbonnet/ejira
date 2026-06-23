@@ -229,7 +229,7 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                         (parent-id (nth 1 parent-info)))
                    (cond
                     ((member parent-type '("ejira-issue" "ejira-story"
-                                          "ejira-epic" "ejira-subtask"))
+                                          "ejira-epic"))
                      (let ((project-key (car (split-string parent-id "-"))))
                        (push (list :op 'create
                                    :object 'subtask

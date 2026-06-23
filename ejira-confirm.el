@@ -296,7 +296,7 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
                  (propertize label 'face 'ejira-confirm-item)
                  ": "
                  (if (and state-val (> (length state-val) 0))
-                     (concat (propertize state-val 'face 'ejira-confirm-summary) " ")
+                     (concat state-val " ")
                    "")
                  (propertize title-disp 'face 'ejira-confirm-item)
                  "\n")
@@ -349,11 +349,9 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
             (propertize "▼" 'ejira-confirm-arrow t)
             " "
             (if update-plan "✎ " "")
-            (propertize issue-key 'face 'ejira-confirm-item)
-            (if (and title (not (string-empty-p title)))
-                (concat " " (propertize title 'face 'ejira-confirm-summary))
-              "")
-            (propertize summary 'face 'ejira-confirm-summary)
+            (propertize (or (and title (not (string-empty-p title)) title) issue-key)
+                        'face 'ejira-confirm-item)
+            summary
             "\n")
     (let ((body-start (point)))
       (when update-plan
@@ -384,7 +382,7 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
                  (propertize "+" 'face 'ejira-confirm-new)
                  "  "
                  (if (and state-val (> (length state-val) 0))
-                     (concat (propertize state-val 'face 'ejira-confirm-summary) " ")
+                     (concat state-val " ")
                    "")
                  (propertize title 'face 'ejira-confirm-item)
                  "\n")
@@ -453,7 +451,7 @@ ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
     (insert (propertize "▼" 'ejira-confirm-arrow t)
             " "
             (propertize project-key 'face 'ejira-confirm-project)
-            (propertize summary 'face 'ejira-confirm-summary)
+            summary
             "\n")
     (let ((body-start (point)))
       (dolist (group issue-groups)
