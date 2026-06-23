@@ -403,7 +403,8 @@ offers to push locally-edited issues and comments through a review buffer.")
                              :parent-issue parent-key
                              :fields fields
                              :send (let ((marker marker) (project-key project-key)
-                                         (parent-key parent-key))
+                                         (parent-key parent-key)
+                                         (orig-state local-state))
                                      (lambda ()
                                        (let* ((summary (org-with-point-at marker
                                                           (ejira--strip-properties
@@ -426,7 +427,20 @@ offers to push locally-edited issues and comments through a review buffer.")
                                                   (abbreviate-file-name
                                                    (buffer-file-name (marker-buffer marker)))
                                                   org-id-locations)
-                                         (ejira--update-task new-key))))))))
+                                         (ejira--update-task new-key)
+                                         ;; Jira always creates issues in the project's initial
+                                         ;; state; ejira--update-task overwrites the local org
+                                         ;; state with that initial state.  Restore the original
+                                         ;; state so the user's intent is preserved.
+                                         (when (and (stringp orig-state) (> (length orig-state) 0))
+                                           (let* ((m (ejira--find-heading new-key))
+                                                  (cur (when m
+                                                         (org-with-point-at m
+                                                           (substring-no-properties
+                                                            (or (org-get-todo-state) ""))))))
+                                             (when (and m (not (equal cur orig-state)))
+                                               (org-with-point-at m
+                                                 (org-todo orig-state))))))))))))
          ((and (eq op-type 'create) (eq object 'issue))
           (let* ((project-key (plist-get data :project-key))
                  (heading-title (org-with-point-at marker
