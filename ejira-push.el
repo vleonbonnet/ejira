@@ -48,7 +48,11 @@ updates the baseline so the next scan does not see a spurious dirty heading."
   (puthash new-key
            (abbreviate-file-name (buffer-file-name (marker-buffer marker)))
            org-id-locations)
-  (ejira--transition-to-org-state new-key orig-state todo-keywords)
+  (condition-case err
+      (ejira--transition-to-org-state new-key orig-state todo-keywords)
+    (error (display-warning 'ejira (format "transition skipped for new issue %s: %s"
+                                         new-key (error-message-string err))
+                            :warning)))
   (ejira--update-task new-key)
   (when (and (stringp orig-state) (> (length orig-state) 0))
     (let* ((m (ejira--find-heading new-key))
@@ -301,14 +305,9 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
     (when issue-update-ops
       (let* ((keys (mapcar (lambda (op) (plist-get op :key)) issue-update-ops))
              (remote-items
-              (condition-case err
-                  (apply #'jiralib2-jql-search
-                         (format "key in (%s)" (s-join ", " keys))
-                         '("summary" "description" "assignee" "priority" "duedate" "status"))
-                (error
-                 (message "ejira: failed to fetch remote state: %s"
-                          (error-message-string err))
-                 nil))))
+              (apply #'jiralib2-jql-search
+                     (format "key in (%s)" (s-join ", " keys))
+                     '("summary" "description" "assignee" "priority" "duedate" "status"))))
         (dolist (op issue-update-ops)
           (let* ((key (plist-get op :key))
                  (marker (plist-get op :marker))
@@ -367,7 +366,7 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                  (priority-changed (assoc "priority" changes))
                  (deadline-changed (assoc "deadline" changes))
                  (state-changed (assoc "state" changes)))
-            (when changes
+            (if changes
               (push (list :op 'update
                           :object 'issue
                           :project project
@@ -406,7 +405,10 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                                     (when state-changed
                                       (ejira--transition-to-org-state key local-state todo-kws))
                                     (ejira--push-finalize marker))))
-                    plans))))))
+                    plans)
+              ;; No changes vs remote — re-baseline to clear the dirty hash.
+              (when item
+                (org-with-point-at marker (ejira--update-push-baseline))))))))
     (dolist (op (nreverse other-ops))
       (let* ((op-type (plist-get op :op))
              (object (plist-get op :object))
@@ -419,11 +421,7 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
          ((and (eq op-type 'update) (eq object 'comment))
           (let* ((issue-key (plist-get data :issue-key))
                  (commid (plist-get data :commid))
-                 (comment-data (condition-case err
-                                   (jiralib2-get-comment issue-key commid)
-                                 (error (message "ejira: failed to fetch comment: %s"
-                                                 (error-message-string err))
-                                        nil)))
+                 (comment-data (jiralib2-get-comment issue-key commid))
                  (remote-body (when comment-data (ejira--alist-get comment-data 'body)))
                  (remote-org (when comment-data
                                (ejira--expected-org-body marker remote-body)))
@@ -585,8 +583,12 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                                                (ejira--push-create-cascaded-subtask
                                                 new-key project-key child todo-kws)
                                              (error
-                                              (message "ejira: cascade subtask failed: %s"
-                                                       (error-message-string err))))))))))))
+                                              (display-warning
+                                               'ejira
+                                               (format "cascade subtask failed for %s: %s"
+                                                       (plist-get child :title)
+                                                       (error-message-string err))
+                                               :error)))))))))))
          ((and (eq op-type 'create) (eq object 'comment))
           (let* ((issue-key (plist-get data :issue-key))
                  (preview (let ((body (ejira--get-heading-body marker)))
