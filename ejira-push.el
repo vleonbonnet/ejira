@@ -15,6 +15,13 @@ offers to push locally-edited issues and comments through a review buffer.")
 (defvar ejira--pushing nil
   "Bound to t while a push batch is executing (inhibits re-scan on save).")
 
+(defvar ejira-state-resolution-alist
+  '((5 . "Done")
+    (6 . "Won't Fix"))
+  "Alist mapping org-todo-keyword index to the Jira resolution name used when
+a transition requires a resolution field (e.g. the 'Closed' workflow step).
+Index values correspond to positions in org-todo-keywords-1 (1-based).")
+
 (defun ejira--transition-to-org-state (key org-state todo-keywords)
   "Transition Jira issue KEY to the state mapped from ORG-STATE.
 TODO-KEYWORDS is the buffer's org-todo-keywords-1 list used for index lookup.
@@ -30,13 +37,36 @@ Signals an error if no matching transition is available or the API call fails."
             (delq nil (mapcar (lambda (e)
                                 (when (= (cdr e) idx) (car e)))
                               ejira-todo-states-alist)))
-           (actions (jiralib2-get-actions key))
+           ;; Fetch transitions with field metadata to detect required fields.
+           (all-transitions
+            (cdadr
+             (jiralib2-session-call
+              (format "/rest/api/2/issue/%s/transitions?expand=transitions.fields" key))))
+           (actions (mapcar (lambda (trans)
+                              (cons (cdr (assoc 'id trans))
+                                    (cdr (assoc 'name trans))))
+                            all-transitions))
            (action (cl-find-if (lambda (a) (member (cdr a) target-states))
                                actions)))
       (unless action
         (error "ejira: no Jira transition to %S available for %s (tried: %s)"
                org-state key (mapconcat #'identity target-states ", ")))
-      (jiralib2-do-action key (car action)))))
+      (let* ((action-id (car action))
+             (trans-detail (cl-find-if (lambda (tr)
+                                         (equal (cdr (assoc 'id tr)) action-id))
+                                       all-transitions))
+             (fields (cdr (assoc 'fields trans-detail)))
+             (res-field (cdr (assoc 'resolution fields)))
+             (resolution-required (eq (cdr (assoc 'required res-field)) t))
+             (resolution-name (when resolution-required
+                                (cdr (assq idx ejira-state-resolution-alist)))))
+        (if resolution-name
+            (jiralib2-session-call
+             (format "/rest/api/2/issue/%s/transitions" key)
+             :type "POST"
+             :data (json-encode `((transition . ((id . ,action-id)))
+                                  (fields . ((resolution . ((name . ,resolution-name))))))))
+          (jiralib2-do-action key action-id))))))
 
 (defun ejira--finalize-new-issue (new-key marker orig-state todo-keywords)
   "Post-create housekeeping for a newly-created Jira issue NEW-KEY.
