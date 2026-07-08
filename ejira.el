@@ -71,7 +71,7 @@ Returns unresolved tickets across all PROJECT-IDS."
   "Builds JQL for server-resolved project tickets in PROJECT-ID from local KEYS.
 This is the function used in `ejira-update-project'. Override with
 `ejira-update-jql-resolved-fn'."
-  (format "project = '%s' and key in (%s) and resolution = done"
+  (format "project = '%s' and key in (%s) and statusCategory = Done"
           project-id (s-join ", " keys)))
 
 
@@ -131,7 +131,8 @@ traces there.  Debugging aid for locating where a sync stalls; nil disables it."
 (defun ejira--apply-sync (projects unresolved-items resolved-items shallow)
   "Apply UNRESOLVED-ITEMS and RESOLVED-ITEMS to org files for PROJECTS.
 Called from async callbacks once all network responses have arrived."
-  ;; Suppress the \"changed since visited or saved\" prompt for the entire sync.
+  (unwind-protect
+      ;; Suppress the \"changed since visited or saved\" prompt for the entire sync.
   ;; ejira--new-heading calls basic-save-buffer mid-sync to register new IDs,
   ;; which advances the on-disk modtime while we continue editing the buffer.
   ;; Overriding verify-visited-file-modtime to always return t prevents
@@ -211,7 +212,8 @@ Called from async callbacks once all network responses have arrived."
       ;; (seconds, even minutes cold) is wasteful here.
       (org-id-locations-save)
       (ejira--trace "after org-id-locations-save (DONE)")))
-  (message "ejira: sync finished"))
+    (setq ejira--sync-in-progress nil)
+    (message "ejira: sync finished")))
 
 (defun ejira-pull-item-under-point ()
   "Update the issue, project or comment under point."
@@ -261,76 +263,80 @@ Save the buffer to stage creation via ejira-confirm."
   "Update all issues in project ID.
 If DEEP set to t, update each issue with separate API call which pulls also
 comments. With SHALLOW, only update todo status and assignee."
-  (ejira--update-project id)
+  (setq ejira--sync-in-progress t)
+  (unwind-protect
+      (progn
+        (ejira--update-project id)
 
-  ;; Expand the project buffer once so ejira--with-expand-all becomes a no-op
-  ;; inside the sync loop instead of save/restoring outline visibility per op.
-  (let* ((ejira--syncing t)
-         (ejira--heading-cache (make-hash-table :test 'equal))
-         ;; See ejira--apply-sync: disable org-element cache during bulk edits.
-         (org-element-use-cache nil)
-         (proj-buf (find-file-noselect
-                    (expand-file-name (ejira--project-file-name id))))
-         (vis-save (with-current-buffer proj-buf (org-fold-core-get-regions))))
-    (with-current-buffer proj-buf (outline-show-all))
+        ;; Expand the project buffer once so ejira--with-expand-all becomes a no-op
+        ;; inside the sync loop instead of save/restoring outline visibility per op.
+        (let* ((ejira--syncing t)
+               (ejira--heading-cache (make-hash-table :test 'equal))
+               ;; See ejira--apply-sync: disable org-element cache during bulk edits.
+               (org-element-use-cache nil)
+               (proj-buf (find-file-noselect
+                          (expand-file-name (ejira--project-file-name id))))
+               (vis-save (with-current-buffer proj-buf (org-fold-core-get-regions))))
+          (with-current-buffer proj-buf (outline-show-all))
 
-  ;; First, update all items that are marked as unresolved.
-  ;;
-  ;; Handles cases:
-  ;; *local*    | *remote*
-  ;; ===========+===========
-  ;;            | unresolved
-  ;; unresolved | unresolved
-  ;; resolved   | unresolved
-  ;;
-  (mapc (lambda (i) (if shallow
-                        (ejira--update-task-light
-                         (ejira--alist-get i 'key)
-                         (ejira--alist-get i 'fields 'status 'name)
-                         (ejira--alist-get i 'fields 'assignee 'displayName)
-                         (ejira--alist-get i 'fields 'resolution 'name))
-                      (ejira--update-task (ejira--parse-item i))))
-        (apply #'jiralib2-jql-search
-               (funcall ejira-update-jql-unresolved-multi-fn (list id))
-               (ejira--get-fields-to-sync shallow)))
+          ;; First, update all items that are marked as unresolved.
+          ;;
+          ;; Handles cases:
+          ;; *local*    | *remote*
+          ;; ===========+===========
+          ;;            | unresolved
+          ;; unresolved | unresolved
+          ;; resolved   | unresolved
+          ;;
+          (mapc (lambda (i) (if shallow
+                                (ejira--update-task-light
+                                 (ejira--alist-get i 'key)
+                                 (ejira--alist-get i 'fields 'status 'name)
+                                 (ejira--alist-get i 'fields 'assignee 'displayName)
+                                 (ejira--alist-get i 'fields 'resolution 'name))
+                             (ejira--update-task (ejira--parse-item i))))
+                (apply #'jiralib2-jql-search
+                       (funcall ejira-update-jql-unresolved-multi-fn (list id))
+                       (ejira--get-fields-to-sync shallow)))
 
-  ;; Then, sync any items that are still marked as unresolved in our local sync,
-  ;; but are already resolved at the server. This should ensure that there are
-  ;; no hanging todo items in our local sync.
-  ;;
-  ;; Handles cases:
-  ;; *local*    | *remote*
-  ;; ===========+===========
-  ;; unresolved | resolved
-  ;;
-  (let ((keys (mapcar #'car (ejira--get-headings-in-file
-                             (ejira--project-file-name id)
-                             '(:todo "todo")))))
-    (when keys
-      (mapc (lambda (i) (if shallow
-                            (ejira--update-task-light
-                             (ejira--alist-get i 'key)
-                             (ejira--alist-get i 'fields 'status 'name)
-                             (ejira--alist-get i 'fields 'assignee 'displayName)
-                             (ejira--alist-get i 'fields 'resolution 'name))
-                          (ejira--update-task (ejira--parse-item i))))
-            (apply #'jiralib2-jql-search
-               (funcall ejira-update-jql-resolved-fn id keys)
-                   (ejira--get-fields-to-sync shallow)))))
+          ;; Then, sync any items that are still marked as unresolved in our local sync,
+          ;; but are already resolved at the server. This should ensure that there are
+          ;; no hanging todo items in our local sync.
+          ;;
+          ;; Handles cases:
+          ;; *local*    | *remote*
+          ;; ===========+===========
+          ;; unresolved | resolved
+          ;;
+          (let ((keys (mapcar #'car (ejira--get-headings-in-file
+                                     (ejira--project-file-name id)
+                                     '(:todo "todo")))))
+            (when keys
+              (mapc (lambda (i) (if shallow
+                                    (ejira--update-task-light
+                                     (ejira--alist-get i 'key)
+                                     (ejira--alist-get i 'fields 'status 'name)
+                                     (ejira--alist-get i 'fields 'assignee 'displayName)
+                                     (ejira--alist-get i 'fields 'resolution 'name))
+                                 (ejira--update-task (ejira--parse-item i))))
+                    (apply #'jiralib2-jql-search
+                           (funcall ejira-update-jql-resolved-fn id keys)
+                           (ejira--get-fields-to-sync shallow)))))
 
-  ;; TODO: Handle issue being deleted from server:
-  ;; *local*    | *remote*
-  ;; ===========+===========
-  ;; unresolved |
-  ;; resolved   |
+          ;; TODO: Handle issue being deleted from server:
+          ;; *local*    | *remote*
+          ;; ===========+===========
+          ;; unresolved |
+          ;; resolved   |
 
-  ;; Normalize spacing, save, then restore fold state.
-  (when-let ((buf (find-buffer-visiting
-                   (expand-file-name (ejira--project-file-name id)))))
-    (with-current-buffer buf
-      (ejira--normalize-end-spacing)
-      (save-buffer)
-      (org-fold-core-regions vis-save :override t)))))
+          ;; Normalize spacing, save, then restore fold state.
+          (when-let ((buf (find-buffer-visiting
+                           (expand-file-name (ejira--project-file-name id)))))
+            (with-current-buffer buf
+              (ejira--normalize-end-spacing)
+              (save-buffer)
+              (org-fold-core-regions vis-save :override t)))))
+    (setq ejira--sync-in-progress nil)))
 
 ;;;###autoload
 (defun ejira-update-my-projects (&optional shallow)
@@ -343,47 +349,157 @@ parallel, then applies all updates synchronously when both arrive."
          (fields (ejira--get-fields-to-sync shallow))
          ;; Collect local TODO keys across all project files before firing
          ;; network requests — this is a fast local scan, no network needed.
+         ;; Bind ejira--syncing so ejira--with-expand-all skips outline-show-all,
+         ;; which can trigger org-element-cache parser errors on files with
+         ;; malformed Jira-sourced content (e.g. SECBUG.org descriptions).
          (local-todo-keys
-          (mapcan (lambda (id)
-                    (mapcar #'car
-                            (ejira--get-headings-in-file
-                             (ejira--project-file-name id) '(:todo "todo"))))
-                  projects))
+          (let ((ejira--syncing t))
+            (mapcan (lambda (id)
+                      (mapcar #'car
+                              (ejira--get-headings-in-file
+                               (ejira--project-file-name id) '(:todo "todo"))))
+                    projects)))
          ;; Mutable state shared between the two async callbacks.
          (pending 0)
          (all-unresolved nil)
          (all-resolved nil))
-    (cl-labels
-        ((maybe-apply ()
-           (when (= pending 0)
-             ;; Defer onto a zero-delay timer so the (long, synchronous) apply
-             ;; runs in the command loop where C-g works.  The request.el
-             ;; success callback fires from the curl process sentinel, where
-             ;; `inhibit-quit' is t — running apply-sync there makes it
-             ;; uninterruptible, so any slowness becomes a hard freeze.
-             (run-at-time 0 nil #'ejira--apply-sync
-                          projects all-unresolved all-resolved shallow))))
-      (message "ejira: fetching...")
-      ;; Fire unresolved query for all projects in one round-trip.
-      (cl-incf pending)
-      (ejira--async-jql
-       (funcall ejira-update-jql-unresolved-multi-fn projects) fields
-       (lambda (items) (setq all-unresolved items) (cl-decf pending) (maybe-apply))
-       (lambda (err) (message "ejira: unresolved fetch failed: %s" err) (cl-decf pending) (maybe-apply)))
-      ;; Fire resolved-check query in parallel if there are any local TODOs.
-      ;; This finds tickets that are TODO in org but already closed on Jira.
-      (if local-todo-keys
-          (progn
-            (cl-incf pending)
-            (ejira--async-jql
-             (format "key in (%s) and resolution = done"
-                     (s-join ", " local-todo-keys))
-             fields
-             (lambda (items) (setq all-resolved items) (cl-decf pending) (maybe-apply))
-             (lambda (_err) (cl-decf pending) (maybe-apply))))
-        ;; No local TODOs, nothing to check.
-        (maybe-apply)))))
+    (if (not projects)
+        (message "ejira: no projects configured — set `ejira-projects'")
+      (setq ejira--sync-in-progress t)
+      (cl-labels
+          ((maybe-apply ()
+             (when (= pending 0)
+               ;; Defer onto a zero-delay timer so the (long, synchronous) apply
+               ;; runs in the command loop where C-g works.  The request.el
+               ;; success callback fires from the curl process sentinel, where
+               ;; `inhibit-quit' is t — running apply-sync there makes it
+               ;; uninterruptible, so any slowness becomes a hard freeze.
+               (run-at-time 0 nil #'ejira--apply-sync
+                            projects all-unresolved all-resolved shallow))))
+        (message "ejira: fetching...")
+        ;; Fire unresolved query for all projects in one round-trip.
+        (cl-incf pending)
+        (ejira--async-jql
+         (funcall ejira-update-jql-unresolved-multi-fn projects) fields
+         (lambda (items) (setq all-unresolved items) (cl-decf pending) (maybe-apply))
+         (lambda (err) (message "ejira: unresolved fetch failed: %s" err) (cl-decf pending) (maybe-apply)))
+        ;; Fire resolved-check query in parallel if there are any local TODOs.
+        ;; This finds tickets that are TODO in org but already closed on Jira.
+        ;; Uses statusCategory = Done to catch all terminal-status issues,
+        ;; including those with null resolution (e.g. Cancelled).
+        (if local-todo-keys
+            (progn
+              (cl-incf pending)
+              (ejira--async-jql
+               (format "key in (%s) and statusCategory = Done"
+                       (s-join ", " local-todo-keys))
+               fields
+               (lambda (items) (setq all-resolved items) (cl-decf pending) (maybe-apply))
+               (lambda (_err) (cl-decf pending) (maybe-apply))))
+          ;; No local TODOs, nothing to check.
+          (maybe-apply))))))
 
+
+;;; Auto-pull
+
+(defcustom ejira-auto-pull-interval nil
+  "Seconds between automatic pulls from Jira, or nil to disable.
+When set, ejira periodically pulls changes on a timer and also
+pulls when switching to an ejira buffer if the interval has
+elapsed.  Auto-pull is read-only — it never triggers a push."
+  :group 'ejira
+  :type '(choice (integer :tag "Seconds")
+                 (const :tag "Disabled" nil)))
+
+(defcustom ejira-auto-pull-shallow t
+  "When non-nil, auto-pull uses shallow updates (status + assignee only).
+When nil, auto-pull performs full updates including comments and
+descriptions.  Shallow updates are faster and sufficient for
+tracking status changes."
+  :group 'ejira
+  :type 'boolean)
+
+(defvar ejira--auto-pull-timer nil
+  "Timer for periodic auto-pull, or nil when not running.")
+
+(defvar ejira--last-pull-time nil
+  "Time of the last pull (from `current-time').
+Used by auto-pull to avoid pulling more often than `ejira-auto-pull-interval'.")
+
+(defvar ejira--sync-in-progress nil
+  "Non-nil while a sync cycle is in progress.
+Set at the start of `ejira-update-my-projects' or `ejira-update-project'
+and cleared when `ejira--apply-sync' (or the synchronous update) finishes.
+Guards auto-pull against re-entrancy.")
+
+(defun ejira--auto-pull-due-p ()
+  "Return non-nil if enough time has elapsed since the last pull."
+  (or (null ejira--last-pull-time)
+      (> (float-time (time-subtract (current-time) ejira--last-pull-time))
+         ejira-auto-pull-interval)))
+
+(defun ejira--any-ejira-buffer-p ()
+  "Return non-nil if any live buffer is visiting an ejira org file."
+  (let ((ejira-dir (file-truename (expand-file-name ejira-org-directory))))
+    (cl-some (lambda (b)
+               (and (buffer-live-p b)
+                    (with-current-buffer b
+                      (and (derived-mode-p 'org-mode)
+                           buffer-file-name
+                           (string-prefix-p ejira-dir
+                                            (file-truename buffer-file-name))))))
+             (buffer-list))))
+
+(defun ejira--auto-pull ()
+  "Pull from Jira if not already syncing.
+Calls `ejira-update-my-projects' with `ejira-auto-pull-shallow'."
+  (when (and ejira-auto-pull-interval
+             (not ejira--sync-in-progress)
+             ejira-projects)
+    (setq ejira--last-pull-time (current-time))
+    (message "ejira: auto-pull started")
+    (ejira-update-my-projects ejira-auto-pull-shallow)))
+
+(defun ejira--auto-pull-timer-fn ()
+  "Timer callback for periodic auto-pull."
+  (when (and ejira-auto-pull-interval
+             (ejira--any-ejira-buffer-p))
+    (ejira--auto-pull)))
+
+(defun ejira--on-window-buffer-change (frame)
+  "Auto-pull when switching to an ejira buffer.
+Added to `window-buffer-change-functions' by `ejira--start-auto-pull'."
+  (when ejira-auto-pull-interval
+    (let ((buf (window-buffer (frame-selected-window frame))))
+      (when (and (buffer-live-p buf)
+                 (with-current-buffer buf
+                   (and (derived-mode-p 'org-mode)
+                        buffer-file-name
+                        (string-prefix-p (file-truename
+                                          (expand-file-name ejira-org-directory))
+                                         (file-truename buffer-file-name))))
+                 (not ejira--sync-in-progress)
+                 (ejira--auto-pull-due-p))
+        (ejira--auto-pull)))))
+
+(defun ejira--start-auto-pull ()
+  "Set up auto-pull timer and buffer-switch hook."
+  (when (and ejira-auto-pull-interval (not ejira--auto-pull-timer))
+    (setq ejira--auto-pull-timer
+          (run-with-timer ejira-auto-pull-interval
+                          ejira-auto-pull-interval
+                          #'ejira--auto-pull-timer-fn))
+    (add-hook 'window-buffer-change-functions #'ejira--on-window-buffer-change)
+    (message "ejira: auto-pull enabled (every %ds)" ejira-auto-pull-interval)))
+
+(defun ejira--stop-auto-pull ()
+  "Tear down auto-pull timer and buffer-switch hook."
+  (when ejira--auto-pull-timer
+    (cancel-timer ejira--auto-pull-timer)
+    (setq ejira--auto-pull-timer nil))
+  (remove-hook 'window-buffer-change-functions #'ejira--on-window-buffer-change))
+
+
 ;;;###autoload
 (defun ejira-set-deadline (arg &optional time)
   "Set deadline of issue under point. Save buffer to stage push."

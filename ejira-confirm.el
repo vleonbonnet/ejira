@@ -27,6 +27,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'org)
 
 (defvar ejira--pushing nil
   "Bound to t while ejira-push is executing a batch; inhibits re-scan on save.

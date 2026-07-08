@@ -331,6 +331,7 @@ If the issue heading does not exist, fallback to full update."
       (ejira--update-task issue-key)
 
     (ejira--with-point-on issue-key
+      (org-set-property "Status" status)
       (org-set-property "Assignee" (or assignee ""))
       (when ejira-assigned-tagname
         (if (equal assignee (ejira--my-fullname))
@@ -713,9 +714,12 @@ is established on the next sync or push, never during a plain save."
     ;; before comparing so the guard works for both numeric and string inputs.
     (let ((target (if (numberp state) (nth (1- state) org-todo-keywords-1) state)))
       (unless (equal (org-get-todo-state) target)
-        ;; Inhibit logbook: sync is not an interactive user action, state history
-        ;; lives in Jira not in the org LOGBOOK drawer.
-        (let ((org-inhibit-logging t))
+        ;; Inhibit logbook and todo blockers: sync is not an interactive user
+        ;; action, state history lives in Jira not in the org LOGBOOK drawer,
+        ;; and dependency blockers (org-block-todo-from-children-or-siblings-or-parent,
+        ;; org-edna) must not prevent reflecting Jira's authoritative status.
+        (let ((org-inhibit-logging t)
+              (org-blocker-hook nil))
           (org-todo state))))))
 
 (defun ejira--is-parent-p (child parent)
