@@ -338,7 +338,11 @@ If the issue heading does not exist, fallback to full update."
             (org-toggle-tag ejira-assigned-tagname 'on)
           (org-toggle-tag ejira-assigned-tagname 'off))))
     (ejira--set-todo-state issue-key
-                           (funcall ejira-todo-state-fn status resolution))))
+                           (funcall ejira-todo-state-fn status resolution))
+    ;; Refresh push baseline so sync-induced state/assignee changes are not
+    ;; mistaken for local edits on the next save.
+    (ejira--with-point-on issue-key
+      (ejira--update-push-baseline))))
 
 (defun ejira--update-task (issue-key)
   "Pull the task ISSUE-KEY from the server and update it's org state."
