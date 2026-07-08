@@ -668,10 +668,14 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
 Causes all `ejira--with-expand-all' calls to skip their per-call
 `outline-show-all', which is safe because org structural navigation
 (org-goto-first-child, re-search-forward, org-narrow-to-subtree, etc.)
-operates on buffer text regardless of fold state."
+operates on buffer text regardless of fold state.
+Also disables `org-element-use-cache' for the duration: after save-buffer
+the cache can be inconsistent, causing org-element-at-point errors in
+org-entry-get calls within the scan."
   (declare (indent 1))
   `(with-current-buffer ,buf
-     (let ((ejira--pre-scanning t))
+     (let ((ejira--pre-scanning t)
+           (org-element-use-cache nil))
        ,@body)))
 
 (defun ejira-push-at-point ()
