@@ -12,6 +12,11 @@
   "When non-nil, saving any org buffer that contains ejira-managed headings
 offers to push locally-edited issues and comments through a review buffer.")
 
+(defvar ejira--assign-new-issues t
+  "Default value for the assign-self cell on new issue plans.
+Individual cells are mutable `(list t)' stored on each plan's
+:assign-self property, toggled interactively in the confirm buffer.")
+
 (defvar ejira--pushing nil
   "Bound to t while a push batch is executing (inhibits re-scan on save).")
 
@@ -121,24 +126,24 @@ Only scans direct children (depth 1) — Jira subtasks cannot have subtasks."
                        children))))))))
     (nreverse children)))
 
-(defun ejira--push-create-cascaded-subtask (parent-key project-key child todo-keywords)
+(defun ejira--push-create-cascaded-subtask (parent-key project-key child todo-keywords assign-self)
   "Create a Jira subtask for CHILD under PARENT-KEY in PROJECT-KEY.
 CHILD is a plist with :marker :title :state :body.
-TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
+TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup.
+ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
   (let* ((child-marker (plist-get child :marker))
          (orig-state   (plist-get child :state))
-         (summary (org-with-point-at child-marker
-                    (ejira--strip-properties (org-get-heading t t t t))))
-         (desc-heading (org-with-point-at child-marker
-                         (ejira--find-child-heading ejira-description-heading-name)))
-         (desc (if desc-heading
-                   (ejira-parser-org-to-jira (ejira--get-heading-body desc-heading))
-                 ""))
+         (summary      (plist-get child :title))
+         (desc         (ejira-parser-org-to-jira (or (plist-get child :body) "")))
          (result (jiralib2-create-issue
                   project-key ejira-subtask-type-name
                   summary desc
                   `(parent . ((key . ,parent-key)))))
          (new-key (ejira--alist-get result 'key)))
+    (when assign-self
+      (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
+        (when my-name
+          (jiralib2-assign-issue new-key my-name))))
     (ejira--finalize-new-issue new-key child-marker orig-state todo-keywords)))
 
 (defun ejira--push-finalize (marker)
@@ -500,13 +505,13 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                                :title (format "%s comment %s" issue-key commid)
                                :parent-issue issue-key
                                :changes changes
-                               :send (let ((issue-key issue-key) (commid commid) (marker marker))
-                                       (lambda ()
-                                         (let ((local-body (ejira--get-heading-body marker)))
-                                           (jiralib2-edit-comment
-                                            issue-key commid
-                                            (ejira-parser-org-to-jira local-body))
-                                           (ejira--push-finalize marker)))))))))
+                                :send (let ((issue-key issue-key) (commid commid) (marker marker)
+                                            (body local-body))
+                                        (lambda ()
+                                          (jiralib2-edit-comment
+                                           issue-key commid
+                                           (ejira-parser-org-to-jira body))
+                                          (ejira--push-finalize marker))))))))
          ((and (eq op-type 'update) (eq object 'status))
           (let ((action-name (plist-get data :action-name)))
             (setq plan (list :op 'update
@@ -552,9 +557,10 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                              :title key
                              :parent-issue key
                              :changes `(("epic" "" ,new-epic))
-                             :send (let ((key key) (marker marker) (new-epic new-epic))
-                                     (lambda ()
-                                       (jiralib2-update-issue key `(,ejira-epic-field . ,new-epic))
+                              :send (let ((key key) (marker marker) (new-epic new-epic)
+                                          (epic-field ejira-epic-field))
+                                      (lambda ()
+                                        (jiralib2-update-issue key `(,epic-field . ,new-epic))
                                        (ejira--update-task key)
                                        (org-with-point-at marker
                                          (org-delete-property "PendingEpic"))))))))
@@ -577,30 +583,23 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                                                        0 (min 60 (length heading-title))))
                              :parent-issue parent-key
                              :fields fields
-                             :send (let ((marker marker) (project-key project-key)
-                                         (parent-key parent-key)
-                                         (orig-state local-state)
-                                         (todo-kws (org-with-point-at marker
-                                                      (when (boundp 'org-todo-keywords-1)
-                                                        org-todo-keywords-1))))
-                                     (lambda ()
-                                       (let* ((summary (org-with-point-at marker
-                                                          (ejira--strip-properties
-                                                           (org-get-heading t t t t))))
-                                              (desc-heading (org-with-point-at marker
-                                                              (ejira--find-child-heading
-                                                               ejira-description-heading-name)))
-                                              (desc (if desc-heading
-                                                        (ejira-parser-org-to-jira
-                                                         (ejira--get-heading-body desc-heading))
-                                                      ""))
-                                              (result (jiralib2-create-issue
-                                                       project-key ejira-subtask-type-name
-                                                       summary desc
-                                                       `(parent . ((key . ,parent-key)))))
-                                              (new-key (ejira--alist-get result 'key)))
-                                         (ejira--finalize-new-issue
-                                          new-key marker orig-state todo-kws))))))))
+                               :send (let ((marker marker) (project-key project-key)
+                                           (parent-key parent-key)
+                                           (summary heading-title)
+                                           (desc (ejira-parser-org-to-jira (or local-body "")))
+                                           (subtask-type ejira-subtask-type-name)
+                                           (orig-state local-state)
+                                           (todo-kws (org-with-point-at marker
+                                                        (when (boundp 'org-todo-keywords-1)
+                                                          org-todo-keywords-1))))
+                                      (lambda ()
+                                        (let* ((result (jiralib2-create-issue
+                                                        project-key subtask-type
+                                                        summary desc
+                                                        `(parent . ((key . ,parent-key)))))
+                                               (new-key (ejira--alist-get result 'key)))
+                                          (ejira--finalize-new-issue
+                                           new-key marker orig-state todo-kws))))))))
           ((and (eq op-type 'create) (eq object 'issue))
            (let* ((project-key      (plist-get data :project-key))
                   (children         (plist-get data :children))
@@ -630,55 +629,54 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                               :parent-issue parent-issue
                               :fields fields
                               :children children
-                              :send (let ((marker marker) (project-key project-key)
-                                          (orig-state local-state)
-                                          (children children)
-                                          (issue-type issue-type)
-                                          (parent-epic parent-epic)
-                                          (is-epic is-epic)
-                                          (todo-kws (org-with-point-at marker
-                                                       (when (boundp 'org-todo-keywords-1)
-                                                         org-todo-keywords-1))))
+                              :assign-self (list ejira--assign-new-issues)
+                               :send (let ((marker marker) (project-key project-key)
+                                           (orig-state local-state)
+                                           (summary heading-title)
+                                           (desc (ejira-parser-org-to-jira (or local-body "")))
+                                           (children children)
+                                           (issue-type issue-type)
+                                           (parent-epic parent-epic)
+                                           (is-epic is-epic)
+                                           (assign-self (list ejira--assign-new-issues))
+                                           (epic-field ejira-epic-field)
+                                           (epic-summary-field ejira-epic-summary-field)
+                                           (todo-kws (org-with-point-at marker
+                                                        (when (boundp 'org-todo-keywords-1)
+                                                          org-todo-keywords-1))))
                                       (lambda ()
-                                        (let* ((summary (org-with-point-at marker
-                                                           (ejira--strip-properties
-                                                            (org-get-heading t t t t))))
-                                               (desc-heading (org-with-point-at marker
-                                                               (ejira--find-child-heading
-                                                                ejira-description-heading-name)))
-                                               (desc (if desc-heading
-                                                         (ejira-parser-org-to-jira
-                                                          (ejira--get-heading-body desc-heading))
-                                                       ""))
-                                               ;; For Epics, set the Epic Name field if known.
-                                               (epic-name-arg
-                                                (when (and is-epic ejira-epic-summary-field)
-                                                  `(,ejira-epic-summary-field . ,summary)))
+                                        (let* ((epic-name-arg
+                                                (when (and is-epic epic-summary-field)
+                                                  `(,epic-summary-field . ,summary)))
                                                (result (apply #'jiralib2-create-issue
                                                               project-key issue-type
                                                               summary desc
                                                               (delq nil (list epic-name-arg))))
                                                (new-key (ejira--alist-get result 'key)))
-                                          ;; Link the new issue to its Epic via Epic Link field.
-                                          (when (and parent-epic ejira-epic-field)
+                                          (when (and parent-epic epic-field)
                                             (jiralib2-update-issue
-                                             new-key `(,ejira-epic-field . ,parent-epic)))
-                                          (when (and parent-epic (not ejira-epic-field))
+                                             new-key `(,epic-field . ,parent-epic)))
+                                          (when (and parent-epic (not epic-field))
                                             (display-warning
                                              'ejira
                                              "ejira-epic-field is nil — run `ejira-guess-epic-sprint-fields' to auto-configure.  Epic Link not set for new issue."
                                              :warning))
-                                          (when (and is-epic (not ejira-epic-summary-field))
+                                          (when (and is-epic (not epic-summary-field))
                                             (display-warning
                                              'ejira
                                              "ejira-epic-summary-field is nil — run `ejira-guess-epic-sprint-fields' to auto-configure.  Epic Name not set for new Epic."
                                              :warning))
+                                          (when (car assign-self)
+                                            (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
+                                              (when my-name
+                                                (jiralib2-assign-issue new-key my-name))))
                                           (ejira--finalize-new-issue
                                            new-key marker orig-state todo-kws)
                                           (dolist (child children)
                                             (condition-case err
                                                 (ejira--push-create-cascaded-subtask
-                                                 new-key project-key child todo-kws)
+                                                 new-key project-key child todo-kws
+                                                 (car assign-self))
                                               (error
                                                (display-warning
                                                 'ejira
@@ -686,29 +684,29 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                                                         (plist-get child :title)
                                                         (error-message-string err))
                                                 :error)))))))))))
-         ((and (eq op-type 'create) (eq object 'comment))
-          (let* ((issue-key (plist-get data :issue-key))
-                 (preview (let ((body (ejira--get-heading-body marker)))
-                            (if (and body (> (length body) 0))
-                                (substring body 0 (min 80 (length body)))
-                              "(no body)"))))
-            (setq plan (list :op 'create
-                             :object 'comment
-                             :project project
-                             :title (format "new comment on %s" issue-key)
-                             :parent-issue issue-key
-                             :preview preview
-                             :send (let ((marker marker) (issue-key issue-key))
-                                     (lambda ()
-                                       (let* ((body (ejira--get-heading-body marker))
-                                              (comment (ejira--parse-comment
-                                                        (jiralib2-add-comment
-                                                         issue-key
-                                                         (ejira-parser-org-to-jira body)))))
-                                         (org-with-point-at marker
-                                           (org-set-property "CommId" (ejira-comment-id comment))
-                                           (org-set-property "TYPE" "ejira-comment"))
-                                         (ejira--update-comment issue-key comment))))))))
+          ((and (eq op-type 'create) (eq object 'comment))
+           (let* ((issue-key (plist-get data :issue-key))
+                  (preview (let ((body (ejira--get-heading-body marker)))
+                             (if (and body (> (length body) 0))
+                                 (substring body 0 (min 80 (length body)))
+                               "(no body)"))))
+             (setq plan (list :op 'create
+                              :object 'comment
+                              :project project
+                              :title (format "new comment on %s" issue-key)
+                              :parent-issue issue-key
+                              :preview preview
+                              :send (let ((marker marker) (issue-key issue-key)
+                                          (body (ejira--get-heading-body marker)))
+                                      (lambda ()
+                                        (let* ((comment (ejira--parse-comment
+                                                         (jiralib2-add-comment
+                                                          issue-key
+                                                          (ejira-parser-org-to-jira body)))))
+                                          (org-with-point-at marker
+                                            (org-set-property "CommId" (ejira-comment-id comment))
+                                            (org-set-property "TYPE" "ejira-comment"))
+                                          (ejira--update-comment issue-key comment))))))))
          ((and (eq op-type 'delete) (eq object 'comment))
           (let* ((issue-key (plist-get data :issue-key))
                  (commid (plist-get data :commid))
@@ -724,8 +722,8 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                                        (jiralib2-delete-comment issue-key commid)
                                        (org-with-point-at marker
                                          (ejira--with-expand-all
-                                           (org-cut-subtree))))))))))
-        (when plan (push plan plans))))
+                                            (org-cut-subtree))))))))))
+         (when plan (push plan plans))))
     (nreverse plans)))
 
 (defmacro ejira--with-pre-scan (buf &rest body)

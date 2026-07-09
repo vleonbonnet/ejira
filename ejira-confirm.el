@@ -90,9 +90,19 @@ Defined in ejira-push.el; declared here so ejira-confirm-execute can bind it.")
   "Face for deletion warning text."
   :group 'ejira)
 
+(defface ejira-confirm-checkbox
+  '((t :weight bold))
+  "Face for the checkbox toggle in the confirm buffer."
+  :group 'ejira)
+
 ;;; ── Buffer-local state ───────────────────────────────────────────────────────
 
 (defvar-local ejira-confirm--plans nil)
+
+(defvar-local ejira-confirm--checkboxes nil
+  "List of plists (:marker MARKER :plan PLAN :global BOOL).
+Each entry tracks a togglable checkbox in the confirm buffer.
+:global is t for the master checkbox, nil for per-issue checkboxes.")
 
 (defvar-local ejira-confirm--nodes nil
   "List of plists (:marker MARKER :overlay OVERLAY :level LEVEL).
@@ -174,14 +184,14 @@ FIELDS is a list of (NAME OLD NEW) string triples."
         (push (string-join fields ", ") parts)))
     (let ((n-sub (cl-count-if (lambda (p) (eq (plist-get p :object) 'subtask)) creates))
           (n-cmt (cl-count-if (lambda (p) (eq (plist-get p :object) 'comment)) creates))
-          (n-iss (cl-remove-if-not
-                  (lambda (p) (and (eq (plist-get p :object) 'issue)
-                                   (not (plist-get p :label))))
-                  creates))
-          (n-lbl (cl-remove-if-not
-                  (lambda (p) (and (eq (plist-get p :object) 'issue)
-                                   (plist-get p :label)))
-                  creates)))
+           (n-iss (cl-count-if
+                   (lambda (p) (and (eq (plist-get p :object) 'issue)
+                                    (not (plist-get p :label))))
+                   creates))
+           (n-lbl (cl-remove-if-not
+                   (lambda (p) (and (eq (plist-get p :object) 'issue)
+                                    (plist-get p :label)))
+                   creates)))
       (when (> n-sub 0) (push (format "%d new subtask%s" n-sub (if (= n-sub 1) "" "s")) parts))
       (when (> n-cmt 0) (push (format "%d new comment%s" n-cmt (if (= n-cmt 1) "" "s")) parts))
       (when (> n-iss 0) (push (format "%d new issue%s"   n-iss (if (= n-iss 1) "" "s")) parts))
@@ -283,38 +293,36 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
          (fields  (plist-get plan :fields))
          (preview (plist-get plan :preview)))
     (pcase op
-      ('create
-       (let* ((label      (or (plist-get plan :label)
-                               (pcase object ('subtask "subtask") ('comment "comment") (_ "new"))))
-              (state-entry (cl-assoc "state" fields :test #'string=))
-              (state-val   (when state-entry (nth 1 state-entry)))
-              (clean       (replace-regexp-in-string "^new [a-z]+: " "" (or title "")))
-              ;; Truncate title so the whole visible header fits within ~100 chars.
-              ;; Fixed prefix: "    ▶ + LABEL: " = 4+1+1+1+1+1+(length label)+2 = 11+(length label)
-              ;; Plus state and one space separator if state present.
-              (prefix-len  (+ 11 (length label)
-                               (if (and state-val (> (length state-val) 0))
-                                   (1+ (length state-val))
-                                 0)))
-              (title-max   (max 20 (- 100 prefix-len)))
-              (title-disp  (let ((flat (string-trim
-                                        (replace-regexp-in-string "[\n\r]+" " " clean))))
-                             (if (> (length flat) title-max)
-                                 (concat (substring flat 0 title-max) "…")
-                               flat)))
-              (header-start (point)))
-         (insert "    "
-                 (propertize "▶" 'ejira-confirm-arrow t)
-                 " "
-                 (propertize "+" 'face 'ejira-confirm-new)
-                 " "
-                 (propertize label 'face 'ejira-confirm-item)
-                 ": "
-                 (if (and state-val (> (length state-val) 0))
-                     (concat state-val " ")
-                   "")
-                 (propertize title-disp 'face 'ejira-confirm-item)
-                 "\n")
+       ('create
+        (let* ((label      (or (plist-get plan :label)
+                                (pcase object ('subtask "subtask") ('comment "comment") (_ "new"))))
+               (state-entry (cl-assoc "state" fields :test #'string=))
+               (state-val   (when state-entry (nth 1 state-entry)))
+               (clean       (replace-regexp-in-string "^new [a-z]+: " "" (or title "")))
+               (prefix-len  (+ 11 (length label)
+                                (if (and state-val (> (length state-val) 0))
+                                    (1+ (length state-val))
+                                  0)))
+               (title-max   (max 20 (- 100 prefix-len)))
+               (title-disp  (let ((flat (string-trim
+                                         (replace-regexp-in-string "[\n\r]+" " " clean))))
+                              (if (> (length flat) title-max)
+                                  (concat (substring flat 0 title-max) "…")
+                                flat)))
+               (assign-cell (plist-get plan :assign-self))
+               (header-start (point)))
+          (insert "    "
+                  (propertize "▶" 'ejira-confirm-arrow t)
+                  " "
+                  (propertize "+" 'face 'ejira-confirm-new)
+                  " "
+                  (propertize label 'face 'ejira-confirm-item)
+                  ": "
+                  (if (and state-val (> (length state-val) 0))
+                      (concat state-val " ")
+                    "")
+                  (propertize title-disp 'face 'ejira-confirm-item)
+                  "\n")
          (let ((body-start (point)))
            (cond
             (fields
@@ -323,8 +331,16 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
                  (when (and fval (> (length fval) 0))
                    (ejira-confirm--insert-new-field fname fval 8)))))
             ((and preview (> (length preview) 0))
-             (ejira-confirm--insert-new-field "body" preview 8)))
-           (ejira-confirm--register-node header-start body-start 'item t))))
+              (ejira-confirm--insert-new-field "body" preview 8)))
+            (when assign-cell
+              (let ((cb-pos (point-marker)))
+                (insert "        "
+                        (propertize (if (car assign-cell) "[x]" "[ ]")
+                                    'face 'ejira-confirm-checkbox)
+                        " assign to me\n")
+                (push (list :marker cb-pos :plan plan :global nil)
+                      ejira-confirm--checkboxes)))
+            (ejira-confirm--register-node header-start body-start 'item t))))
       ('delete
        (insert "    "
                (propertize "✗" 'face 'ejira-confirm-deleted)
@@ -389,19 +405,20 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
          (header-start (point)))
     (pcase op
       ('create
-       (let* ((state-entry (cl-assoc "state" fields :test #'string=))
-              (state-val   (when state-entry (nth 1 state-entry))))
-         (insert "  "
-                 (propertize "▶" 'ejira-confirm-arrow t)
-                 " "
-                 (propertize "+" 'face 'ejira-confirm-new)
-                 "  "
-                 (if (and state-val (> (length state-val) 0))
-                     (concat state-val " ")
-                   "")
-                 (propertize title 'face 'ejira-confirm-item)
-                 "\n")
-         (let ((body-start (point)))
+        (let* ((state-entry (cl-assoc "state" fields :test #'string=))
+               (state-val   (when state-entry (nth 1 state-entry)))
+               (assign-cell (plist-get plan :assign-self)))
+          (insert "  "
+                  (propertize "▶" 'ejira-confirm-arrow t)
+                  " "
+                  (propertize "+" 'face 'ejira-confirm-new)
+                  "  "
+                  (if (and state-val (> (length state-val) 0))
+                      (concat state-val " ")
+                    "")
+                  (propertize title 'face 'ejira-confirm-item)
+                  "\n")
+          (let ((body-start (point)))
            (cond
             (fields
              (dolist (f fields)
@@ -425,8 +442,16 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
                                                            (when (and child-body
                                                                       (> (length child-body) 0))
                                                              (list "description" child-body)))))))
-               (ejira-confirm--insert-subitem child-plan)))
-           (ejira-confirm--register-node header-start body-start 'item t))))
+                (ejira-confirm--insert-subitem child-plan)))
+            (when assign-cell
+              (let ((cb-pos (point-marker)))
+                (insert "      "
+                        (propertize (if (car assign-cell) "[x]" "[ ]")
+                                    'face 'ejira-confirm-checkbox)
+                        " assign to me\n")
+                (push (list :marker cb-pos :plan plan :global nil)
+                      ejira-confirm--checkboxes)))
+            (ejira-confirm--register-node header-start body-start 'item t))))
       ('update
        ;; Standalone update not inside an issue node (fallback)
        (let* ((changes     (plist-get plan :changes))
@@ -494,19 +519,24 @@ ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
                         n
                         (if (= n 1) "" "s")
                         (if parts (concat ": " (string-join (nreverse parts) ", ")) ""))))
-      ;; Apply the same face to both title and separator so they share identical
-      ;; font metrics and string-width matches visual width exactly.
       (insert (propertize line 'face 'ejira-confirm-title)
               "\n"
               (propertize (make-string (string-width line) ?═) 'face 'ejira-confirm-title)
-              "\n\n"))))
+              "\n")
+      (when (> n-create 0)
+        (let ((pos (point-marker)))
+          (insert (propertize "[x]" 'face 'ejira-confirm-checkbox)
+                  "  Assign new issues to me\n")
+          (push (list :marker pos :plan nil :global t) ejira-confirm--checkboxes)))
+      (insert "\n"))))
 
 (defun ejira-confirm--insert-footer ()
   "Insert the keybinding footer."
   (insert "\n"
           (propertize "C-c C-c" 'face 'ejira-confirm-key) "  Push    "
           (propertize "C-c C-k" 'face 'ejira-confirm-key) "  Cancel    "
-          (propertize "TAB"     'face 'ejira-confirm-key) "  Toggle\n"))
+          (propertize "TAB"     'face 'ejira-confirm-key) "  Toggle    "
+          (propertize "RET"     'face 'ejira-confirm-key) "  Checkbox\n"))
 
 ;;; ── Entry point ──────────────────────────────────────────────────────────────
 
@@ -524,6 +554,7 @@ ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
       (let ((inhibit-read-only t))
         (erase-buffer)
         (ejira-confirm-mode)
+        (setq ejira-confirm--checkboxes nil)
         (ejira-confirm--insert-header (length plans) counts)
         (dolist (group grouped)
           (ejira-confirm--insert-project (car group) (cdr group)))
@@ -539,8 +570,6 @@ ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
   (interactive)
   (let ((plans ejira-confirm--plans))
     (quit-window t)
-    ;; Bind ejira--pushing for the entire batch so that any org saves triggered
-    ;; by state restoration or property writes do not re-invoke ejira--push-on-save.
     (let ((ejira--pushing t)
           (failures nil))
       (dolist (plan plans)
@@ -584,6 +613,63 @@ ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
         (when (search-forward (if hidden "▶" "▼") (line-end-position) t)
           (replace-match (if hidden "▼" "▶") t t))))))
 
+(defun ejira-confirm--checkbox-at-point ()
+  "Return the checkbox plist whose marker is on the current line, or nil."
+  (let ((line-beg (line-beginning-position))
+        (line-end (line-end-position)))
+    (cl-find-if (lambda (cb)
+                  (let ((m (marker-position (plist-get cb :marker))))
+                    (and (>= m line-beg) (<= m line-end))))
+                ejira-confirm--checkboxes)))
+
+(defun ejira-confirm--redraw-checkbox (cb)
+  "Redraw the checkbox text for CB in place."
+  (let* ((pos (marker-position (plist-get cb :marker)))
+         (global-p (plist-get cb :global))
+         (cell (plist-get (plist-get cb :plan) :assign-self))
+         (checked (if global-p
+                      (let ((cells (mapcar (lambda (c)
+                                             (plist-get (plist-get c :plan) :assign-self))
+                                           (cl-remove-if (lambda (c) (plist-get c :global))
+                                                         ejira-confirm--checkboxes))))
+                        (cl-every (lambda (x) (car x)) cells))
+                    (car cell)))
+         (inhibit-read-only t)
+         (buffer-read-only nil))
+    (save-excursion
+      (goto-char pos)
+      (save-match-data
+        (re-search-forward "\\[\\([x ]\\)\\]" (line-end-position) t)
+        (replace-match (if checked "x" " ") t t nil 1)))))
+
+(defun ejira-confirm-toggle-checkbox ()
+  "Toggle the checkbox at point (master or per-issue)."
+  (interactive)
+  (when-let ((cb (ejira-confirm--checkbox-at-point)))
+    (let ((inhibit-read-only t)
+          (buffer-read-only nil))
+      (if (plist-get cb :global)
+          ;; Master: flip all individual cells, then redraw everything.
+          (let* ((individuals (cl-remove-if (lambda (c) (plist-get c :global))
+                                            ejira-confirm--checkboxes))
+                 (all-on (cl-every (lambda (c)
+                                     (car (plist-get (plist-get c :plan) :assign-self)))
+                                   individuals))
+                 (new-val (not all-on)))
+            (dolist (c individuals)
+              (setcar (plist-get (plist-get c :plan) :assign-self) new-val))
+            ;; Redraw master + all individuals.
+            (ejira-confirm--redraw-checkbox cb)
+            (dolist (c individuals)
+              (ejira-confirm--redraw-checkbox c)))
+        ;; Individual: flip its cell, redraw it and the master.
+        (let ((cell (plist-get (plist-get cb :plan) :assign-self)))
+          (setcar cell (not (car cell)))
+          (ejira-confirm--redraw-checkbox cb)
+          (let ((master (cl-find-if (lambda (c) (plist-get c :global))
+                                    ejira-confirm--checkboxes)))
+            (when master (ejira-confirm--redraw-checkbox master))))))))
+
 (defun ejira-confirm-next-section ()
   "Move point to the next node heading."
   (interactive)
@@ -624,6 +710,8 @@ ISSUE-GROUPS is an alist (issue-key-or-nil . plans-list)."
     (keymap-set map "C-c C-k" #'ejira-confirm-cancel)
     (keymap-set map "TAB"     #'ejira-confirm-toggle-section)
     (keymap-set map "<tab>"   #'ejira-confirm-toggle-section)
+    (keymap-set map "RET"     #'ejira-confirm-toggle-checkbox)
+    (keymap-set map "<return>" #'ejira-confirm-toggle-checkbox)
     (keymap-set map "n"       #'ejira-confirm-next-section)
     (keymap-set map "p"       #'ejira-confirm-prev-section)
     (keymap-set map "q"       #'ejira-confirm-cancel)
