@@ -174,10 +174,23 @@ FIELDS is a list of (NAME OLD NEW) string triples."
         (push (string-join fields ", ") parts)))
     (let ((n-sub (cl-count-if (lambda (p) (eq (plist-get p :object) 'subtask)) creates))
           (n-cmt (cl-count-if (lambda (p) (eq (plist-get p :object) 'comment)) creates))
-          (n-iss (cl-count-if (lambda (p) (eq (plist-get p :object) 'issue))   creates)))
+          (n-iss (cl-remove-if-not
+                  (lambda (p) (and (eq (plist-get p :object) 'issue)
+                                   (not (plist-get p :label))))
+                  creates))
+          (n-lbl (cl-remove-if-not
+                  (lambda (p) (and (eq (plist-get p :object) 'issue)
+                                   (plist-get p :label)))
+                  creates)))
       (when (> n-sub 0) (push (format "%d new subtask%s" n-sub (if (= n-sub 1) "" "s")) parts))
       (when (> n-cmt 0) (push (format "%d new comment%s" n-cmt (if (= n-cmt 1) "" "s")) parts))
-      (when (> n-iss 0) (push (format "%d new issue%s"   n-iss (if (= n-iss 1) "" "s")) parts)))
+      (when (> n-iss 0) (push (format "%d new issue%s"   n-iss (if (= n-iss 1) "" "s")) parts))
+      (dolist (lbl (cl-remove-duplicates
+                    (mapcar (lambda (p) (plist-get p :label)) n-lbl)
+                    :test #'string=))
+        (let ((n (cl-count-if (lambda (p) (equal (plist-get p :label) lbl)) n-lbl)))
+          (when (> n 0)
+            (push (format "%d new %s%s" n lbl (if (= n 1) "" "s")) parts)))))
     (when (> (length deletes) 0)
       (push (format "%d deleted" (length deletes)) parts))
     (if parts (concat "  " (string-join (nreverse parts) ", ")) "")))
@@ -271,7 +284,8 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
          (preview (plist-get plan :preview)))
     (pcase op
       ('create
-       (let* ((label      (pcase object ('subtask "subtask") ('comment "comment") (_ "new")))
+       (let* ((label      (or (plist-get plan :label)
+                               (pcase object ('subtask "subtask") ('comment "comment") (_ "new"))))
               (state-entry (cl-assoc "state" fields :test #'string=))
               (state-val   (when state-entry (nth 1 state-entry)))
               (clean       (replace-regexp-in-string "^new [a-z]+: " "" (or title "")))

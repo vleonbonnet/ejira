@@ -61,6 +61,19 @@
 (defvar ejira-subtask-type-name "Sub-task"
   "Name of the issue type equivalent to a subtask.")
 
+(defcustom ejira-epic-child-type-name "Task"
+  "Jira issue type to create when a TODO heading is added directly under an Epic.
+Defaults to \"Task\"; set to \"Story\" if your team prefers stories under epics."
+  :group 'ejira
+  :type 'string)
+
+(defcustom ejira-epic-parent-issuetypes '("Initiative")
+  "Jira issue types under which new TODO headings create Epics rather than subtasks.
+Defaults to (\"Initiative\").  Add other top-level planning types (e.g. \"Goal\")
+if your project hierarchy uses them as Epic parents."
+  :group 'ejira
+  :type '(repeat string))
+
 (defvar ejira-comments-heading-name "Comments"
   "Subheading ejira uses for the comments list.")
 (defvar ejira-description-heading-name "Description"

@@ -254,37 +254,70 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                           (not type)
                           (not (equal heading-title ejira-description-heading-name))
                           (not (equal heading-title ejira-comments-heading-name)))
-                 (let* ((parent-info
-                         (save-excursion
-                           (when (org-up-heading-safe)
-                             (list (org-entry-get nil "TYPE")
-                                   (org-entry-get nil "ID")))))
-                        (parent-type (nth 0 parent-info))
-                        (parent-id (nth 1 parent-info)))
-                   (cond
-                    ((member parent-type '("ejira-issue" "ejira-story"
-                                          "ejira-epic"))
-                     (let ((project-key (car (split-string parent-id "-"))))
-                       (push (list :op 'create
-                                   :object 'subtask
-                                   :key nil
-                                   :project project-key
-                                   :parent-issue parent-id
-                                   :marker marker
-                                   :data (list :parent-key parent-id
-                                               :project-key project-key))
-                             ops)))
-                    ((equal parent-type "ejira-project")
-                     (let ((children (ejira--push-scan-issue-children marker parent-id)))
-                       (push (list :op 'create
-                                   :object 'issue
-                                   :key nil
-                                   :project parent-id
-                                   :parent-issue nil
-                                   :marker marker
-                                   :data (list :project-key parent-id
-                                               :children children))
-                             ops))))))
+                  (let* ((parent-info
+                          (save-excursion
+                            (when (org-up-heading-safe)
+                              (list (org-entry-get nil "TYPE")
+                                    (org-entry-get nil "ID")
+                                    (org-entry-get nil "Issuetype")))))
+                         (parent-type       (nth 0 parent-info))
+                         (parent-id         (nth 1 parent-info))
+                         (parent-issuetype  (nth 2 parent-info))
+                         (project-key       (when parent-id
+                                              (car (split-string parent-id "-")))))
+                    (cond
+                     ;; Under Initiative (or other epic-parent type) → create Epic
+                     ((and (equal parent-type "ejira-issue")
+                           (member parent-issuetype ejira-epic-parent-issuetypes))
+                      (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                        (push (list :op 'create
+                                    :object 'issue
+                                    :key nil
+                                    :project project-key
+                                    :parent-issue parent-id
+                                    :marker marker
+                                    :data (list :project-key project-key
+                                                :issue-type ejira-epic-type-name
+                                                :parent-initiative parent-id
+                                                :children children))
+                              ops)))
+                     ;; Under Epic → create Task (or Story) with Epic Link
+                     ((equal parent-type "ejira-epic")
+                      (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                        (push (list :op 'create
+                                    :object 'issue
+                                    :key nil
+                                    :project project-key
+                                    :parent-issue parent-id
+                                    :marker marker
+                                    :data (list :project-key project-key
+                                                :issue-type ejira-epic-child-type-name
+                                                :parent-epic parent-id
+                                                :children children))
+                              ops)))
+                     ;; Under Issue/Story → create Sub-task (Jira parent link)
+                     ((member parent-type '("ejira-issue" "ejira-story"))
+                      (push (list :op 'create
+                                  :object 'subtask
+                                  :key nil
+                                  :project project-key
+                                  :parent-issue parent-id
+                                  :marker marker
+                                  :data (list :parent-key parent-id
+                                              :project-key project-key))
+                            ops))
+                     ;; Under Project → create issue (top-level)
+                     ((equal parent-type "ejira-project")
+                      (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                        (push (list :op 'create
+                                    :object 'issue
+                                    :key nil
+                                    :project parent-id
+                                    :parent-issue nil
+                                    :marker marker
+                                    :data (list :project-key parent-id
+                                                :children children))
+                              ops))))))
                ;; Rule G: New comment draft — heading directly under Comments,
                ;; no CommId yet.  Catches manually-added plain headings and
                ;; org-capture stubs (TYPE=ejira-comment, no CommId).
@@ -568,59 +601,91 @@ TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup."
                                               (new-key (ejira--alist-get result 'key)))
                                          (ejira--finalize-new-issue
                                           new-key marker orig-state todo-kws))))))))
-         ((and (eq op-type 'create) (eq object 'issue))
-          (let* ((project-key (plist-get data :project-key))
-                 (children    (plist-get data :children))
-                 (heading-title (org-with-point-at marker
-                                  (ejira--strip-properties (org-get-heading t t t t))))
-                 (local-body (ejira--get-heading-body marker))
-                 (local-state (org-with-point-at marker
-                                (substring-no-properties (or (org-get-todo-state) ""))))
-                 (fields `(("title" ,heading-title)
-                           ("state" ,local-state)
-                           ("description" ,(or local-body "")))))
-            (setq plan (list :op 'create
-                             :object 'issue
-                             :project project-key
-                             :title (format "new issue: %s" heading-title)
-                             :parent-issue nil
-                             :fields fields
-                             :children children
-                             :send (let ((marker marker) (project-key project-key)
-                                         (orig-state local-state)
-                                         (children children)
-                                         (todo-kws (org-with-point-at marker
-                                                      (when (boundp 'org-todo-keywords-1)
-                                                        org-todo-keywords-1))))
-                                     (lambda ()
-                                       (let* ((summary (org-with-point-at marker
-                                                          (ejira--strip-properties
-                                                           (org-get-heading t t t t))))
-                                              (desc-heading (org-with-point-at marker
-                                                              (ejira--find-child-heading
-                                                               ejira-description-heading-name)))
-                                              (desc (if desc-heading
-                                                        (ejira-parser-org-to-jira
-                                                         (ejira--get-heading-body desc-heading))
-                                                      ""))
-                                              (result (jiralib2-create-issue
-                                                       project-key
-                                                       (or ejira-story-type-name "Task")
-                                                       summary desc))
-                                              (new-key (ejira--alist-get result 'key)))
-                                         (ejira--finalize-new-issue
-                                          new-key marker orig-state todo-kws)
-                                         (dolist (child children)
-                                           (condition-case err
-                                               (ejira--push-create-cascaded-subtask
-                                                new-key project-key child todo-kws)
-                                             (error
-                                              (display-warning
-                                               'ejira
-                                               (format "cascade subtask failed for %s: %s"
-                                                       (plist-get child :title)
-                                                       (error-message-string err))
-                                               :error)))))))))))
+          ((and (eq op-type 'create) (eq object 'issue))
+           (let* ((project-key      (plist-get data :project-key))
+                  (children         (plist-get data :children))
+                  (issue-type       (or (plist-get data :issue-type)
+                                        (or ejira-story-type-name "Task")))
+                  (parent-epic      (plist-get data :parent-epic))
+                  (parent-initiative (plist-get data :parent-initiative))
+                  (parent-issue     (or parent-epic parent-initiative
+                                        (plist-get op :parent-issue)))
+                  (heading-title (org-with-point-at marker
+                                   (ejira--strip-properties (org-get-heading t t t t))))
+                  (local-body (ejira--get-heading-body marker))
+                  (local-state (org-with-point-at marker
+                                 (substring-no-properties (or (org-get-todo-state) ""))))
+                  (fields `(("title" ,heading-title)
+                            ("state" ,local-state)
+                            ("description" ,(or local-body ""))))
+                  (is-epic (equal issue-type ejira-epic-type-name))
+                  (label (cond (is-epic "epic")
+                               (parent-epic "task")
+                               (t "issue"))))
+              (setq plan (list :op 'create
+                              :object 'issue
+                              :project project-key
+                              :label label
+                              :title (format "new %s: %s" label heading-title)
+                              :parent-issue parent-issue
+                              :fields fields
+                              :children children
+                              :send (let ((marker marker) (project-key project-key)
+                                          (orig-state local-state)
+                                          (children children)
+                                          (issue-type issue-type)
+                                          (parent-epic parent-epic)
+                                          (is-epic is-epic)
+                                          (todo-kws (org-with-point-at marker
+                                                       (when (boundp 'org-todo-keywords-1)
+                                                         org-todo-keywords-1))))
+                                      (lambda ()
+                                        (let* ((summary (org-with-point-at marker
+                                                           (ejira--strip-properties
+                                                            (org-get-heading t t t t))))
+                                               (desc-heading (org-with-point-at marker
+                                                               (ejira--find-child-heading
+                                                                ejira-description-heading-name)))
+                                               (desc (if desc-heading
+                                                         (ejira-parser-org-to-jira
+                                                          (ejira--get-heading-body desc-heading))
+                                                       ""))
+                                               ;; For Epics, set the Epic Name field if known.
+                                               (epic-name-arg
+                                                (when (and is-epic ejira-epic-summary-field)
+                                                  `(,ejira-epic-summary-field . ,summary)))
+                                               (result (apply #'jiralib2-create-issue
+                                                              project-key issue-type
+                                                              summary desc
+                                                              (delq nil (list epic-name-arg))))
+                                               (new-key (ejira--alist-get result 'key)))
+                                          ;; Link the new issue to its Epic via Epic Link field.
+                                          (when (and parent-epic ejira-epic-field)
+                                            (jiralib2-update-issue
+                                             new-key `(,ejira-epic-field . ,parent-epic)))
+                                          (when (and parent-epic (not ejira-epic-field))
+                                            (display-warning
+                                             'ejira
+                                             "ejira-epic-field is nil — run `ejira-guess-epic-sprint-fields' to auto-configure.  Epic Link not set for new issue."
+                                             :warning))
+                                          (when (and is-epic (not ejira-epic-summary-field))
+                                            (display-warning
+                                             'ejira
+                                             "ejira-epic-summary-field is nil — run `ejira-guess-epic-sprint-fields' to auto-configure.  Epic Name not set for new Epic."
+                                             :warning))
+                                          (ejira--finalize-new-issue
+                                           new-key marker orig-state todo-kws)
+                                          (dolist (child children)
+                                            (condition-case err
+                                                (ejira--push-create-cascaded-subtask
+                                                 new-key project-key child todo-kws)
+                                              (error
+                                               (display-warning
+                                                'ejira
+                                                (format "cascade subtask failed for %s: %s"
+                                                        (plist-get child :title)
+                                                        (error-message-string err))
+                                                :error)))))))))))
          ((and (eq op-type 'create) (eq object 'comment))
           (let* ((issue-key (plist-get data :issue-key))
                  (preview (let ((body (ejira--get-heading-body marker)))

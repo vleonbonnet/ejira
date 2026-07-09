@@ -317,6 +317,7 @@ Draft body.
 :PROPERTIES:
 :TYPE:     ejira-issue
 :ID:       PROJ-1
+:Issuetype: Task
 :END:
 ** TODO My New Subtask
 ")))
@@ -335,12 +336,55 @@ Draft body.
 :PROPERTIES:
 :TYPE:     ejira-issue
 :ID:       PROJ-1
+:Issuetype: Task
 :END:
 ** Just a note
 ")))
     (should (null (cl-remove-if-not
                    (lambda (op) (eq 'create (plist-get op :op)))
                    ops)))))
+
+(ert-deftest ejira-push--rule-e/new-task-under-epic ()
+  "TODO heading without TYPE directly under ejira-epic → create-issue op with
+:parent-epic set and :issue-type from `ejira-epic-child-type-name'."
+  (let ((ops (ejira-test--scan
+              "* PROJ-1 My Epic
+:PROPERTIES:
+:TYPE:     ejira-epic
+:ID:       PROJ-1
+:Issuetype: Epic
+:END:
+** TODO My New Task
+")))
+    (let ((issue-ops (cl-remove-if-not
+                      (lambda (op) (and (eq 'create (plist-get op :op))
+                                        (eq 'issue  (plist-get op :object))))
+                      ops)))
+      (should (= 1 (length issue-ops)))
+      (let ((data (plist-get (car issue-ops) :data)))
+        (should (equal "PROJ-1" (plist-get data :parent-epic)))
+        (should (equal ejira-epic-child-type-name (plist-get data :issue-type)))))))
+
+(ert-deftest ejira-push--rule-e/new-epic-under-initiative ()
+  "TODO heading without TYPE under ejira-issue with Issuetype=Initiative
+→ create-issue op with :parent-initiative set and :issue-type \"Epic\"."
+  (let ((ops (ejira-test--scan
+              "* PROJ-1 My Initiative
+:PROPERTIES:
+:TYPE:     ejira-issue
+:ID:       PROJ-1
+:Issuetype: Initiative
+:END:
+** TODO My New Epic
+")))
+    (let ((issue-ops (cl-remove-if-not
+                      (lambda (op) (and (eq 'create (plist-get op :op))
+                                        (eq 'issue  (plist-get op :object))))
+                      ops)))
+      (should (= 1 (length issue-ops)))
+      (let ((data (plist-get (car issue-ops) :data)))
+        (should (equal "PROJ-1" (plist-get data :parent-initiative)))
+        (should (equal ejira-epic-type-name (plist-get data :issue-type)))))))
 
 (ert-deftest ejira-push--rule-f/new-issue-under-project ()
   "TODO heading without TYPE directly under ejira-project → create-issue op."
