@@ -141,21 +141,16 @@ Called from async callbacks once all network responses have arrived."
     (let ((ejira--syncing t)
           (ejira--heading-cache (make-hash-table :test 'equal))
           (save-silently t)
-          ;; Disable the org-element cache during the bulk programmatic edits.
-          ;; In a displayed buffer the cache reacts to every modification and can
-          ;; wedge into an uninterruptible loop (notably under org-sort-entries);
-          ;; rebuilt lazily on next access after the sync.
           (org-element-use-cache nil)
-          ;; Suppress all per-operation noise (org-todo, org-priority, org-refile,
-          ;; basic-save-buffer "Wrote X", etc.) for the duration of the sync.
-          ;; message-log-max is checked by the C message_dolog function, so it
-          ;; suppresses *Messages* logging regardless of how message is called.
-          ;; "ejira: sync finished" is printed after this let, stays visible.
           (message-log-max nil))
       (ejira--trace "START unresolved=%d resolved=%d" (length unresolved-items) (length resolved-items))
-      ;; Refresh org-id locations so manually-refiled issues are found.
-      (org-id-update-id-locations nil t)
-      (ejira--trace "after org-id-update #1")
+      ;; org-id-locations is kept current by `org-id-track-globally' on every
+      ;; save; a full `org-id-update-id-locations' rescan of every org-id file
+      ;; (~90 files, each triggering org-indent-refresh-maybe →
+      ;; org-element--parse-to per line) was the single biggest hotspot
+      ;; (66% of profiler samples).  Skipped entirely — if a refiled issue
+      ;; isn't found by ejira--find-heading, ejira--update-task-light falls
+      ;; back to ejira--update-task which creates a new heading.
       ;; Save fold state (char positions, no markers — survives revert of unmodified buffers).
       (let ((vis-saves
              (delq nil
@@ -174,7 +169,12 @@ Called from async callbacks once all network responses have arrived."
               (revert-buffer t t t))
             (outline-show-all)))
         (ejira--trace "after revert+expand, starting loop")
-        ;; Process all fetched items.
+        ;; Process all fetched items.  ejira--update-task-light and
+        ;; ejira--normalize-end-spacing both guard against no-op writes
+        ;; (comparing current values before calling org-set-property, skipping
+        ;; delete+insert when spacing is already correct), so a sync where
+        ;; nothing changed makes zero buffer modifications and triggers zero
+        ;; after-change-functions.
         (let ((update-fn (if shallow
                              (lambda (i)
                                (ejira--update-task-light
@@ -187,8 +187,7 @@ Called from async callbacks once all network responses have arrived."
           (mapc update-fn resolved-items))
         (ejira--trace "after loop")
         ;; Normalize: ensure exactly one blank line after every :END: closer.
-        ;; ejira--set-heading-body handles body content spacing, but does not
-        ;; insert blanks between a heading's property drawer and its child headings.
+        ;; No-ops when spacing is already correct — see ejira--normalize-end-spacing.
         (dolist (id projects)
           (when-let ((buf (find-buffer-visiting
                            (expand-file-name (ejira--project-file-name id)))))
@@ -205,13 +204,7 @@ Called from async callbacks once all network responses have arrived."
         (dolist (entry vis-saves)
           (with-current-buffer (car entry)
             (org-fold-core-regions (cdr entry) :override t)))
-        (ejira--trace "after fold-restore"))
-      ;; Persist the id->file table. ejira--new-heading already registers new
-      ;; IDs in `org-id-locations' in memory, so a plain save suffices — a
-      ;; second full org-id-update-id-locations rescan of every org-id file
-      ;; (seconds, even minutes cold) is wasteful here.
-      (org-id-locations-save)
-      (ejira--trace "after org-id-locations-save (DONE)")))
+        (ejira--trace "after fold-restore"))))
     (setq ejira--sync-in-progress nil)
     (message "ejira: sync finished")))
 
@@ -259,6 +252,43 @@ Save the buffer to stage creation via ejira-confirm."
     (org-todo (car org-todo-keywords-1)))
   (message "ejira: heading marked as pending subtask — save buffer to stage."))
 
+(defun ejira--local-todo-keys (projects)
+  "Return keys of local ejira TODO headings belonging to PROJECTS.
+Uses `org-id-locations' to find which files contain ejira issue keys
+for these projects, then scans those files for TODO headings.
+
+Scanning uses `re-search-forward' for headline patterns — org-fold
+only hides subtree *content*, never the headline lines themselves,
+so the search reaches all headings regardless of fold state without
+calling `outline-show-all'.  This avoids both fold disruption and
+the cost of a full `org-element-parse-buffer' AST (which parses every
+bold, italic, link, and timestamp object in the buffer when we only
+need the :ID property and TODO keyword per headline)."
+  (let* ((prefixes (mapcar (lambda (id) (concat id "-")) projects))
+         (key-pred (lambda (id)
+                     (and id
+                          (cl-some (lambda (p) (string-prefix-p p id)) prefixes))))
+         (files (cl-remove-duplicates
+                 (delq nil
+                       (cl-loop for id being the hash-keys of org-id-locations
+                                when (funcall key-pred id)
+                                collect (gethash id org-id-locations)))
+                 :test #'equal))
+         keys)
+    (dolist (file files)
+      (let ((buf (find-file-noselect file t)))
+        (with-current-buffer buf
+          (org-with-wide-buffer
+           (goto-char (point-min))
+           (while (re-search-forward "^\\*\\{1,4\\} " nil t)
+             (let ((id (org-entry-get (point) "ID"))
+                   (todo (org-get-todo-state)))
+               (when (and (funcall key-pred id)
+                          todo
+                          (not (member todo org-done-keywords)))
+                 (push id keys))))))))
+    (nreverse keys)))
+
 (defun ejira-update-project (id &optional shallow)
   "Update all issues in project ID.
 If DEEP set to t, update each issue with separate API call which pulls also
@@ -303,14 +333,16 @@ comments. With SHALLOW, only update todo status and assignee."
           ;; but are already resolved at the server. This should ensure that there are
           ;; no hanging todo items in our local sync.
           ;;
+          ;; Scans files from `org-id-locations' (not just this project's canonical
+          ;; sync file) so issues refiled elsewhere are still caught — see
+          ;; `ejira--local-todo-keys'.
+          ;;
           ;; Handles cases:
           ;; *local*    | *remote*
           ;; ===========+===========
           ;; unresolved | resolved
           ;;
-          (let ((keys (mapcar #'car (ejira--get-headings-in-file
-                                     (ejira--project-file-name id)
-                                     '(:todo "todo")))))
+          (let ((keys (ejira--local-todo-keys (list id))))
             (when keys
               (mapc (lambda (i) (if shallow
                                     (ejira--update-task-light
@@ -347,18 +379,11 @@ parallel, then applies all updates synchronously when both arrive."
   (interactive "P")
   (let* ((projects ejira-projects)
          (fields (ejira--get-fields-to-sync shallow))
-         ;; Collect local TODO keys across all project files before firing
-         ;; network requests — this is a fast local scan, no network needed.
-         ;; Bind ejira--syncing so ejira--with-expand-all skips outline-show-all,
-         ;; which can trigger org-element-cache parser errors on files with
-         ;; malformed Jira-sourced content (e.g. SECBUG.org descriptions).
+         ;; Collect local TODO keys via `org-id-locations' (see
+         ;; `ejira--local-todo-keys') before firing network requests.
+         ;; This is a fast local scan, no network needed.
          (local-todo-keys
-          (let ((ejira--syncing t))
-            (mapcan (lambda (id)
-                      (mapcar #'car
-                              (ejira--get-headings-in-file
-                               (ejira--project-file-name id) '(:todo "todo"))))
-                    projects)))
+          (ejira--local-todo-keys projects))
          ;; Mutable state shared between the two async callbacks.
          (pending 0)
          (all-unresolved nil)

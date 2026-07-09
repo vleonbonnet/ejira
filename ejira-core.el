@@ -331,12 +331,16 @@ If the issue heading does not exist, fallback to full update."
       (ejira--update-task issue-key)
 
     (ejira--with-point-on issue-key
-      (org-set-property "Status" status)
-      (org-set-property "Assignee" (or assignee ""))
+      (unless (equal (org-entry-get (point-marker) "Status") status)
+        (org-set-property "Status" status))
+      (let ((target-assignee (or assignee "")))
+        (unless (equal (org-entry-get (point-marker) "Assignee") target-assignee)
+          (org-set-property "Assignee" target-assignee)))
       (when ejira-assigned-tagname
-        (if (equal assignee (ejira--my-fullname))
-            (org-toggle-tag ejira-assigned-tagname 'on)
-          (org-toggle-tag ejira-assigned-tagname 'off))))
+        (let ((has-tag (member ejira-assigned-tagname (org-get-tags))))
+          (if (equal assignee (ejira--my-fullname))
+              (unless has-tag (org-toggle-tag ejira-assigned-tagname 'on))
+            (when has-tag (org-toggle-tag ejira-assigned-tagname 'off))))))
     (ejira--set-todo-state issue-key
                            (funcall ejira-todo-state-fn status resolution))
     ;; Refresh push baseline so sync-induced state/assignee changes are not
@@ -693,12 +697,23 @@ is established on the next sync or push, never during a plain save."
   (save-excursion
     (goto-char (point-min))
     (while (re-search-forward "^[ \t]*:END:[ \t]*\n" nil t)
-      ;; Delete all blank lines immediately following :END:
-      (while (and (not (eobp)) (looking-at "[ \t]*\n"))
-        (delete-region (point) (line-beginning-position 2)))
-      ;; Insert exactly one blank line (unless at end of buffer)
-      (unless (eobp)
-        (insert "\n")))))
+      ;; Count blank lines immediately following :END:, then only modify
+      ;; if spacing is wrong.  Skip the delete+insert entirely when there's
+      ;; already exactly one blank line — this avoids triggering
+      ;; after-change-functions (org-indent, jit-lock, goggles) for every
+      ;; :END: in the buffer on a no-op sync.
+      (let ((blanks 0))
+        (save-excursion
+          (while (and (not (eobp)) (looking-at "[ \t]*\n"))
+            (cl-incf blanks)
+            (forward-line 1)))
+        (cond
+         ((= blanks 0)
+          (unless (eobp) (insert "\n")))
+         ((> blanks 1)
+          (while (and (not (eobp)) (looking-at "[ \t]*\n"))
+            (delete-region (point) (line-beginning-position 2)))
+          (unless (eobp) (insert "\n"))))))))
 
 (defun ejira--set-heading-body (heading contents)
   "Set the contents of item HEADING to CONTENTS."
