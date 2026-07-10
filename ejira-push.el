@@ -731,14 +731,10 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
 Causes all `ejira--with-expand-all' calls to skip their per-call
 `outline-show-all', which is safe because org structural navigation
 (org-goto-first-child, re-search-forward, org-narrow-to-subtree, etc.)
-operates on buffer text regardless of fold state.
-Also disables `org-element-use-cache' for the duration: after save-buffer
-the cache can be inconsistent, causing org-element-at-point errors in
-org-entry-get calls within the scan."
+operates on buffer text regardless of fold state."
   (declare (indent 1))
   `(with-current-buffer ,buf
-     (let ((ejira--pre-scanning t)
-           (org-element-use-cache nil))
+     (let ((ejira--pre-scanning t))
        ,@body)))
 
 (defun ejira-push-at-point ()

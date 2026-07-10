@@ -141,7 +141,6 @@ Called from async callbacks once all network responses have arrived."
     (let ((ejira--syncing t)
           (ejira--heading-cache (make-hash-table :test 'equal))
           (save-silently t)
-          (org-element-use-cache nil)
           (message-log-max nil))
       (ejira--trace "START unresolved=%d resolved=%d" (length unresolved-items) (length resolved-items))
       ;; org-id-locations is kept current by `org-id-track-globally' on every
@@ -302,8 +301,6 @@ comments. With SHALLOW, only update todo status and assignee."
         ;; inside the sync loop instead of save/restoring outline visibility per op.
         (let* ((ejira--syncing t)
                (ejira--heading-cache (make-hash-table :test 'equal))
-               ;; See ejira--apply-sync: disable org-element cache during bulk edits.
-               (org-element-use-cache nil)
                (proj-buf (find-file-noselect
                           (expand-file-name (ejira--project-file-name id))))
                (vis-save (with-current-buffer proj-buf (org-fold-core-get-regions))))
