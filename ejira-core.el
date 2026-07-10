@@ -680,8 +680,12 @@ body.  Normalized so the fingerprint ignores cosmetic whitespace changes."
                 (ejira--push-normalize
                  (or (org-entry-get nil "Assignee") ""))
                 "\0"
-                (ejira--push-normalize
-                 (or (org-entry-get nil "PRIORITY") ""))
+                 (ejira--push-normalize
+                  (or (save-excursion
+                        (org-back-to-heading t)
+                        (when (looking-at org-priority-regexp)
+                          (match-string 2)))
+                      ""))
                 "\0"
                 (ejira--push-normalize
                  (or (when-let ((d (org-get-deadline-time (point-marker))))

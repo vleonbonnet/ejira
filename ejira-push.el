@@ -178,6 +178,12 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                   (todo-state (org-get-todo-state))
                   (heading-title (org-get-heading t t t t))
                   (marker (point-marker)))
+             ;; Skip headings marked with the org COMMENT keyword (and any
+             ;; of their descendants, since COMMENT is inherited) — these
+             ;; are explicitly excluded from export/agenda by the user and
+             ;; must never be detected as new issues or pushed to Jira.
+             (if (org-in-commented-heading-p)
+                 nil
              ;; Rule H: PendingDelete (check first)
              (if (and (equal pending-delete "t") (equal type "ejira-comment"))
                  (push (list :op 'delete
@@ -348,7 +354,7 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                  :parent-issue issue-key
                                  :marker marker
                                  :data (list :issue-key issue-key))
-                           ops)))))
+                           ops))))))
            (goto-char (line-end-position))))
          (nreverse ops))))))
 
@@ -392,10 +398,13 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                   (ejira--strip-properties (org-get-heading t t t t))))
                  (local-desc-org (if desc-marker (ejira--get-heading-body desc-marker) ""))
                  (local-assignee (or (org-entry-get marker "Assignee") ""))
-                 (local-priority-char (org-entry-get marker "PRIORITY"))
-                 (local-priority-name (when local-priority-char
-                                        (car (rassoc (string-to-char local-priority-char)
-                                                     ejira-priorities-alist))))
+                  (local-priority-char (org-with-point-at marker
+                                         (org-back-to-heading t)
+                                         (when (looking-at org-priority-regexp)
+                                           (match-string 2))))
+                  (local-priority-name (when local-priority-char
+                                         (car (rassoc (org-priority-to-value local-priority-char)
+                                                      ejira-priorities-alist))))
                  (local-deadline (when-let ((d (org-get-deadline-time marker)))
                                    (format-time-string "%Y-%m-%d" d)))
                  (remote-summary (when item (ejira--alist-get item 'fields 'summary)))
@@ -575,31 +584,38 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  (fields `(("title" ,heading-title)
                            ("state" ,local-state)
                            ("description" ,(or local-body "")))))
-            (setq plan (list :op 'create
-                             :object 'subtask
-                             :project project-key
-                             :title (format "new subtask: %s"
-                                            (substring heading-title
-                                                       0 (min 60 (length heading-title))))
-                             :parent-issue parent-key
-                             :fields fields
-                               :send (let ((marker marker) (project-key project-key)
-                                           (parent-key parent-key)
-                                           (summary heading-title)
-                                           (desc (ejira-parser-org-to-jira (or local-body "")))
-                                           (subtask-type ejira-subtask-type-name)
-                                           (orig-state local-state)
-                                           (todo-kws (org-with-point-at marker
-                                                        (when (boundp 'org-todo-keywords-1)
-                                                          org-todo-keywords-1))))
-                                      (lambda ()
-                                        (let* ((result (jiralib2-create-issue
-                                                        project-key subtask-type
-                                                        summary desc
-                                                        `(parent . ((key . ,parent-key)))))
-                                               (new-key (ejira--alist-get result 'key)))
-                                          (ejira--finalize-new-issue
-                                           new-key marker orig-state todo-kws))))))))
+             (setq plan (list :op 'create
+                              :object 'subtask
+                              :project project-key
+                              :title (format "new subtask: %s"
+                                             (substring heading-title
+                                                        0 (min 60 (length heading-title))))
+                              :parent-issue parent-key
+                              :fields fields
+                              :assign-self (list ejira--assign-new-issues)
+                                :send (let ((marker marker) (project-key project-key)
+                                            (parent-key parent-key)
+                                            (summary heading-title)
+                                            (desc (ejira-parser-org-to-jira (or local-body "")))
+                                            (subtask-type ejira-subtask-type-name)
+                                            (orig-state local-state)
+                                            (todo-kws (org-with-point-at marker
+                                                         (when (boundp 'org-todo-keywords-1)
+                                                           org-todo-keywords-1)))
+                                            (assign-self (list ejira--assign-new-issues)))
+                                       (lambda ()
+                                         (let* ((result (jiralib2-create-issue
+                                                         project-key subtask-type
+                                                         summary desc
+                                                         `(parent . ((key . ,parent-key)))))
+                                                (new-key (ejira--alist-get result 'key)))
+                                           (when (car assign-self)
+                                             (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
+                                               (when my-name
+                                                 (jiralib2-assign-issue new-key my-name))))
+                                           (ejira--finalize-new-issue
+                                            new-key marker orig-state todo-kws))))))))
+
           ((and (eq op-type 'create) (eq object 'issue))
            (let* ((project-key      (plist-get data :project-key))
                   (children         (plist-get data :children))
