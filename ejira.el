@@ -193,11 +193,24 @@ Called from async callbacks once all network responses have arrived."
             (with-current-buffer buf
               (ejira--normalize-end-spacing))))
         (ejira--trace "after normalize")
-        ;; Save all modified project buffers, then restore fold state.
-        (dolist (id projects)
-          (when-let ((buf (find-buffer-visiting
-                           (expand-file-name (ejira--project-file-name id)))))
-            (with-current-buffer buf (save-buffer))))
+        ;; Save all buffers touched during sync, not just project files.
+        ;; Headings refiled into other org files are found via
+        ;; org-id-find-id-in-file and updated in-place; those buffers must
+        ;; be saved too or the sync leaves them dirty.
+        (let ((touched
+               (delq nil
+                     (cl-remove-duplicates
+                      (cl-loop for m being the hash-values of ejira--heading-cache
+                               when (and (markerp m) (marker-buffer m))
+                               collect (marker-buffer m))
+                      :test #'eq))))
+          (dolist (id projects)
+            (when-let ((buf (find-buffer-visiting
+                             (expand-file-name (ejira--project-file-name id)))))
+              (cl-pushnew buf touched :test #'eq)))
+          (dolist (buf touched)
+            (with-current-buffer buf
+              (when (buffer-modified-p) (save-buffer)))))
         (ejira--trace "after save")
         ;; Restore fold state for any buffer that was open before the sync.
         (dolist (entry vis-saves)
@@ -358,12 +371,29 @@ comments. With SHALLOW, only update todo status and assignee."
           ;; unresolved |
           ;; resolved   |
 
-          ;; Normalize spacing, save, then restore fold state.
+          ;; Normalize spacing on the project buffer.
           (when-let ((buf (find-buffer-visiting
                            (expand-file-name (ejira--project-file-name id)))))
             (with-current-buffer buf
-              (ejira--normalize-end-spacing)
-              (save-buffer)
+              (ejira--normalize-end-spacing)))
+          ;; Save all buffers touched during sync, not just the project file.
+          (let ((touched
+                 (delq nil
+                       (cl-remove-duplicates
+                        (cl-loop for m being the hash-values of ejira--heading-cache
+                                 when (and (markerp m) (marker-buffer m))
+                                 collect (marker-buffer m))
+                        :test #'eq))))
+            (when-let ((buf (find-buffer-visiting
+                             (expand-file-name (ejira--project-file-name id)))))
+              (cl-pushnew buf touched :test #'eq))
+            (dolist (buf touched)
+              (with-current-buffer buf
+                (when (buffer-modified-p) (save-buffer)))))
+          ;; Restore fold state on the project buffer.
+          (when-let ((buf (find-buffer-visiting
+                           (expand-file-name (ejira--project-file-name id)))))
+            (with-current-buffer buf
               (org-fold-core-regions vis-save :override t)))))
     (setq ejira--sync-in-progress nil)))
 
