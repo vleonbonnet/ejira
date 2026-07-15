@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2017 - 2019 Henrik Nyman
 
-;; Author: Henrik Nyman <h@nyymanni.com>
+;; Author: Henrik Nyman
 ;; URL: https://github.com/nyyManni/ejira
 ;; Keywords: calendar, data, org, jira
 

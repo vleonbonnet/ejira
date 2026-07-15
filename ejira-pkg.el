@@ -10,9 +10,9 @@
   :keywords
   '("jira" "org")
   :authors
-  '(("Henrik Nyman <h@nyymanni.com>"))
+  '(("Henrik Nyman"))
   :maintainer
-  '("Henrik Nyman <h@nyymanni.com>")
+  '("Henrik Nyman")
   :url "https://github.com/nyyManni/ejira")
 ;; Local Variables:
 ;; no-byte-compile: t

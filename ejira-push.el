@@ -86,7 +86,7 @@ leaves the heading dirty so the next save retries the state push."
   (condition-case err
       (ejira--transition-to-org-state new-key orig-state todo-keywords)
     (error (display-warning 'ejira (format "transition skipped for new issue %s: %s"
-                                         new-key (error-message-string err))
+                                           new-key (error-message-string err))
                             :warning)))
   (ejira--update-task new-key)
   (when (and (stringp orig-state) (> (length orig-state) 0))
@@ -135,10 +135,14 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
          (orig-state   (plist-get child :state))
          (summary      (plist-get child :title))
          (desc         (ejira-parser-org-to-jira (or (plist-get child :body) "")))
-         (result (jiralib2-create-issue
-                  project-key ejira-subtask-type-name
-                  summary desc
-                  `(parent . ((key . ,parent-key)))))
+         (priority-id (ejira--default-priority-id project-key parent-key))
+         (result (apply #'jiralib2-create-issue
+                        project-key ejira-subtask-type-name
+                        summary desc
+                        (delq nil
+                              (list `(parent . ((key . ,parent-key)))
+                                    (when priority-id
+                                      `(priority . ((id . ,priority-id))))))))
          (new-key (ejira--alist-get result 'key)))
     (when assign-self
       (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
@@ -184,178 +188,178 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
              ;; must never be detected as new issues or pushed to Jira.
              (if (org-in-commented-heading-p)
                  nil
-             ;; Rule H: PendingDelete (check first)
-             (if (and (equal pending-delete "t") (equal type "ejira-comment"))
-                 (push (list :op 'delete
-                             :object 'comment
-                             :key (org-entry-get nil "CommId")
-                             :project (when-let ((ik (org-entry-get nil "ID" t))) (car (split-string ik "-")))
-                             :parent-issue (org-entry-get nil "ID" t)
-                             :marker marker
-                             :data (list :issue-key (org-entry-get nil "ID" t)
-                                         :commid (org-entry-get nil "CommId")
-                                         :body (ejira--get-heading-body marker)))
-                       ops)
-               ;; Rules A-G (only when NOT PendingDelete)
-               ;; Rule A: Dirty Pushhash — issues
-               (when (and (member type ejira-pushable-types)
-                          id
-                          (not (equal type "ejira-comment"))
-                          (ejira--locally-modified-p)
-                          (not pending-delete))
-                 (let ((proj (car (split-string id "-"))))
-                   (push (list :op 'update
-                               :object 'issue
-                               :key id
-                               :project proj
-                               :parent-issue id
-                               :marker marker
-                               :data nil)
-                         ops)))
-               ;; Rule A2: Dirty Pushhash — existing comments (have CommId)
-               (when (and (equal type "ejira-comment")
-                          (org-entry-get nil "CommId")
-                          (ejira--locally-modified-p)
-                          (not pending-delete))
-                 (let* ((commid (org-entry-get nil "CommId"))
-                        (issue-key (org-entry-get nil "ID" t))
-                        (proj (car (split-string issue-key "-"))))
-                   (push (list :op 'update
+               ;; Rule H: PendingDelete (check first)
+               (if (and (equal pending-delete "t") (equal type "ejira-comment"))
+                   (push (list :op 'delete
                                :object 'comment
-                               :key commid
-                               :project proj
-                               :parent-issue issue-key
+                               :key (org-entry-get nil "CommId")
+                               :project (when-let ((ik (org-entry-get nil "ID" t))) (car (split-string ik "-")))
+                               :parent-issue (org-entry-get nil "ID" t)
                                :marker marker
-                               :data (list :issue-key issue-key
-                                           :commid commid))
-                         ops)))
-               ;; Rule B: PendingTransition
-               (when (and pending-transition (member type ejira-pushable-types))
-                 (push (list :op 'update
-                             :object 'status
-                             :key id
-                             :project (car (split-string id "-"))
-                             :parent-issue id
-                             :marker marker
-                             :data (list :action-name pending-transition))
-                       ops))
-               ;; Rule C: PendingIssuetype
-               (when pending-issuetype
-                 (push (list :op 'update
-                             :object 'issuetype
-                             :key id
-                             :project (car (split-string id "-"))
-                             :parent-issue id
-                             :marker marker
-                             :data (list :new-type pending-issuetype
-                                         :old-type (org-entry-get nil "Issuetype")))
-                       ops))
-               ;; Rule D: PendingEpic
-               (when pending-epic
-                 (push (list :op 'update
-                             :object 'epic
-                             :key id
-                             :project (car (split-string id "-"))
-                             :parent-issue id
-                             :marker marker
-                             :data (list :new-epic pending-epic))
-                       ops))
-               ;; Rule E/F: New heading without TYPE
-               (when (and todo-state
-                          (not type)
-                          (not (equal heading-title ejira-description-heading-name))
-                          (not (equal heading-title ejira-comments-heading-name)))
-                  (let* ((parent-info
-                          (save-excursion
-                            (when (org-up-heading-safe)
-                              (list (org-entry-get nil "TYPE")
-                                    (org-entry-get nil "ID")
-                                    (org-entry-get nil "Issuetype")))))
-                         (parent-type       (nth 0 parent-info))
-                         (parent-id         (nth 1 parent-info))
-                         (parent-issuetype  (nth 2 parent-info))
-                         (project-key       (when parent-id
-                                              (car (split-string parent-id "-")))))
-                    (cond
-                     ;; Under Initiative (or other epic-parent type) → create Epic
-                     ((and (equal parent-type "ejira-issue")
-                           (member parent-issuetype ejira-epic-parent-issuetypes))
-                      (let ((children (ejira--push-scan-issue-children marker parent-id)))
-                        (push (list :op 'create
-                                    :object 'issue
-                                    :key nil
-                                    :project project-key
-                                    :parent-issue parent-id
-                                    :marker marker
-                                    :data (list :project-key project-key
-                                                :issue-type ejira-epic-type-name
-                                                :parent-initiative parent-id
-                                                :children children))
-                              ops)))
-                     ;; Under Epic → create Task (or Story) with Epic Link
-                     ((equal parent-type "ejira-epic")
-                      (let ((children (ejira--push-scan-issue-children marker parent-id)))
-                        (push (list :op 'create
-                                    :object 'issue
-                                    :key nil
-                                    :project project-key
-                                    :parent-issue parent-id
-                                    :marker marker
-                                    :data (list :project-key project-key
-                                                :issue-type ejira-epic-child-type-name
-                                                :parent-epic parent-id
-                                                :children children))
-                              ops)))
-                     ;; Under Issue/Story → create Sub-task (Jira parent link)
-                     ((member parent-type '("ejira-issue" "ejira-story"))
-                      (push (list :op 'create
-                                  :object 'subtask
-                                  :key nil
-                                  :project project-key
-                                  :parent-issue parent-id
-                                  :marker marker
-                                  :data (list :parent-key parent-id
-                                              :project-key project-key))
-                            ops))
-                     ;; Under Project → create issue (top-level)
-                     ((equal parent-type "ejira-project")
-                      (let ((children (ejira--push-scan-issue-children marker parent-id)))
-                        (push (list :op 'create
-                                    :object 'issue
-                                    :key nil
-                                    :project parent-id
-                                    :parent-issue nil
-                                    :marker marker
-                                    :data (list :project-key parent-id
-                                                :children children))
-                              ops))))))
-               ;; Rule G: New comment draft — heading directly under Comments,
-               ;; no CommId yet.  Catches manually-added plain headings and
-               ;; org-capture stubs (TYPE=ejira-comment, no CommId).
-               (when (and (not (org-entry-get nil "CommId"))
-                          (or (not type) (equal type "ejira-comment"))
-                          (not todo-state))
-                 (let* ((parent-title
-                         (save-excursion
-                           (when (org-up-heading-safe)
-                             (org-get-heading t t t t))))
-                        (issue-key
-                         (when (equal parent-title ejira-comments-heading-name)
-                           (save-excursion
-                             (org-up-heading-safe)
-                             (when (org-up-heading-safe)
-                               (org-entry-get nil "ID")))))
-                        (proj (when issue-key (car (split-string issue-key "-")))))
-                   (when issue-key
-                     (push (list :op 'create
+                               :data (list :issue-key (org-entry-get nil "ID" t)
+                                           :commid (org-entry-get nil "CommId")
+                                           :body (ejira--get-heading-body marker)))
+                         ops)
+                 ;; Rules A-G (only when NOT PendingDelete)
+                 ;; Rule A: Dirty Pushhash — issues
+                 (when (and (member type ejira-pushable-types)
+                            id
+                            (not (equal type "ejira-comment"))
+                            (ejira--locally-modified-p)
+                            (not pending-delete))
+                   (let ((proj (car (split-string id "-"))))
+                     (push (list :op 'update
+                                 :object 'issue
+                                 :key id
+                                 :project proj
+                                 :parent-issue id
+                                 :marker marker
+                                 :data nil)
+                           ops)))
+                 ;; Rule A2: Dirty Pushhash — existing comments (have CommId)
+                 (when (and (equal type "ejira-comment")
+                            (org-entry-get nil "CommId")
+                            (ejira--locally-modified-p)
+                            (not pending-delete))
+                   (let* ((commid (org-entry-get nil "CommId"))
+                          (issue-key (org-entry-get nil "ID" t))
+                          (proj (car (split-string issue-key "-"))))
+                     (push (list :op 'update
                                  :object 'comment
-                                 :key nil
+                                 :key commid
                                  :project proj
                                  :parent-issue issue-key
                                  :marker marker
-                                 :data (list :issue-key issue-key))
-                           ops))))))
-           (goto-char (line-end-position))))
+                                 :data (list :issue-key issue-key
+                                             :commid commid))
+                           ops)))
+                 ;; Rule B: PendingTransition
+                 (when (and pending-transition (member type ejira-pushable-types))
+                   (push (list :op 'update
+                               :object 'status
+                               :key id
+                               :project (car (split-string id "-"))
+                               :parent-issue id
+                               :marker marker
+                               :data (list :action-name pending-transition))
+                         ops))
+                 ;; Rule C: PendingIssuetype
+                 (when pending-issuetype
+                   (push (list :op 'update
+                               :object 'issuetype
+                               :key id
+                               :project (car (split-string id "-"))
+                               :parent-issue id
+                               :marker marker
+                               :data (list :new-type pending-issuetype
+                                           :old-type (org-entry-get nil "Issuetype")))
+                         ops))
+                 ;; Rule D: PendingEpic
+                 (when pending-epic
+                   (push (list :op 'update
+                               :object 'epic
+                               :key id
+                               :project (car (split-string id "-"))
+                               :parent-issue id
+                               :marker marker
+                               :data (list :new-epic pending-epic))
+                         ops))
+                 ;; Rule E/F: New heading without TYPE
+                 (when (and todo-state
+                            (not type)
+                            (not (equal heading-title ejira-description-heading-name))
+                            (not (equal heading-title ejira-comments-heading-name)))
+                   (let* ((parent-info
+                           (save-excursion
+                             (when (org-up-heading-safe)
+                               (list (org-entry-get nil "TYPE")
+                                     (org-entry-get nil "ID")
+                                     (org-entry-get nil "Issuetype")))))
+                          (parent-type       (nth 0 parent-info))
+                          (parent-id         (nth 1 parent-info))
+                          (parent-issuetype  (nth 2 parent-info))
+                          (project-key       (when parent-id
+                                               (car (split-string parent-id "-")))))
+                     (cond
+                      ;; Under Initiative (or other epic-parent type) → create Epic
+                      ((and (equal parent-type "ejira-issue")
+                            (member parent-issuetype ejira-epic-parent-issuetypes))
+                       (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                         (push (list :op 'create
+                                     :object 'issue
+                                     :key nil
+                                     :project project-key
+                                     :parent-issue parent-id
+                                     :marker marker
+                                     :data (list :project-key project-key
+                                                 :issue-type ejira-epic-type-name
+                                                 :parent-initiative parent-id
+                                                 :children children))
+                               ops)))
+                      ;; Under Epic → create Task (or Story) with Epic Link
+                      ((equal parent-type "ejira-epic")
+                       (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                         (push (list :op 'create
+                                     :object 'issue
+                                     :key nil
+                                     :project project-key
+                                     :parent-issue parent-id
+                                     :marker marker
+                                     :data (list :project-key project-key
+                                                 :issue-type ejira-epic-child-type-name
+                                                 :parent-epic parent-id
+                                                 :children children))
+                               ops)))
+                      ;; Under Issue/Story → create Sub-task (Jira parent link)
+                      ((member parent-type '("ejira-issue" "ejira-story"))
+                       (push (list :op 'create
+                                   :object 'subtask
+                                   :key nil
+                                   :project project-key
+                                   :parent-issue parent-id
+                                   :marker marker
+                                   :data (list :parent-key parent-id
+                                               :project-key project-key))
+                             ops))
+                      ;; Under Project → create issue (top-level)
+                      ((equal parent-type "ejira-project")
+                       (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                         (push (list :op 'create
+                                     :object 'issue
+                                     :key nil
+                                     :project parent-id
+                                     :parent-issue nil
+                                     :marker marker
+                                     :data (list :project-key parent-id
+                                                 :children children))
+                               ops))))))
+                 ;; Rule G: New comment draft — heading directly under Comments,
+                 ;; no CommId yet.  Catches manually-added plain headings and
+                 ;; org-capture stubs (TYPE=ejira-comment, no CommId).
+                 (when (and (not (org-entry-get nil "CommId"))
+                            (or (not type) (equal type "ejira-comment"))
+                            (not todo-state))
+                   (let* ((parent-title
+                           (save-excursion
+                             (when (org-up-heading-safe)
+                               (org-get-heading t t t t))))
+                          (issue-key
+                           (when (equal parent-title ejira-comments-heading-name)
+                             (save-excursion
+                               (org-up-heading-safe)
+                               (when (org-up-heading-safe)
+                                 (org-entry-get nil "ID")))))
+                          (proj (when issue-key (car (split-string issue-key "-")))))
+                     (when issue-key
+                       (push (list :op 'create
+                                   :object 'comment
+                                   :key nil
+                                   :project proj
+                                   :parent-issue issue-key
+                                   :marker marker
+                                   :data (list :issue-key issue-key))
+                             ops))))))
+             (goto-char (line-end-position))))
          (nreverse ops))))))
 
 (defun ejira--push-scan-all ()
@@ -398,13 +402,11 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                   (ejira--strip-properties (org-get-heading t t t t))))
                  (local-desc-org (if desc-marker (ejira--get-heading-body desc-marker) ""))
                  (local-assignee (or (org-entry-get marker "Assignee") ""))
-                  (local-priority-char (org-with-point-at marker
-                                         (org-back-to-heading t)
-                                         (when (looking-at org-priority-regexp)
-                                           (match-string 2))))
-                  (local-priority-name (when local-priority-char
-                                         (car (rassoc (org-priority-to-value local-priority-char)
-                                                      ejira-priorities-alist))))
+                 (priority-scheme (when item (ejira--get-priority-scheme key)))
+                 (local-priority-entry
+                  (ejira--local-priority-entry marker priority-scheme project))
+                 (local-priority-id (plist-get local-priority-entry :id))
+                 (local-priority-name (plist-get local-priority-entry :name))
                  (local-deadline (when-let ((d (org-get-deadline-time marker)))
                                    (format-time-string "%Y-%m-%d" d)))
                  (remote-summary (when item (ejira--alist-get item 'fields 'summary)))
@@ -415,6 +417,9 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  (remote-assignee (or (when item
                                         (ejira--alist-get item 'fields 'assignee 'displayName))
                                       ""))
+                 (remote-priority-id (when item
+                                       (ejira--priority-id-string
+                                        (ejira--alist-get item 'fields 'priority 'id))))
                  (remote-priority-name (when item
                                          (ejira--alist-get item 'fields 'priority 'name)))
                  (remote-deadline (when item (ejira--alist-get item 'fields 'duedate)))
@@ -430,61 +435,72 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                         (delq nil (mapcar (lambda (e) (when (= (cdr e) idx) (car e)))
                                           ejira-todo-states-alist))))))
                  (state-matches (member remote-status-name local-state-jira-names))
-                 (changes (ejira-confirm-field-changes
-                           `(("summary"     ,remote-summary  ,local-summary)
-                             ("description" ,(or remote-desc-org "") ,local-desc-org)
-                             ("assignee"    ,remote-assignee ,local-assignee)
-                             ,@(when local-priority-name
-                                 `(("priority" ,(or remote-priority-name "") ,local-priority-name)))
-                             ("deadline"    ,(or remote-deadline "") ,(or local-deadline ""))
-                             ,@(when (and local-state remote-status-name (not state-matches))
-                                 `(("state" ,(or remote-status-name "") ,local-state))))))
+                 ;; A legacy heading has no exact Jira priority identity and
+                 ;; is intentionally ignored here.  It will be migrated on a
+                 ;; clean pull, or after its current dirty push succeeds.
+                 (priority-changed
+                  (and local-priority-id
+                       (not (equal local-priority-id remote-priority-id))))
+                 (changes (let ((base-changes
+                                 (ejira-confirm-field-changes
+                                  `(("summary"     ,remote-summary ,local-summary)
+                                    ("description" ,(or remote-desc-org "") ,local-desc-org)
+                                    ("assignee"    ,remote-assignee ,local-assignee)
+                                    ("deadline"    ,(or remote-deadline "") ,(or local-deadline ""))
+                                    ,@(when (and local-state remote-status-name
+                                                 (not state-matches))
+                                        `(("state" ,(or remote-status-name "") ,local-state)))))))
+                            (if priority-changed
+                                (cons (list "priority"
+                                            (or remote-priority-name remote-priority-id "")
+                                            (or local-priority-name local-priority-id ""))
+                                      base-changes)
+                              base-changes)))
                  (summary-changed (assoc "summary" changes))
                  (desc-changed (assoc "description" changes))
                  (assignee-changed (assoc "assignee" changes))
-                 (priority-changed (assoc "priority" changes))
                  (deadline-changed (assoc "deadline" changes))
                  (state-changed (assoc "state" changes)))
             (if changes
-              (push (list :op 'update
-                          :object 'issue
-                          :project project
-                          :title key
-                          :parent-issue key
-                          :changes changes
-                          :send (let ((key key) (marker marker)
-                                      (local-summary local-summary)
-                                      (local-desc-org local-desc-org)
-                                      (local-assignee local-assignee)
-                                      (local-priority-name local-priority-name)
-                                      (local-deadline local-deadline)
-                                      (local-state local-state)
-                                      (todo-kws todo-kws)
-                                      (summary-changed summary-changed)
-                                      (desc-changed desc-changed)
-                                      (assignee-changed assignee-changed)
-                                      (priority-changed priority-changed)
-                                      (deadline-changed deadline-changed)
-                                      (state-changed state-changed))
-                                  (lambda ()
-                                    (when (or summary-changed desc-changed)
-                                      (jiralib2-update-summary-description
-                                       key local-summary
-                                       (ejira-parser-org-to-jira local-desc-org)))
-                                    (when assignee-changed
-                                      (let* ((users (ejira--get-assignable-users key))
-                                             (username (car (rassoc local-assignee users))))
-                                        (jiralib2-assign-issue key username)))
-                                    (when (and priority-changed local-priority-name)
-                                      (jiralib2-update-issue
-                                       key `(priority . ((name . ,local-priority-name)))))
-                                    (when deadline-changed
-                                      (jiralib2-update-issue
-                                       key `(duedate . ,(or local-deadline ""))))
-                                    (when state-changed
-                                      (ejira--transition-to-org-state key local-state todo-kws))
-                                    (ejira--push-finalize marker))))
-                    plans)
+                (push (list :op 'update
+                            :object 'issue
+                            :project project
+                            :title key
+                            :parent-issue key
+                            :changes changes
+                            :send (let ((key key) (marker marker)
+                                        (local-summary local-summary)
+                                        (local-desc-org local-desc-org)
+                                        (local-assignee local-assignee)
+                                        (local-priority-id local-priority-id)
+                                        (local-deadline local-deadline)
+                                        (local-state local-state)
+                                        (todo-kws todo-kws)
+                                        (summary-changed summary-changed)
+                                        (desc-changed desc-changed)
+                                        (assignee-changed assignee-changed)
+                                        (priority-changed priority-changed)
+                                        (deadline-changed deadline-changed)
+                                        (state-changed state-changed))
+                                    (lambda ()
+                                      (when (or summary-changed desc-changed)
+                                        (jiralib2-update-summary-description
+                                         key local-summary
+                                         (ejira-parser-org-to-jira local-desc-org)))
+                                      (when assignee-changed
+                                        (let* ((users (ejira--get-assignable-users key))
+                                               (username (car (rassoc local-assignee users))))
+                                          (jiralib2-assign-issue key username)))
+                                      (when (and priority-changed local-priority-id)
+                                        (jiralib2-update-issue
+                                         key `(priority . ((id . ,local-priority-id)))))
+                                      (when deadline-changed
+                                        (jiralib2-update-issue
+                                         key `(duedate . ,(or local-deadline ""))))
+                                      (when state-changed
+                                        (ejira--transition-to-org-state key local-state todo-kws))
+                                      (ejira--push-finalize marker))))
+                      plans)
               ;; No changes vs remote — re-baseline to clear the dirty hash.
               (when item
                 (org-with-point-at marker (ejira--update-push-baseline))))))))
@@ -514,13 +530,13 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                :title (format "%s comment %s" issue-key commid)
                                :parent-issue issue-key
                                :changes changes
-                                :send (let ((issue-key issue-key) (commid commid) (marker marker)
-                                            (body local-body))
-                                        (lambda ()
-                                          (jiralib2-edit-comment
-                                           issue-key commid
-                                           (ejira-parser-org-to-jira body))
-                                          (ejira--push-finalize marker))))))))
+                               :send (let ((issue-key issue-key) (commid commid) (marker marker)
+                                           (body local-body))
+                                       (lambda ()
+                                         (jiralib2-edit-comment
+                                          issue-key commid
+                                          (ejira-parser-org-to-jira body))
+                                         (ejira--push-finalize marker))))))))
          ((and (eq op-type 'update) (eq object 'status))
           (let ((action-name (plist-get data :action-name)))
             (setq plan (list :op 'update
@@ -566,10 +582,10 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                              :title key
                              :parent-issue key
                              :changes `(("epic" "" ,new-epic))
-                              :send (let ((key key) (marker marker) (new-epic new-epic)
-                                          (epic-field ejira-epic-field))
-                                      (lambda ()
-                                        (jiralib2-update-issue key `(,epic-field . ,new-epic))
+                             :send (let ((key key) (marker marker) (new-epic new-epic)
+                                         (epic-field ejira-epic-field))
+                                     (lambda ()
+                                       (jiralib2-update-issue key `(,epic-field . ,new-epic))
                                        (ejira--update-task key)
                                        (org-with-point-at marker
                                          (org-delete-property "PendingEpic"))))))))
@@ -584,145 +600,158 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  (fields `(("title" ,heading-title)
                            ("state" ,local-state)
                            ("description" ,(or local-body "")))))
-             (setq plan (list :op 'create
-                              :object 'subtask
-                              :project project-key
-                              :title (format "new subtask: %s"
-                                             (substring heading-title
-                                                        0 (min 60 (length heading-title))))
-                              :parent-issue parent-key
-                              :fields fields
-                              :assign-self (list ejira--assign-new-issues)
-                                :send (let ((marker marker) (project-key project-key)
-                                            (parent-key parent-key)
-                                            (summary heading-title)
-                                            (desc (ejira-parser-org-to-jira (or local-body "")))
-                                            (subtask-type ejira-subtask-type-name)
-                                            (orig-state local-state)
-                                            (todo-kws (org-with-point-at marker
-                                                         (when (boundp 'org-todo-keywords-1)
-                                                           org-todo-keywords-1)))
-                                            (assign-self (list ejira--assign-new-issues)))
-                                       (lambda ()
-                                         (let* ((result (jiralib2-create-issue
-                                                         project-key subtask-type
-                                                         summary desc
-                                                         `(parent . ((key . ,parent-key)))))
-                                                (new-key (ejira--alist-get result 'key)))
-                                           (when (car assign-self)
-                                             (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
-                                               (when my-name
-                                                 (jiralib2-assign-issue new-key my-name))))
-                                           (ejira--finalize-new-issue
-                                            new-key marker orig-state todo-kws))))))))
+            (setq plan (list :op 'create
+                             :object 'subtask
+                             :project project-key
+                             :title (format "new subtask: %s"
+                                            (substring heading-title
+                                                       0 (min 60 (length heading-title))))
+                             :parent-issue parent-key
+                             :fields fields
+                             :assign-self (list ejira--assign-new-issues)
+                             :send (let ((marker marker) (project-key project-key)
+                                         (parent-key parent-key)
+                                         (summary heading-title)
+                                         (desc (ejira-parser-org-to-jira (or local-body "")))
+                                         (subtask-type ejira-subtask-type-name)
+                                         (orig-state local-state)
+                                         (todo-kws (org-with-point-at marker
+                                                     (when (boundp 'org-todo-keywords-1)
+                                                       org-todo-keywords-1)))
+                                         (assign-self (list ejira--assign-new-issues)))
+                                     (lambda ()
+                                       (let* ((priority-id
+                                               (ejira--default-priority-id
+                                                project-key parent-key))
+                                              (result (apply #'jiralib2-create-issue
+                                                             project-key subtask-type
+                                                             summary desc
+                                                             (delq nil
+                                                                   (list
+                                                                    `(parent . ((key . ,parent-key)))
+                                                                    (when priority-id
+                                                                      `(priority . ((id . ,priority-id))))))))
+                                              (new-key (ejira--alist-get result 'key)))
+                                         (when (car assign-self)
+                                           (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
+                                             (when my-name
+                                               (jiralib2-assign-issue new-key my-name))))
+                                         (ejira--finalize-new-issue
+                                          new-key marker orig-state todo-kws))))))))
 
-          ((and (eq op-type 'create) (eq object 'issue))
-           (let* ((project-key      (plist-get data :project-key))
-                  (children         (plist-get data :children))
-                  (issue-type       (or (plist-get data :issue-type)
-                                        (or ejira-story-type-name "Task")))
-                  (parent-epic      (plist-get data :parent-epic))
-                  (parent-initiative (plist-get data :parent-initiative))
-                  (parent-issue     (or parent-epic parent-initiative
-                                        (plist-get op :parent-issue)))
-                  (heading-title (org-with-point-at marker
-                                   (ejira--strip-properties (org-get-heading t t t t))))
-                  (local-body (ejira--get-heading-body marker))
-                  (local-state (org-with-point-at marker
-                                 (substring-no-properties (or (org-get-todo-state) ""))))
-                  (fields `(("title" ,heading-title)
-                            ("state" ,local-state)
-                            ("description" ,(or local-body ""))))
-                  (is-epic (equal issue-type ejira-epic-type-name))
-                  (label (cond (is-epic "epic")
-                               (parent-epic "task")
-                               (t "issue"))))
-              (setq plan (list :op 'create
-                              :object 'issue
-                              :project project-key
-                              :label label
-                              :title (format "new %s: %s" label heading-title)
-                              :parent-issue parent-issue
-                              :fields fields
-                              :children children
-                              :assign-self (list ejira--assign-new-issues)
-                               :send (let ((marker marker) (project-key project-key)
-                                           (orig-state local-state)
-                                           (summary heading-title)
-                                           (desc (ejira-parser-org-to-jira (or local-body "")))
-                                           (children children)
-                                           (issue-type issue-type)
-                                           (parent-epic parent-epic)
-                                           (is-epic is-epic)
-                                           (assign-self (list ejira--assign-new-issues))
-                                           (epic-field ejira-epic-field)
-                                           (epic-summary-field ejira-epic-summary-field)
-                                           (todo-kws (org-with-point-at marker
-                                                        (when (boundp 'org-todo-keywords-1)
-                                                          org-todo-keywords-1))))
-                                      (lambda ()
-                                        (let* ((epic-name-arg
-                                                (when (and is-epic epic-summary-field)
-                                                  `(,epic-summary-field . ,summary)))
-                                               (result (apply #'jiralib2-create-issue
-                                                              project-key issue-type
-                                                              summary desc
-                                                              (delq nil (list epic-name-arg))))
-                                               (new-key (ejira--alist-get result 'key)))
-                                          (when (and parent-epic epic-field)
-                                            (jiralib2-update-issue
-                                             new-key `(,epic-field . ,parent-epic)))
-                                          (when (and parent-epic (not epic-field))
-                                            (display-warning
-                                             'ejira
-                                             "ejira-epic-field is nil — run `ejira-guess-epic-sprint-fields' to auto-configure.  Epic Link not set for new issue."
-                                             :warning))
-                                          (when (and is-epic (not epic-summary-field))
-                                            (display-warning
-                                             'ejira
-                                             "ejira-epic-summary-field is nil — run `ejira-guess-epic-sprint-fields' to auto-configure.  Epic Name not set for new Epic."
-                                             :warning))
-                                          (when (car assign-self)
-                                            (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
-                                              (when my-name
-                                                (jiralib2-assign-issue new-key my-name))))
-                                          (ejira--finalize-new-issue
-                                           new-key marker orig-state todo-kws)
-                                          (dolist (child children)
-                                            (condition-case err
-                                                (ejira--push-create-cascaded-subtask
-                                                 new-key project-key child todo-kws
-                                                 (car assign-self))
-                                              (error
-                                               (display-warning
-                                                'ejira
-                                                (format "cascade subtask failed for %s: %s"
-                                                        (plist-get child :title)
-                                                        (error-message-string err))
-                                                :error)))))))))))
-          ((and (eq op-type 'create) (eq object 'comment))
-           (let* ((issue-key (plist-get data :issue-key))
-                  (preview (let ((body (ejira--get-heading-body marker)))
-                             (if (and body (> (length body) 0))
-                                 (substring body 0 (min 80 (length body)))
-                               "(no body)"))))
-             (setq plan (list :op 'create
-                              :object 'comment
-                              :project project
-                              :title (format "new comment on %s" issue-key)
-                              :parent-issue issue-key
-                              :preview preview
-                              :send (let ((marker marker) (issue-key issue-key)
-                                          (body (ejira--get-heading-body marker)))
-                                      (lambda ()
-                                        (let* ((comment (ejira--parse-comment
-                                                         (jiralib2-add-comment
-                                                          issue-key
-                                                          (ejira-parser-org-to-jira body)))))
-                                          (org-with-point-at marker
-                                            (org-set-property "CommId" (ejira-comment-id comment))
-                                            (org-set-property "TYPE" "ejira-comment"))
-                                          (ejira--update-comment issue-key comment))))))))
+         ((and (eq op-type 'create) (eq object 'issue))
+          (let* ((project-key      (plist-get data :project-key))
+                 (children         (plist-get data :children))
+                 (issue-type       (or (plist-get data :issue-type)
+                                       (or ejira-story-type-name "Task")))
+                 (parent-epic      (plist-get data :parent-epic))
+                 (parent-initiative (plist-get data :parent-initiative))
+                 (parent-issue     (or parent-epic parent-initiative
+                                       (plist-get op :parent-issue)))
+                 (heading-title (org-with-point-at marker
+                                  (ejira--strip-properties (org-get-heading t t t t))))
+                 (local-body (ejira--get-heading-body marker))
+                 (local-state (org-with-point-at marker
+                                (substring-no-properties (or (org-get-todo-state) ""))))
+                 (fields `(("title" ,heading-title)
+                           ("state" ,local-state)
+                           ("description" ,(or local-body ""))))
+                 (is-epic (equal issue-type ejira-epic-type-name))
+                 (label (cond (is-epic "epic")
+                              (parent-epic "task")
+                              (t "issue"))))
+            (setq plan (list :op 'create
+                             :object 'issue
+                             :project project-key
+                             :label label
+                             :title (format "new %s: %s" label heading-title)
+                             :parent-issue parent-issue
+                             :fields fields
+                             :children children
+                             :assign-self (list ejira--assign-new-issues)
+                             :send (let ((marker marker) (project-key project-key)
+                                         (orig-state local-state)
+                                         (summary heading-title)
+                                         (desc (ejira-parser-org-to-jira (or local-body "")))
+                                         (children children)
+                                         (issue-type issue-type)
+                                         (parent-epic parent-epic)
+                                         (is-epic is-epic)
+                                         (assign-self (list ejira--assign-new-issues))
+                                         (epic-field ejira-epic-field)
+                                         (epic-summary-field ejira-epic-summary-field)
+                                         (todo-kws (org-with-point-at marker
+                                                     (when (boundp 'org-todo-keywords-1)
+                                                       org-todo-keywords-1))))
+                                     (lambda ()
+                                       (let* ((epic-name-arg
+                                               (when (and is-epic epic-summary-field)
+                                                 `(,epic-summary-field . ,summary)))
+                                              (priority-id
+                                               (ejira--default-priority-id
+                                                project-key parent-issue))
+                                              (result (apply #'jiralib2-create-issue
+                                                             project-key issue-type
+                                                             summary desc
+                                                             (delq nil
+                                                                   (list epic-name-arg
+                                                                         (when priority-id
+                                                                           `(priority . ((id . ,priority-id))))))))
+                                              (new-key (ejira--alist-get result 'key)))
+                                         (when (and parent-epic epic-field)
+                                           (jiralib2-update-issue
+                                            new-key `(,epic-field . ,parent-epic)))
+                                         (when (and parent-epic (not epic-field))
+                                           (display-warning
+                                            'ejira
+                                            "ejira-epic-field is nil — run `ejira-guess-epic-sprint-fields' to auto-configure.  Epic Link not set for new issue."
+                                            :warning))
+                                         (when (and is-epic (not epic-summary-field))
+                                           (display-warning
+                                            'ejira
+                                            "ejira-epic-summary-field is nil — run `ejira-guess-epic-sprint-fields' to auto-configure.  Epic Name not set for new Epic."
+                                            :warning))
+                                         (when (car assign-self)
+                                           (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
+                                             (when my-name
+                                               (jiralib2-assign-issue new-key my-name))))
+                                         (ejira--finalize-new-issue
+                                          new-key marker orig-state todo-kws)
+                                         (dolist (child children)
+                                           (condition-case err
+                                               (ejira--push-create-cascaded-subtask
+                                                new-key project-key child todo-kws
+                                                (car assign-self))
+                                             (error
+                                              (display-warning
+                                               'ejira
+                                               (format "cascade subtask failed for %s: %s"
+                                                       (plist-get child :title)
+                                                       (error-message-string err))
+                                               :error)))))))))))
+         ((and (eq op-type 'create) (eq object 'comment))
+          (let* ((issue-key (plist-get data :issue-key))
+                 (preview (let ((body (ejira--get-heading-body marker)))
+                            (if (and body (> (length body) 0))
+                                (substring body 0 (min 80 (length body)))
+                              "(no body)"))))
+            (setq plan (list :op 'create
+                             :object 'comment
+                             :project project
+                             :title (format "new comment on %s" issue-key)
+                             :parent-issue issue-key
+                             :preview preview
+                             :send (let ((marker marker) (issue-key issue-key)
+                                         (body (ejira--get-heading-body marker)))
+                                     (lambda ()
+                                       (let* ((comment (ejira--parse-comment
+                                                        (jiralib2-add-comment
+                                                         issue-key
+                                                         (ejira-parser-org-to-jira body)))))
+                                         (org-with-point-at marker
+                                           (org-set-property "CommId" (ejira-comment-id comment))
+                                           (org-set-property "TYPE" "ejira-comment"))
+                                         (ejira--update-comment issue-key comment))))))))
          ((and (eq op-type 'delete) (eq object 'comment))
           (let* ((issue-key (plist-get data :issue-key))
                  (commid (plist-get data :commid))
@@ -738,8 +767,8 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                        (jiralib2-delete-comment issue-key commid)
                                        (org-with-point-at marker
                                          (ejira--with-expand-all
-                                            (org-cut-subtree))))))))))
-         (when plan (push plan plans))))
+                                           (org-cut-subtree))))))))))
+        (when plan (push plan plans))))
     (nreverse plans)))
 
 (defmacro ejira--with-pre-scan (buf &rest body)

@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2017-2019 Henrik Nyman
 
-;; Author: Henrik Nyman <henrikjohannesnyman@gmail.com>
+;; Author: Henrik Nyman
 ;; URL: https://github.com/nyyManni/ejira
 ;; Keywords: jira, org, helm
 ;; Version: 1.0

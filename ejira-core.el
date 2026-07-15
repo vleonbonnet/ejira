@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2017 - 2019 Henrik Nyman
 
-;; Author: Henrik Nyman <h@nyymanni.com>
+;; Author: Henrik Nyman
 ;; URL: https://github.com/nyyManni/ejira
 ;; Keywords: calendar, data, org, jira
 ;; Package-Requires: ((emacs "26.1"))
@@ -84,16 +84,24 @@ if your project hierarchy uses them as Epic parents."
   :group 'ejira
   :type '(repeat string))
 
-(defcustom ejira-priorities-alist '(("High"   . ?A)
-                                    ("Medium" . ?B)
-                                    ("Low"    . ?C))
-  "Association list to convert between `org-mode' and JIRA priorities.
-If modifying, remember to set `org-lowest-priority' and `org-highest-priority'
-so that all priorities are valid."
+(defcustom ejira-priorities-alist nil
+  "Deprecated compatibility variable; Jira priorities are loaded per issue.
+The priority scheme returned by Jira's issue edit metadata is authoritative.
+The variable is retained so older configurations can be loaded, but it is no
+longer consulted when priorities are pulled or pushed."
   :group 'ejira
   :tag "JIRA priority map"
   :type '(alist :key-type (string :tag "JIRA Priority")
                 :value-type (character :tag "org-priority")))
+
+(defcustom ejira-priority-policies nil
+  "Per-project overrides for Jira priority display and selection.
+Each entry is (PROJECT :ranks RANKS :fallback-rank RANK :selectable IDS
+:default ID).  RANKS maps exact Jira priority IDs to one-based Org ranks.
+IDs in :selectable are offered by `ejira-set-priority'; omitted Jira IDs use
+:fallback-rank when present."
+  :group 'ejira
+  :type 'sexp)
 
 (defcustom ejira-todo-states-alist '(("To Do"       . 1)
                                      ("In Progress" . 2)
@@ -106,7 +114,7 @@ The default value is applicable for:
   :group 'ejira
   :tag "JIRA state map"
   :type '(alist :key-type (string :tag "JIRA State")
-        :value-type (number :tag "org-todo")))
+                :value-type (number :tag "org-todo")))
 
 (defcustom ejira-todo-state-fn
   (lambda (status _resolution)
@@ -142,6 +150,7 @@ Set to nil to disable assigned-tag management entirely.")
   epic
   project
   priority
+  priority-id
   sprint
   estimate
   remaining-estimate
@@ -149,6 +158,18 @@ Set to nil to disable assigned-tag management entirely.")
   parent
   description
   comments)
+
+(defconst ejira-priority-id-property "JiraPriorityId"
+  "Org property storing the exact Jira priority ID for a heading.")
+
+(defconst ejira-priority-name-property "JiraPriorityName"
+  "Org property storing the last-seen Jira priority name for a heading.")
+
+(defconst ejira-priority-rank-property "JiraPriorityRank"
+  "Org property storing the policy-derived display rank for a heading.")
+
+(defvar ejira--priority-scheme-cache (make-hash-table :test #'equal)
+  "Cached ordered Jira priority schemes keyed by session, URL, and issue key.")
 
 (cl-defstruct ejira-comment
   id
@@ -258,10 +279,210 @@ Set to nil to disable assigned-tag management entirely.")
      :parent (when (equal type ejira-subtask-type-name)
                (ejira--alist-get item 'fields 'parent 'key))
      :priority (ejira--alist-get item 'fields 'priority 'name)
+     :priority-id (when-let ((id (ejira--alist-get item 'fields 'priority 'id)))
+                    (format "%s" id))
      :summary (ejira--parse-body (ejira--alist-get item 'fields 'summary))
      :description (ejira--alist-get item 'fields 'description)
      :comments (mapcar #'ejira--parse-comment
                        (ejira--alist-get item 'fields 'comment 'comments)))))
+
+(defun ejira--priority-id-string (id)
+  "Return ID as a string, or nil when ID is absent."
+  (when id (format "%s" id)))
+
+(defun ejira--parse-priority-scheme (editmeta)
+  "Return ordered priority records from Jira EDITMETA.
+Each record is a plist containing :id and :name.  The order is the order
+returned by Jira's `allowedValues', which is the issue's applicable scheme."
+  (let ((allowed-values (ejira--alist-get editmeta 'fields 'priority
+                                          'allowedValues)))
+    (when (vectorp allowed-values)
+      (setq allowed-values (append allowed-values nil)))
+    (cl-loop for value in allowed-values
+             for id = (ejira--priority-id-string
+                       (ejira--alist-get value 'id))
+             for name = (ejira--alist-get value 'name)
+             when (and id name)
+             collect (list :id id :name name))))
+
+(defun ejira--priority-scheme-cache-key (issue-key)
+  "Return the cache key for ISSUE-KEY in the active Jira session."
+  (list jiralib2-url jiralib2--session issue-key))
+
+(defun ejira--clear-priority-scheme-cache (&rest _args)
+  "Clear cached Jira priority schemes."
+  (when (hash-table-p ejira--priority-scheme-cache)
+    (clrhash ejira--priority-scheme-cache)))
+
+(advice-add 'jiralib2-session-logout :after #'ejira--clear-priority-scheme-cache)
+
+(defun ejira--get-priority-scheme (issue-key &optional refresh)
+  "Return the ordered priority scheme applicable to ISSUE-KEY.
+The result is read from Jira's issue edit metadata and cached for the active
+session.  A nil result means the priority field is not editable or Jira did
+not provide allowed values."
+  (unless (hash-table-p ejira--priority-scheme-cache)
+    (setq ejira--priority-scheme-cache (make-hash-table :test #'equal)))
+  (let ((cache-key (ejira--priority-scheme-cache-key issue-key)))
+    (or (and (not refresh) (gethash cache-key ejira--priority-scheme-cache))
+        (condition-case err
+            (let ((scheme (ejira--parse-priority-scheme
+                           (jiralib2-session-call
+                            (format "/rest/api/2/issue/%s/editmeta" issue-key)))))
+              (when scheme
+                (puthash cache-key scheme ejira--priority-scheme-cache))
+              scheme)
+          (error
+           (display-warning
+            'ejira
+            (format "Could not retrieve priority scheme for %s: %s"
+                    issue-key (error-message-string err))
+            :warning)
+           nil)))))
+
+(defun ejira--priority-entry-by-id (scheme priority-id)
+  "Return the entry in SCHEME whose Jira ID is PRIORITY-ID."
+  (when priority-id
+    (cl-find (ejira--priority-id-string priority-id) scheme
+             :key (lambda (entry) (plist-get entry :id))
+             :test #'equal)))
+
+(defun ejira--priority-entry-by-rank (scheme rank)
+  "Return the RANK-th entry in ordered SCHEME, or nil."
+  (when (and (integerp rank) (> rank 0))
+    (nth (1- rank) scheme)))
+
+(defun ejira--priority-policy (project)
+  "Return the configured priority policy for PROJECT, or nil."
+  (cdr (assoc project ejira-priority-policies)))
+
+(defun ejira--priority-policy-rank (project priority-id)
+  "Return PROJECT's configured rank for PRIORITY-ID, or nil."
+  (when-let ((policy (ejira--priority-policy project)))
+    (or (cdr (assoc (ejira--priority-id-string priority-id)
+                    (plist-get policy :ranks)))
+        (plist-get policy :fallback-rank))))
+
+(defun ejira--selectable-priority-scheme (project scheme)
+  "Return the priorities from SCHEME selectable in PROJECT."
+  (let* ((policy (ejira--priority-policy project))
+         (selectable (plist-get policy :selectable)))
+    (if (and policy selectable)
+        (cl-remove-if-not
+         (lambda (entry) (member (plist-get entry :id) selectable))
+         scheme)
+      scheme)))
+
+(defun ejira--priority-rank (scheme priority-id &optional project)
+  "Return the one-based rank of PRIORITY-ID in SCHEME.
+Use PROJECT's configured policy when one exists."
+  (or (ejira--priority-policy-rank project priority-id)
+      (when-let ((position
+                  (cl-position (ejira--priority-id-string priority-id) scheme
+                               :key (lambda (entry) (plist-get entry :id))
+                               :test #'equal)))
+        (1+ position))))
+
+(defun ejira--priority-entry-for-rank (project scheme rank)
+  "Return the selectable SCHEME entry corresponding to PROJECT RANK."
+  (cl-find rank (ejira--selectable-priority-scheme project scheme)
+           :key (lambda (entry)
+                  (ejira--priority-rank scheme (plist-get entry :id) project))))
+
+(defun ejira--default-priority-id (project &optional reference-key)
+  "Return the default priority ID for new issues in PROJECT.
+REFERENCE-KEY supplies an existing issue whose edit metadata can provide the
+scheme when PROJECT has no explicit policy."
+  (let* ((policy (ejira--priority-policy project))
+         (configured (plist-get policy :default))
+         (selectable (plist-get policy :selectable)))
+    (or configured
+        (car selectable)
+        (when reference-key
+          (car (mapcar (lambda (entry) (plist-get entry :id))
+                       (ejira--get-priority-scheme reference-key)))))))
+
+(defun ejira--org-priority-numeric-p ()
+  "Return non-nil when Org's configured priority range is numeric."
+  (< org-priority-lowest 65))
+
+(defun ejira--org-priority-for-rank (rank)
+  "Return the Org priority value corresponding to Jira scheme RANK."
+  (if (ejira--org-priority-numeric-p)
+      rank
+    (+ org-priority-highest (1- rank))))
+
+(defun ejira--org-priority-rank (priority)
+  "Return the Jira-style rank represented by Org PRIORITY.
+PRIORITY may be the string captured from an Org priority cookie."
+  (when priority
+    (let ((value (org-priority-to-value (format "%s" priority))))
+      (if (ejira--org-priority-numeric-p)
+          value
+        (1+ (- (upcase value) (upcase org-priority-highest)))))))
+
+(defun ejira--ensure-org-priority-range (rank)
+  "Extend Org's configured priority range to include Jira scheme RANK."
+  (let ((lowest (ejira--org-priority-for-rank rank)))
+    (when (> lowest org-priority-lowest)
+      (setq org-priority-lowest lowest))
+    ;; Older Org versions and orgist use the unprefixed aliases.
+    (when (and (boundp 'org-lowest-priority)
+               (> lowest org-lowest-priority))
+      (setq org-lowest-priority lowest))))
+
+(defun ejira--set-task-priority (marker priority-id priority-name scheme
+                                        &optional project)
+  "Set MARKER's Org priority and Jira metadata from SCHEME.
+PRIORITY-ID and PRIORITY-NAME are authoritative Jira values.  If the ID is
+not present in SCHEME, preserve the existing Org cookie but still record the
+Jira identity so a later refresh can retry the mapping safely."
+  (org-with-point-at marker
+    (if priority-id
+        (progn
+          (let ((rank (ejira--priority-rank scheme priority-id project)))
+            (if rank
+                (progn
+                  (ejira--ensure-org-priority-range rank)
+                  (org-priority (ejira--org-priority-for-rank rank))
+                  (org-set-property ejira-priority-rank-property
+                                    (number-to-string rank)))
+              (org-delete-property ejira-priority-rank-property)))
+          (org-set-property ejira-priority-id-property
+                            (ejira--priority-id-string priority-id))
+          (if priority-name
+              (org-set-property ejira-priority-name-property priority-name)
+            (org-delete-property ejira-priority-name-property)))
+      (when (save-excursion
+              (org-back-to-heading t)
+              (looking-at org-priority-regexp))
+        (org-priority 'remove))
+      (org-delete-property ejira-priority-id-property)
+      (org-delete-property ejira-priority-name-property)
+      (org-delete-property ejira-priority-rank-property))))
+
+(defun ejira--local-priority-entry (marker scheme &optional project)
+  "Return the Jira priority entry represented by MARKER, or nil.
+Headings without `JiraPriorityId' are legacy data and deliberately do not
+produce an outbound priority.  Once metadata exists, a direct Org cookie edit
+is resolved by the current scheme rank; the stored ID is used when the rank
+has not changed so duplicate or renamed Jira names remain safe."
+  (when scheme
+    (org-with-point-at marker
+      (let* ((stored-id (org-entry-get (point-marker)
+                                       ejira-priority-id-property))
+             (stored-entry (ejira--priority-entry-by-id scheme stored-id))
+             (priority (save-excursion
+                         (org-back-to-heading t)
+                         (when (looking-at org-priority-regexp)
+                           (match-string 2))))
+             (rank (ejira--org-priority-rank priority))
+             (stored-rank (ejira--priority-rank
+                           scheme (plist-get stored-entry :id) project)))
+        (when (and stored-entry rank)
+          (if (= rank stored-rank)
+              stored-entry
+            (ejira--priority-entry-for-rank project scheme rank)))))))
 
 (defun ejira--project-file-name (key)
   "Get file path for the project KEY."
@@ -389,14 +610,50 @@ If the issue heading does not exist, fallback to full update."
         (ejira--new-heading (marker-buffer (ejira--find-heading project))
                             (or parent project)
                             key))
-      (let ((key-m (ejira--find-heading key)))
+      (let* ((key-m (ejira--find-heading key))
+             (modified-p
+              (not (equal (org-entry-get key-m "Modified")
+                          (format-time-string "%Y-%m-%d %H:%M:%S"
+                                              updated "UTC"))))
+             ;; A legacy heading can already contain a real local edit.  Do
+             ;; not reinterpret its old Org cookie as an outbound Jira
+             ;; priority while migrating it.
+             (local-dirty-p
+              (org-with-point-at key-m (ejira--locally-modified-p)))
+             (stored-priority-id
+              (org-entry-get key-m ejira-priority-id-property))
+             (stored-priority-name
+              (org-entry-get key-m ejira-priority-name-property))
+             (stored-priority-rank
+              (org-entry-get key-m ejira-priority-rank-property))
+             (priority-scheme
+              (when priority-id (ejira--get-priority-scheme key)))
+             (remote-priority-rank
+              (when priority-id
+                (ejira--priority-rank priority-scheme priority-id project)))
+             (priority-needs-sync
+              (or modified-p
+                  (not (equal stored-priority-id priority-id))
+                  (not (equal stored-priority-name priority))
+                  (not (equal stored-priority-rank
+                              (and remote-priority-rank
+                                   (number-to-string remote-priority-rank))))))
+             (priority-migration-skipped-p
+              (and local-dirty-p
+                   (not stored-priority-id)
+                   priority-needs-sync))
+             (priority-applied-p nil))
+
+        ;; Priority metadata is handled separately so an unchanged heading can
+        ;; still be migrated from the old global name map.
+        (when (and priority-needs-sync (not priority-migration-skipped-p))
+          (ejira--set-task-priority key-m priority-id priority priority-scheme project)
+          (setq priority-applied-p t))
 
         ;; Skip expensive field/comment updates when Jira reports no changes.
         ;; Modified stores the last-seen Jira updated timestamp; equality means
-        ;; nothing on the server changed since the last sync.
-        (unless (equal (org-entry-get key-m "Modified")
-                       (format-time-string "%Y-%m-%d %H:%M:%S" updated "UTC"))
-
+        ;; nothing else on the server changed since the last sync.
+        (when modified-p
           (ejira--set-todo-state key (funcall ejira-todo-state-fn status resolution))
 
           (ejira--set-property key "TYPE" (symbol-name org-type))
@@ -412,10 +669,6 @@ If the issue heading does not exist, fallback to full update."
 
             ;; Update deadline (4 is the prefix argument to remove deadline)
             (if deadline (org-deadline nil deadline) (org-deadline '(4)))
-
-            ;; Set priority.
-            (when-let ((p (alist-get priority ejira-priorities-alist nil nil #'equal)))
-              (org-priority p))
 
             (org-set-property "Status" status)
             (when reporter
@@ -468,6 +721,11 @@ If the issue heading does not exist, fallback to full update."
           ;; local edits are detectable.  Kept inside the guard: an unchanged
           ;; item keeps its still-valid baseline and pays nothing — recomputing
           ;; it for every item turned a no-op sync into O(items) body scans.
+          (ejira--with-point-on key (ejira--update-push-baseline)))
+
+        ;; For an unchanged, clean legacy heading, the priority migration is
+        ;; the only content change and must establish a new clean baseline.
+        (when (and priority-applied-p (not modified-p) (not local-dirty-p))
           (ejira--with-point-on key (ejira--update-push-baseline)))))))
 
 (defun ejira--update-comment (key comment)
@@ -680,12 +938,19 @@ body.  Normalized so the fingerprint ignores cosmetic whitespace changes."
                 (ejira--push-normalize
                  (or (org-entry-get nil "Assignee") ""))
                 "\0"
-                 (ejira--push-normalize
-                  (or (save-excursion
-                        (org-back-to-heading t)
-                        (when (looking-at org-priority-regexp)
-                          (match-string 2)))
-                      ""))
+                (ejira--push-normalize
+                 (or (save-excursion
+                       (org-back-to-heading t)
+                       (when (looking-at org-priority-regexp)
+                         (match-string 2)))
+                     ""))
+                ;; Include the exact Jira identity once a heading has been
+                ;; migrated.  Omitting it for legacy headings preserves their
+                ;; existing baseline until the safe migration path runs.
+                (or (when-let ((priority-id
+                                (org-entry-get nil ejira-priority-id-property)))
+                      (concat "\0" (ejira--push-normalize priority-id)))
+                    "")
                 "\0"
                 (ejira--push-normalize
                  (or (when-let ((d (org-get-deadline-time (point-marker))))

@@ -11,8 +11,8 @@
 ;;
 ;;   Ejira Push — 3 items: 1 new, 1 modified
 ;;   ══════════════════════════════════════════
-;;   ▼ RNDSEC  1 new, 1 modified
-;;     ▼ ✎ RNDSEC-123  summary, 1 new subtask
+;;   ▼ TEST  1 new, 1 modified
+;;     ▼ ✎ TEST-123  summary, 1 new subtask
 ;;       ▶ summary:     old title → new title
 ;;       ▶ + subtask: TODO  My new task
 ;;             title:        My new task
@@ -184,14 +184,14 @@ FIELDS is a list of (NAME OLD NEW) string triples."
         (push (string-join fields ", ") parts)))
     (let ((n-sub (cl-count-if (lambda (p) (eq (plist-get p :object) 'subtask)) creates))
           (n-cmt (cl-count-if (lambda (p) (eq (plist-get p :object) 'comment)) creates))
-           (n-iss (cl-count-if
-                   (lambda (p) (and (eq (plist-get p :object) 'issue)
-                                    (not (plist-get p :label))))
-                   creates))
-           (n-lbl (cl-remove-if-not
-                   (lambda (p) (and (eq (plist-get p :object) 'issue)
-                                    (plist-get p :label)))
-                   creates)))
+          (n-iss (cl-count-if
+                  (lambda (p) (and (eq (plist-get p :object) 'issue)
+                                   (not (plist-get p :label))))
+                  creates))
+          (n-lbl (cl-remove-if-not
+                  (lambda (p) (and (eq (plist-get p :object) 'issue)
+                                   (plist-get p :label)))
+                  creates)))
       (when (> n-sub 0) (push (format "%d new subtask%s" n-sub (if (= n-sub 1) "" "s")) parts))
       (when (> n-cmt 0) (push (format "%d new comment%s" n-cmt (if (= n-cmt 1) "" "s")) parts))
       (when (> n-iss 0) (push (format "%d new issue%s"   n-iss (if (= n-iss 1) "" "s")) parts))
@@ -293,36 +293,36 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
          (fields  (plist-get plan :fields))
          (preview (plist-get plan :preview)))
     (pcase op
-       ('create
-        (let* ((label      (or (plist-get plan :label)
-                                (pcase object ('subtask "subtask") ('comment "comment") (_ "new"))))
-               (state-entry (cl-assoc "state" fields :test #'string=))
-               (state-val   (when state-entry (nth 1 state-entry)))
-               (clean       (replace-regexp-in-string "^new [a-z]+: " "" (or title "")))
-               (prefix-len  (+ 11 (length label)
-                                (if (and state-val (> (length state-val) 0))
-                                    (1+ (length state-val))
-                                  0)))
-               (title-max   (max 20 (- 100 prefix-len)))
-               (title-disp  (let ((flat (string-trim
-                                         (replace-regexp-in-string "[\n\r]+" " " clean))))
-                              (if (> (length flat) title-max)
-                                  (concat (substring flat 0 title-max) "…")
-                                flat)))
-               (assign-cell (plist-get plan :assign-self))
-               (header-start (point)))
-          (insert "    "
-                  (propertize "▶" 'ejira-confirm-arrow t)
-                  " "
-                  (propertize "+" 'face 'ejira-confirm-new)
-                  " "
-                  (propertize label 'face 'ejira-confirm-item)
-                  ": "
-                  (if (and state-val (> (length state-val) 0))
-                      (concat state-val " ")
-                    "")
-                  (propertize title-disp 'face 'ejira-confirm-item)
-                  "\n")
+      ('create
+       (let* ((label      (or (plist-get plan :label)
+                              (pcase object ('subtask "subtask") ('comment "comment") (_ "new"))))
+              (state-entry (cl-assoc "state" fields :test #'string=))
+              (state-val   (when state-entry (nth 1 state-entry)))
+              (clean       (replace-regexp-in-string "^new [a-z]+: " "" (or title "")))
+              (prefix-len  (+ 11 (length label)
+                              (if (and state-val (> (length state-val) 0))
+                                  (1+ (length state-val))
+                                0)))
+              (title-max   (max 20 (- 100 prefix-len)))
+              (title-disp  (let ((flat (string-trim
+                                        (replace-regexp-in-string "[\n\r]+" " " clean))))
+                             (if (> (length flat) title-max)
+                                 (concat (substring flat 0 title-max) "…")
+                               flat)))
+              (assign-cell (plist-get plan :assign-self))
+              (header-start (point)))
+         (insert "    "
+                 (propertize "▶" 'ejira-confirm-arrow t)
+                 " "
+                 (propertize "+" 'face 'ejira-confirm-new)
+                 " "
+                 (propertize label 'face 'ejira-confirm-item)
+                 ": "
+                 (if (and state-val (> (length state-val) 0))
+                     (concat state-val " ")
+                   "")
+                 (propertize title-disp 'face 'ejira-confirm-item)
+                 "\n")
          (let ((body-start (point)))
            (cond
             (fields
@@ -331,16 +331,16 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
                  (when (and fval (> (length fval) 0))
                    (ejira-confirm--insert-new-field fname fval 8)))))
             ((and preview (> (length preview) 0))
-              (ejira-confirm--insert-new-field "body" preview 8)))
-            (when assign-cell
-              (let ((cb-pos (point-marker)))
-                (insert "        "
-                        (propertize (if (car assign-cell) "[x]" "[ ]")
-                                    'face 'ejira-confirm-checkbox)
-                        " assign to me\n")
-                (push (list :marker cb-pos :plan plan :global nil)
-                      ejira-confirm--checkboxes)))
-            (ejira-confirm--register-node header-start body-start 'item t))))
+             (ejira-confirm--insert-new-field "body" preview 8)))
+           (when assign-cell
+             (let ((cb-pos (point-marker)))
+               (insert "        "
+                       (propertize (if (car assign-cell) "[x]" "[ ]")
+                                   'face 'ejira-confirm-checkbox)
+                       " assign to me\n")
+               (push (list :marker cb-pos :plan plan :global nil)
+                     ejira-confirm--checkboxes)))
+           (ejira-confirm--register-node header-start body-start 'item t))))
       ('delete
        (insert "    "
                (propertize "✗" 'face 'ejira-confirm-deleted)
@@ -405,20 +405,20 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
          (header-start (point)))
     (pcase op
       ('create
-        (let* ((state-entry (cl-assoc "state" fields :test #'string=))
-               (state-val   (when state-entry (nth 1 state-entry)))
-               (assign-cell (plist-get plan :assign-self)))
-          (insert "  "
-                  (propertize "▶" 'ejira-confirm-arrow t)
-                  " "
-                  (propertize "+" 'face 'ejira-confirm-new)
-                  "  "
-                  (if (and state-val (> (length state-val) 0))
-                      (concat state-val " ")
-                    "")
-                  (propertize title 'face 'ejira-confirm-item)
-                  "\n")
-          (let ((body-start (point)))
+       (let* ((state-entry (cl-assoc "state" fields :test #'string=))
+              (state-val   (when state-entry (nth 1 state-entry)))
+              (assign-cell (plist-get plan :assign-self)))
+         (insert "  "
+                 (propertize "▶" 'ejira-confirm-arrow t)
+                 " "
+                 (propertize "+" 'face 'ejira-confirm-new)
+                 "  "
+                 (if (and state-val (> (length state-val) 0))
+                     (concat state-val " ")
+                   "")
+                 (propertize title 'face 'ejira-confirm-item)
+                 "\n")
+         (let ((body-start (point)))
            (cond
             (fields
              (dolist (f fields)
@@ -442,16 +442,16 @@ Single-line values are shown inline (no toggle); multi-line get a collapsible ov
                                                            (when (and child-body
                                                                       (> (length child-body) 0))
                                                              (list "description" child-body)))))))
-                (ejira-confirm--insert-subitem child-plan)))
-            (when assign-cell
-              (let ((cb-pos (point-marker)))
-                (insert "      "
-                        (propertize (if (car assign-cell) "[x]" "[ ]")
-                                    'face 'ejira-confirm-checkbox)
-                        " assign to me\n")
-                (push (list :marker cb-pos :plan plan :global nil)
-                      ejira-confirm--checkboxes)))
-            (ejira-confirm--register-node header-start body-start 'item t))))
+               (ejira-confirm--insert-subitem child-plan)))
+           (when assign-cell
+             (let ((cb-pos (point-marker)))
+               (insert "      "
+                       (propertize (if (car assign-cell) "[x]" "[ ]")
+                                   'face 'ejira-confirm-checkbox)
+                       " assign to me\n")
+               (push (list :marker cb-pos :plan plan :global nil)
+                     ejira-confirm--checkboxes)))
+           (ejira-confirm--register-node header-start body-start 'item t))))
       ('update
        ;; Standalone update not inside an issue node (fallback)
        (let* ((changes     (plist-get plan :changes))

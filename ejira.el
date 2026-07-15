@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2017 - 2022 Henrik Nyman
 
-;; Author: Henrik Nyman <h@nyymanni.com>
+;; Author: Henrik Nyman
 ;; URL: https://github.com/nyyManni/ejira
 ;; Keywords: calendar, data, org, jira
 ;; Package-Requires: ((emacs "26.1"))
@@ -92,29 +92,29 @@ This is the function used in `ejira-update-project'. Override with
         (results '()))
     (cl-labels ((fetch (start)
                   (request (concat jiralib2-url "/rest/api/2/search")
-                           :type "POST"
-                           :headers `(("Content-Type" . "application/json")
-                                      ,(ejira--auth-header))
-                           :data (json-encode `((jql . ,jql)
-                                                (startAt . ,start)
-                                                (maxResults . 1000)
-                                                (fields . ,fields)))
-                           :parser (lambda ()
-                                     (let ((json-array-type 'list)) (json-read)))
-                           :success (cl-function
-                                     (lambda (&key data &allow-other-keys)
-                                       (let ((page (alist-get 'issues data))
-                                             (total (alist-get 'total data)))
-                                         (setq results (append results page))
-                                         (if (< (length results) total)
-                                             (fetch (length results))
-                                           (funcall success-fn results)))))
-                           :error (cl-function
-                                   (lambda (&key error-thrown &allow-other-keys)
-                                     (if error-fn
-                                         (funcall error-fn error-thrown)
-                                       (message "ejira: JQL error: %s"
-                                                error-thrown)))))))
+                    :type "POST"
+                    :headers `(("Content-Type" . "application/json")
+                               ,(ejira--auth-header))
+                    :data (json-encode `((jql . ,jql)
+                                         (startAt . ,start)
+                                         (maxResults . 1000)
+                                         (fields . ,fields)))
+                    :parser (lambda ()
+                              (let ((json-array-type 'list)) (json-read)))
+                    :success (cl-function
+                              (lambda (&key data &allow-other-keys)
+                                (let ((page (alist-get 'issues data))
+                                      (total (alist-get 'total data)))
+                                  (setq results (append results page))
+                                  (if (< (length results) total)
+                                      (fetch (length results))
+                                    (funcall success-fn results)))))
+                    :error (cl-function
+                            (lambda (&key error-thrown &allow-other-keys)
+                              (if error-fn
+                                  (funcall error-fn error-thrown)
+                                (message "ejira: JQL error: %s"
+                                         error-thrown)))))))
       (fetch 0))))
 
 (defvar ejira--trace-file nil
@@ -133,90 +133,90 @@ traces there.  Debugging aid for locating where a sync stalls; nil disables it."
 Called from async callbacks once all network responses have arrived."
   (unwind-protect
       ;; Suppress the \"changed since visited or saved\" prompt for the entire sync.
-  ;; ejira--new-heading calls basic-save-buffer mid-sync to register new IDs,
-  ;; which advances the on-disk modtime while we continue editing the buffer.
-  ;; Overriding verify-visited-file-modtime to always return t prevents
-  ;; basic-save-buffer and save-buffer from asking the user to confirm.
-  (cl-letf (((symbol-function 'verify-visited-file-modtime) (lambda (&optional _) t)))
-    (let ((ejira--syncing t)
-          (ejira--heading-cache (make-hash-table :test 'equal))
-          (save-silently t)
-          (message-log-max nil))
-      (ejira--trace "START unresolved=%d resolved=%d" (length unresolved-items) (length resolved-items))
-      ;; org-id-locations is kept current by `org-id-track-globally' on every
-      ;; save; a full `org-id-update-id-locations' rescan of every org-id file
-      ;; (~90 files, each triggering org-indent-refresh-maybe →
-      ;; org-element--parse-to per line) was the single biggest hotspot
-      ;; (66% of profiler samples).  Skipped entirely — if a refiled issue
-      ;; isn't found by ejira--find-heading, ejira--update-task-light falls
-      ;; back to ejira--update-task which creates a new heading.
-      ;; Save fold state (char positions, no markers — survives revert of unmodified buffers).
-      (let ((vis-saves
-             (delq nil
-                   (mapcar (lambda (id)
-                             (let ((path (expand-file-name (ejira--project-file-name id))))
-                               (when-let ((buf (find-buffer-visiting path)))
-                                 (with-current-buffer buf
-                                   (cons buf (org-fold-core-get-regions))))))
-                           projects))))
-        ;; Revert unmodified buffers so content matches disk; expand all headings
-        ;; so ejira--with-expand-all is a no-op inside the update loop.
-        (dolist (id projects)
-          (with-current-buffer (find-file-noselect
-                                (expand-file-name (ejira--project-file-name id)) t)
-            (when (and (not (buffer-modified-p)) (file-exists-p buffer-file-name))
-              (revert-buffer t t t))
-            (outline-show-all)))
-        (ejira--trace "after revert+expand, starting loop")
-        ;; Process all fetched items.  ejira--update-task-light and
-        ;; ejira--normalize-end-spacing both guard against no-op writes
-        ;; (comparing current values before calling org-set-property, skipping
-        ;; delete+insert when spacing is already correct), so a sync where
-        ;; nothing changed makes zero buffer modifications and triggers zero
-        ;; after-change-functions.
-        (let ((update-fn (if shallow
-                             (lambda (i)
-                               (ejira--update-task-light
-                                (ejira--alist-get i 'key)
-                                (ejira--alist-get i 'fields 'status 'name)
-                                (ejira--alist-get i 'fields 'assignee 'displayName)
-                                (ejira--alist-get i 'fields 'resolution 'name)))
-                           (lambda (i) (ejira--update-task (ejira--parse-item i))))))
-          (mapc update-fn unresolved-items)
-          (mapc update-fn resolved-items))
-        (ejira--trace "after loop")
-        ;; Normalize: ensure exactly one blank line after every :END: closer.
-        ;; No-ops when spacing is already correct — see ejira--normalize-end-spacing.
-        (dolist (id projects)
-          (when-let ((buf (find-buffer-visiting
-                           (expand-file-name (ejira--project-file-name id)))))
-            (with-current-buffer buf
-              (ejira--normalize-end-spacing))))
-        (ejira--trace "after normalize")
-        ;; Save all buffers touched during sync, not just project files.
-        ;; Headings refiled into other org files are found via
-        ;; org-id-find-id-in-file and updated in-place; those buffers must
-        ;; be saved too or the sync leaves them dirty.
-        (let ((touched
-               (delq nil
-                     (cl-remove-duplicates
-                      (cl-loop for m being the hash-values of ejira--heading-cache
-                               when (and (markerp m) (marker-buffer m))
-                               collect (marker-buffer m))
-                      :test #'eq))))
-          (dolist (id projects)
-            (when-let ((buf (find-buffer-visiting
-                             (expand-file-name (ejira--project-file-name id)))))
-              (cl-pushnew buf touched :test #'eq)))
-          (dolist (buf touched)
-            (with-current-buffer buf
-              (when (buffer-modified-p) (save-buffer)))))
-        (ejira--trace "after save")
-        ;; Restore fold state for any buffer that was open before the sync.
-        (dolist (entry vis-saves)
-          (with-current-buffer (car entry)
-            (org-fold-core-regions (cdr entry) :override t)))
-        (ejira--trace "after fold-restore"))))
+      ;; ejira--new-heading calls basic-save-buffer mid-sync to register new IDs,
+      ;; which advances the on-disk modtime while we continue editing the buffer.
+      ;; Overriding verify-visited-file-modtime to always return t prevents
+      ;; basic-save-buffer and save-buffer from asking the user to confirm.
+      (cl-letf (((symbol-function 'verify-visited-file-modtime) (lambda (&optional _) t)))
+        (let ((ejira--syncing t)
+              (ejira--heading-cache (make-hash-table :test 'equal))
+              (save-silently t)
+              (message-log-max nil))
+          (ejira--trace "START unresolved=%d resolved=%d" (length unresolved-items) (length resolved-items))
+          ;; org-id-locations is kept current by `org-id-track-globally' on every
+          ;; save; a full `org-id-update-id-locations' rescan of every org-id file
+          ;; (~90 files, each triggering org-indent-refresh-maybe →
+          ;; org-element--parse-to per line) was the single biggest hotspot
+          ;; (66% of profiler samples).  Skipped entirely — if a refiled issue
+          ;; isn't found by ejira--find-heading, ejira--update-task-light falls
+          ;; back to ejira--update-task which creates a new heading.
+          ;; Save fold state (char positions, no markers — survives revert of unmodified buffers).
+          (let ((vis-saves
+                 (delq nil
+                       (mapcar (lambda (id)
+                                 (let ((path (expand-file-name (ejira--project-file-name id))))
+                                   (when-let ((buf (find-buffer-visiting path)))
+                                     (with-current-buffer buf
+                                       (cons buf (org-fold-core-get-regions))))))
+                               projects))))
+            ;; Revert unmodified buffers so content matches disk; expand all headings
+            ;; so ejira--with-expand-all is a no-op inside the update loop.
+            (dolist (id projects)
+              (with-current-buffer (find-file-noselect
+                                    (expand-file-name (ejira--project-file-name id)) t)
+                (when (and (not (buffer-modified-p)) (file-exists-p buffer-file-name))
+                  (revert-buffer t t t))
+                (outline-show-all)))
+            (ejira--trace "after revert+expand, starting loop")
+            ;; Process all fetched items.  ejira--update-task-light and
+            ;; ejira--normalize-end-spacing both guard against no-op writes
+            ;; (comparing current values before calling org-set-property, skipping
+            ;; delete+insert when spacing is already correct), so a sync where
+            ;; nothing changed makes zero buffer modifications and triggers zero
+            ;; after-change-functions.
+            (let ((update-fn (if shallow
+                                 (lambda (i)
+                                   (ejira--update-task-light
+                                    (ejira--alist-get i 'key)
+                                    (ejira--alist-get i 'fields 'status 'name)
+                                    (ejira--alist-get i 'fields 'assignee 'displayName)
+                                    (ejira--alist-get i 'fields 'resolution 'name)))
+                               (lambda (i) (ejira--update-task (ejira--parse-item i))))))
+              (mapc update-fn unresolved-items)
+              (mapc update-fn resolved-items))
+            (ejira--trace "after loop")
+            ;; Normalize: ensure exactly one blank line after every :END: closer.
+            ;; No-ops when spacing is already correct — see ejira--normalize-end-spacing.
+            (dolist (id projects)
+              (when-let ((buf (find-buffer-visiting
+                               (expand-file-name (ejira--project-file-name id)))))
+                (with-current-buffer buf
+                  (ejira--normalize-end-spacing))))
+            (ejira--trace "after normalize")
+            ;; Save all buffers touched during sync, not just project files.
+            ;; Headings refiled into other org files are found via
+            ;; org-id-find-id-in-file and updated in-place; those buffers must
+            ;; be saved too or the sync leaves them dirty.
+            (let ((touched
+                   (delq nil
+                         (cl-remove-duplicates
+                          (cl-loop for m being the hash-values of ejira--heading-cache
+                                   when (and (markerp m) (marker-buffer m))
+                                   collect (marker-buffer m))
+                          :test #'eq))))
+              (dolist (id projects)
+                (when-let ((buf (find-buffer-visiting
+                                 (expand-file-name (ejira--project-file-name id)))))
+                  (cl-pushnew buf touched :test #'eq)))
+              (dolist (buf touched)
+                (with-current-buffer buf
+                  (when (buffer-modified-p) (save-buffer)))))
+            (ejira--trace "after save")
+            ;; Restore fold state for any buffer that was open before the sync.
+            (dolist (entry vis-saves)
+              (with-current-buffer (car entry)
+                (org-fold-core-regions (cdr entry) :override t)))
+            (ejira--trace "after fold-restore"))))
     (setq ejira--sync-in-progress nil)
     (message "ejira: sync finished")))
 
@@ -334,7 +334,7 @@ comments. With SHALLOW, only update todo status and assignee."
                                  (ejira--alist-get i 'fields 'status 'name)
                                  (ejira--alist-get i 'fields 'assignee 'displayName)
                                  (ejira--alist-get i 'fields 'resolution 'name))
-                             (ejira--update-task (ejira--parse-item i))))
+                              (ejira--update-task (ejira--parse-item i))))
                 (apply #'jiralib2-jql-search
                        (funcall ejira-update-jql-unresolved-multi-fn (list id))
                        (ejira--get-fields-to-sync shallow)))
@@ -360,7 +360,7 @@ comments. With SHALLOW, only update todo status and assignee."
                                      (ejira--alist-get i 'fields 'status 'name)
                                      (ejira--alist-get i 'fields 'assignee 'displayName)
                                      (ejira--alist-get i 'fields 'resolution 'name))
-                                 (ejira--update-task (ejira--parse-item i))))
+                                  (ejira--update-task (ejira--parse-item i))))
                     (apply #'jiralib2-jql-search
                            (funcall ejira-update-jql-resolved-fn id keys)
                            (ejira--get-fields-to-sync shallow)))))
@@ -561,12 +561,33 @@ Added to `window-buffer-change-functions' by `ejira--start-auto-pull'."
 
 ;;;###autoload
 (defun ejira-set-priority ()
-  "Set priority of the issue under point. Save buffer to stage push."
+  "Set priority of the issue under point using its Jira priority scheme.
+Save the buffer to stage the exact Jira priority ID for push."
   (interactive)
-  (ejira--with-point-on (ejira-issue-id-under-point)
-    (let ((p (completing-read "Priority: "
-                              (mapcar #'car ejira-priorities-alist))))
-      (org-priority (alist-get p ejira-priorities-alist nil nil #'equal)))))
+  (let* ((key (ejira-issue-id-under-point))
+         (project (ejira--get-project key))
+         (scheme (ejira--get-priority-scheme key))
+         (selectable (ejira--selectable-priority-scheme project scheme)))
+    (unless scheme
+      (user-error "No editable Jira priority scheme available for %s" key))
+    (unless selectable
+      (user-error "No selectable Jira priorities available for %s" key))
+    (let* ((choices
+            (mapcar (lambda (entry)
+                      (cons (format "%s [%s]"
+                                    (plist-get entry :name)
+                                    (plist-get entry :id))
+                            entry))
+                    selectable))
+           (selected (completing-read "Priority: " choices nil t))
+           (entry (cdr (assoc selected choices)))
+           (rank (ejira--priority-rank scheme (plist-get entry :id) project)))
+      (ejira--with-point-on key
+        (ejira--ensure-org-priority-range rank)
+        (org-priority (ejira--org-priority-for-rank rank))
+        (org-set-property ejira-priority-id-property (plist-get entry :id))
+        (org-set-property ejira-priority-name-property (plist-get entry :name))
+        (org-set-property ejira-priority-rank-property (number-to-string rank))))))
 
 ;;;###autoload
 (defun ejira-assign-issue (&optional to-me)

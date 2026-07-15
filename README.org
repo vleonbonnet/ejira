@@ -18,14 +18,14 @@ Example configuration with =use-package=. Note, that for Ejira to work =org-id-t
 #+BEGIN_SRC elisp
   (use-package ejira
     :init
-    (setq jiralib2-url              "https://jira.mycorp.com"
+    (setq jiralib2-url              "https://jira.example.com"
           jiralib2-auth             'basic
           jiralib2-user-login-name  "my-jira-username"
           jiralib2-token            nil
 
           ;; NOTE, this directory needs to be in `org-agenda-files'`
           ejira-org-directory       "~/jira"
-          ejira-projects            '("EJ" "JL2")
+          ejira-projects            '("PROJ" "OPS")
 
           ejira-priorities-alist    '(("Highest" . ?A)
                                       ("High"    . ?B)
@@ -86,7 +86,7 @@ Following functions are available in the focus view (most of them work also with
 |                            | =ejira-focus-up-level=         | Focuses the parent item, which could be a project, epic or a story.                                  |
 |                            | =ejira-pull-item-under-point=  | Pulls updated data from the server. Discards local edits. Item can be a comment, issue, project etc. |
 |                            | =ejira-push-item-under-point=  | Updates the changes to item summary and description to the server. Item can be a comment, issue etc. |
-| =C-c= ,                    | =ejira-set-priority=           | Set the priority with =org-priority= and sync to server.                                             |
+| =C-c= ,                    | =ejira-set-priority=           | Set the priority from Jira's issue-specific scheme and sync its exact ID.                            |
 | =C-c C-d=                  | =ejira-set-deadline=           | Set the deadline with =org-deadline= and sync to server.                                             |
 | =C-c C-t=                  | =ejira-progress-issue=         | Progress the item by selecting an action.                                                            |
 |                            | =ejira-set-issuetype=          | Change the issuetype of the item and sync to server.                                                 |
@@ -95,6 +95,15 @@ Following functions are available in the focus view (most of them work also with
 |                            | =ejira-mention-user=           | Add a @user link at location of point.                                                               |
 |                            | =ejira-delete-comment=         | Remove the comment under point and sync to server.                                                   |
 | =C-c q=                    | =ejira-close-buffer=           | Close the indirect buffer.                                                                           |
+
+Priority cookies are ordered ranks from Jira's issue-specific edit metadata.
+Ejira stores the exact priority ID in =JiraPriorityId= and sends that ID back
+to Jira.  Use =ejira-priority-policies= when Jira exposes backend priorities
+that should not appear in the project's user-facing priority menu.
+
+The end-to-end test requires external configuration.  Set =EJIRA_E2E_URL=,
+=EJIRA_E2E_PROJECT=, and =EJIRA_E2E_TOKEN= in the environment; no server URL,
+project key, or credential-store entry is included in the source.
 
 Additionally, following commands are provided, and are meant to be bound globally:
 
