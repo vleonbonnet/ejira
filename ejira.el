@@ -140,6 +140,8 @@ Called from async callbacks once all network responses have arrived."
       (cl-letf (((symbol-function 'verify-visited-file-modtime) (lambda (&optional _) t)))
         (let ((ejira--syncing t)
               (ejira--heading-cache (make-hash-table :test 'equal))
+              (ejira--shallow-only shallow)
+              (ejira--deferred-keys nil)
               (save-silently t)
               (message-log-max nil))
           (ejira--trace "START unresolved=%d resolved=%d" (length unresolved-items) (length resolved-items))
@@ -185,6 +187,14 @@ Called from async callbacks once all network responses have arrived."
               (mapc update-fn unresolved-items)
               (mapc update-fn resolved-items))
             (ejira--trace "after loop")
+            ;; Shallow syncs skip unknown keys rather than escalating; surface
+            ;; them so an explicit full sync can pick them up.
+            (when ejira--deferred-keys
+              (ejira--trace "deferred %d key(s): %s" (length ejira--deferred-keys)
+                            (s-join ", " ejira--deferred-keys))
+              (message "ejira: %d issue(s) skipped, need a full sync: %s"
+                       (length ejira--deferred-keys)
+                       (s-join ", " (seq-take ejira--deferred-keys 5))))
             ;; Normalize: ensure exactly one blank line after every :END: closer.
             ;; No-ops when spacing is already correct — see ejira--normalize-end-spacing.
             (dolist (id projects)

@@ -525,6 +525,13 @@ The slots are parsed from struct TYPE."
        ,@body)))
 (function-put #'ejira--with-bind-struct 'lisp-indent-function 'defun)
 
+(defvar ejira--shallow-only nil
+  "When non-nil, `ejira--update-task-light' must not escalate to a full update.
+Bound by `ejira--apply-sync' for shallow (auto-pull) syncs.")
+
+(defvar ejira--deferred-keys nil
+  "Issue keys skipped by a shallow sync because no local heading was found.")
+
 (defvar ejira--syncing nil
   "Non-nil during `ejira-update-project' to suppress per-op outline expand.")
 
@@ -560,9 +567,16 @@ avoid repeated save/restore overhead."
 
 (defun ejira--update-task-light (issue-key status assignee &optional resolution)
   "Update only the STATUS and ASSIGNEE of issue ISSUE-KEY.
-If the issue heading does not exist, fallback to full update."
+
+If the issue heading does not exist, fall back to a full update -- unless
+`ejira--shallow-only' is set, in which case ISSUE-KEY is recorded in
+`ejira--deferred-keys' and skipped.  That fallback costs a synchronous
+`jiralib2-get-issue' plus a full subtree rewrite per key, which is not
+something a background auto-pull should ever do."
   (if (not (ejira--find-heading issue-key))
-      (ejira--update-task issue-key)
+      (if ejira--shallow-only
+          (progn (cl-pushnew issue-key ejira--deferred-keys :test #'equal) nil)
+        (ejira--update-task issue-key))
 
     (ejira--with-point-on issue-key
       (unless (equal (org-entry-get (point-marker) "Status") status)
@@ -856,7 +870,8 @@ If LEVEL is given, shift all heading by it."
     (concat
      (s-trim
       (ejira-parser-jira-to-org
-       (r "" ""    ; Windows line-endings
+       (r "
+" ""    ; Windows line-endings
           (r " " " " ; Non-breaking space, JIRA likes these, Emacs doesn't
              (decode-coding-string (or body "") 'utf-8)))
        level))
@@ -1036,8 +1051,13 @@ is established on the next sync or push, never during a plain save."
 (defun ejira--new-heading (buffer parent id)
   "Create a header with ID under PARENT into BUFFER and return a marker to it.
 If TITLE is given, use it as header title. If PARENT is nil assume the beginning
-of the document."
-  (save-window-excursion
+of the document.
+
+Never creates a second heading for an ID that is already present -- it
+returns the existing one instead.  Callers reach here after a failed
+`ejira--find-heading', which a stale `org-id-locations' can make lie."
+  (or (ejira--find-heading-by-scan id)
+      (save-window-excursion
     (with-current-buffer buffer
       (org-with-wide-buffer
        (ejira--with-expand-all
@@ -1063,13 +1083,53 @@ of the document."
          (unless (hash-table-p org-id-locations)
            (setq org-id-locations (make-hash-table :test 'equal)))
          (puthash id (abbreviate-file-name (buffer-file-name buffer)) org-id-locations)
-         (point-marker))))))
+         (point-marker)))))))
+
+(defun ejira--project-files ()
+  "Return the existing org files backing `ejira-projects'."
+  (delq nil
+        (mapcar (lambda (p)
+                  (let ((f (expand-file-name (ejira--project-file-name p))))
+                    (and (file-exists-p f) f)))
+                ejira-projects)))
+
+(defun ejira--find-heading-by-scan (id)
+  "Locate ID by scanning the ejira project files directly.
+
+Fallback for a stale `org-id-locations'.  When the index does not know
+ID, `org-id-find-id-in-file' returns nil, callers conclude the item does
+not exist, and `ejira--new-heading' writes a second copy of it -- which
+is how whole project trees came to be duplicated.  Scanning the project
+files is authoritative and repairs the index on the way.
+
+Return a marker on the heading owning ID, or nil when ID really is
+absent.  Only project files are scanned; items refiled elsewhere are
+still found by the `org-id' lookup that runs first."
+  (let ((re (concat "^[ \t]*:ID:[ \t]+" (regexp-quote id) "[ \t]*$"))
+        found)
+    (cl-dolist (file (ejira--project-files))
+      (with-current-buffer (find-file-noselect file t)
+        (org-with-wide-buffer
+         (goto-char (point-min))
+         (while (and (not found) (re-search-forward re nil t))
+           ;; Keep point after the match: `org-back-to-heading' moves back,
+           ;; and re-searching from there would rematch the same line.
+           (let ((next (point)))
+             (save-excursion
+               (when (and (ignore-errors (org-back-to-heading t) t)
+                          (equal id (org-entry-get (point) "ID")))
+                 (setq found (point-marker))
+                 (org-id-add-location id (buffer-file-name))))
+             (goto-char next)))))
+      (when found (cl-return)))
+    found))
 
 (defun ejira--find-heading (id)
   "Find the item ID from agenda files, or return nil."
   (when id
     (or (and ejira--heading-cache (gethash id ejira--heading-cache))
-        (let ((m (org-id-find-id-in-file id (org-id-find-id-file id) t)))
+        (let ((m (or (org-id-find-id-in-file id (org-id-find-id-file id) t)
+                     (ejira--find-heading-by-scan id))))
           (when (and m ejira--heading-cache)
             (puthash id m ejira--heading-cache))
           m))))

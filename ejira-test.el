@@ -790,5 +790,98 @@ Already on Jira.
                                      (eq 'comment (plist-get op :object))))
                    ops)))))
 
+;;; ── Duplicate-heading prevention ─────────────────────────────────────────────
+;;
+;; Regression tests for the failure that duplicated whole project trees: a
+;; stale `org-id-locations' made `ejira--find-heading' report a missing item,
+;; callers then created a second copy of it.
+
+(defmacro ejira-test--with-project-dir (content &rest body)
+  "Run BODY with `ejira-org-directory' holding a TEST.org made of CONTENT."
+  (declare (indent 1))
+  `(let* ((dir (make-temp-file "ejira-test-" t))
+          (ejira-org-directory dir)
+          (ejira-projects '("TEST"))
+          (ejira--heading-cache nil)
+          (org-id-locations (make-hash-table :test 'equal))
+          (file (expand-file-name "TEST.org" dir)))
+     (unwind-protect
+         (progn
+           (with-temp-file file (insert ,content))
+           ,@body)
+       (dolist (b (buffer-list))
+         (when (and (buffer-file-name b)
+                    (string-prefix-p dir (buffer-file-name b)))
+           (with-current-buffer b (set-buffer-modified-p nil))
+           (kill-buffer b)))
+       (delete-directory dir t))))
+
+(defconst ejira-test--project-content
+  "* Project\n:PROPERTIES:\n:ID:       TEST\n:TYPE:     ejira-project\n:END:\n\
+** TODO An issue\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n:END:\n\n")
+
+(ert-deftest ejira-find-heading-by-scan/finds-existing-id ()
+  "Scanning locates an ID that `org-id-locations' does not know about."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let ((m (ejira--find-heading-by-scan "TEST-1")))
+      (should (markerp m))
+      (org-with-point-at m
+        (should (equal "TEST-1" (org-entry-get (point) "ID")))))))
+
+(ert-deftest ejira-find-heading-by-scan/returns-nil-when-absent ()
+  "Scanning returns nil for an ID that really is not there."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (should (null (ejira--find-heading-by-scan "TEST-999")))))
+
+(ert-deftest ejira-find-heading-by-scan/repairs-org-id-locations ()
+  "A successful scan re-registers the ID so the fast path works next time."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (should (null (gethash "TEST-1" org-id-locations)))
+    (ejira--find-heading-by-scan "TEST-1")
+    (should (gethash "TEST-1" org-id-locations))))
+
+(ert-deftest ejira-find-heading/recovers-from-stale-org-id-locations ()
+  "`ejira--find-heading' finds the item even with an empty id index.
+This is the exact condition that used to duplicate project trees."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (should (markerp (ejira--find-heading "TEST-1")))
+    (should (markerp (ejira--find-heading "TEST")))))
+
+(ert-deftest ejira-new-heading/refuses-to-duplicate-existing-id ()
+  "Creating a heading for an ID already in the file returns the existing one."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let* ((buf (find-file-noselect (expand-file-name "TEST.org" ejira-org-directory) t))
+           (before (with-current-buffer buf (buffer-string)))
+           (m (ejira--new-heading buf nil "TEST-1")))
+      (should (markerp m))
+      (org-with-point-at m
+        (should (equal "TEST-1" (org-entry-get (point) "ID"))))
+      ;; buffer untouched: no second copy written
+      (should (equal before (with-current-buffer buf (buffer-string))))
+      (should (= 1 (with-current-buffer buf
+                     (count-matches "^:ID: +TEST-1 *$" (point-min) (point-max))))))))
+
+(ert-deftest ejira-update-task-light/defers-instead-of-escalating ()
+  "A shallow sync records unknown keys rather than firing a full update."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let ((ejira--shallow-only t)
+          (ejira--deferred-keys nil))
+      (cl-letf (((symbol-function 'ejira--update-task)
+                 (lambda (&rest _) (error "must not escalate during shallow sync"))))
+        (should (null (ejira--update-task-light "TEST-404" "Open" nil)))
+        (should (equal '("TEST-404") ejira--deferred-keys))))))
+
+(ert-deftest ejira-update-task-light/escalates-when-not-shallow ()
+  "A full sync still falls back to `ejira--update-task' for unknown keys."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let ((ejira--shallow-only nil)
+          (ejira--deferred-keys nil)
+          (called nil))
+      (cl-letf (((symbol-function 'ejira--update-task)
+                 (lambda (k) (setq called k))))
+        (ejira--update-task-light "TEST-404" "Open" nil)
+        (should (equal "TEST-404" called))
+        (should (null ejira--deferred-keys))))))
+
 (provide 'ejira-test)
 ;;; ejira-test.el ends here
