@@ -119,11 +119,11 @@ Only scans direct children (depth 1) — Jira subtasks cannot have subtasks."
                           (not type)
                           (not (equal heading ejira-description-heading-name))
                           (not (equal heading ejira-comments-heading-name)))
-                 (push (list :marker (point-marker)
-                             :title  (ejira--strip-properties heading)
-                             :state  (substring-no-properties (or todo-state ""))
-                             :body   (ejira--get-heading-body (point-marker)))
-                       children))))))))
+                  (push (list :marker (point-marker)
+                              :title  (ejira--jira-summary)
+                              :state  (substring-no-properties (or todo-state ""))
+                              :body   (ejira--jira-description))
+                        children))))))))
     (nreverse children)))
 
 (defun ejira--push-create-cascaded-subtask (parent-key project-key child todo-keywords assign-self)
@@ -395,12 +395,10 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  (item (cl-find-if (lambda (i)
                                      (equal (ejira--alist-get i 'key) key))
                                    remote-items))
-                 (desc-marker (condition-case nil
-                                  (ejira--find-task-subheading key ejira-description-heading-name)
-                                (error nil)))
-                 (local-summary (org-with-point-at marker
-                                  (ejira--strip-properties (org-get-heading t t t t))))
-                 (local-desc-org (if desc-marker (ejira--get-heading-body desc-marker) ""))
+                  (local-summary (org-with-point-at marker (ejira--jira-summary)))
+                  (local-desc-org (or (org-with-point-at marker
+                                        (ejira--jira-description))
+                                      ""))
                  (local-assignee (or (org-entry-get marker "Assignee") ""))
                  (priority-scheme (when item (ejira--get-priority-scheme key)))
                  (local-priority-entry
@@ -410,10 +408,10 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  (local-deadline (when-let ((d (org-get-deadline-time marker)))
                                    (format-time-string "%Y-%m-%d" d)))
                  (remote-summary (when item (ejira--alist-get item 'fields 'summary)))
-                 (remote-desc-org (when item
-                                    (ejira--expected-org-body
-                                     (or desc-marker marker)
-                                     (ejira--alist-get item 'fields 'description))))
+                  (remote-desc-org (when item
+                                     (ejira--expected-jira-description
+                                      marker
+                                      (ejira--alist-get item 'fields 'description))) )
                  (remote-assignee (or (when item
                                         (ejira--alist-get item 'fields 'assignee 'displayName))
                                       ""))
@@ -592,9 +590,10 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
          ((and (eq op-type 'create) (eq object 'subtask))
           (let* ((parent-key (plist-get data :parent-key))
                  (project-key (plist-get data :project-key))
-                 (heading-title (org-with-point-at marker
-                                  (ejira--strip-properties (org-get-heading t t t t))))
-                 (local-body (ejira--get-heading-body marker))
+                  (heading-title (org-with-point-at marker (ejira--jira-summary)))
+                  (local-body (or (org-with-point-at marker
+                                    (ejira--jira-description))
+                                  ""))
                  (local-state (org-with-point-at marker
                                 (substring-no-properties (or (org-get-todo-state) ""))))
                  (fields `(("title" ,heading-title)

@@ -117,6 +117,72 @@
      :default "p1"))
   "TEST priority policy used by the unit tests.")
 
+(ert-deftest ejira-projection--uses-jira-title-and-description-only ()
+  "A Jira projection never exports the detailed local task body."
+  (ejira-test--with-org-buf
+      "* TODO Local implementation title
+:PROPERTIES:
+:TYPE:       ejira-issue
+:ID:         TEST-1
+:JIRA_TITLE: Concise external title
+:END:
+
+Private implementation notes.
+
+** Description
+
+Private local description.
+
+** JIRA_DESCRIPTION
+
+Concise external description.
+"
+    (goto-char (point-min))
+    (should (ejira--jira-projection-p))
+    (should (equal "Concise external title" (ejira--jira-summary)))
+    (should (equal "Concise external description."
+                   (string-trim (ejira--jira-description))))
+    (let ((hash (md5 (ejira--heading-pushable-content))))
+      (search-forward "Private implementation notes.")
+      (replace-match "Changed private implementation notes.")
+      (goto-char (point-min))
+      (should (equal hash (md5 (ejira--heading-pushable-content)))))))
+
+(ert-deftest ejira-projection--pull-preserves-local-title-and-description ()
+  "A Jira pull updates projection fields without replacing local content."
+  (ejira-test--with-org-buf
+      "* TODO Local implementation title
+:PROPERTIES:
+:TYPE:       ejira-issue
+:ID:         TEST-1
+:JIRA_TITLE: Old external title
+:END:
+
+Private implementation notes.
+
+** Description
+
+Private local description.
+"
+    (let ((marker (point-min)))
+      (cl-letf (((symbol-function 'ejira--find-heading)
+                 (lambda (_id) marker)))
+        (ejira--set-summary "TEST-1" "Updated external title")
+        (ejira--set-jira-description-jira-markup "TEST-1" "Updated external description."))
+      (goto-char (point-min))
+      (should (equal "Local implementation title" (org-get-heading t t t t)))
+      (should (equal "Updated external title" (org-entry-get nil "JIRA_TITLE")))
+      (should (equal "Private local description."
+                     (string-trim
+                      (org-with-point-at
+                          (ejira--find-child-heading "Description")
+                        (ejira--get-heading-body (point-marker))))))
+      (should (equal "Updated external description."
+                     (string-trim
+                      (org-with-point-at
+                          (ejira--find-child-heading "JIRA_DESCRIPTION")
+                        (ejira--get-heading-body (point-marker)))))))))
+
 (ert-deftest ejira-priority--policy/filters-and-falls-back ()
   "Hidden Jira priorities share the configured lowest visible rank."
   (let ((ejira-priority-policies ejira-test--priority-policies))

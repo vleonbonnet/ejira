@@ -75,6 +75,31 @@ When a project in synced into a file, it's items get automatically refiled into 
 
 If the items are updated and these relationships change, the items are automatically refiled to reflect the structure in the server.
 
+** Jira content projection
+
+An ejira heading normally uses its Org heading as the Jira summary and its
+=Description= child as the Jira description.  When a task needs detailed local
+notes but a compact external Jira presentation, add =JIRA_TITLE= and, if needed,
+a direct =JIRA_DESCRIPTION= child:
+
+#+BEGIN_SRC org
+  ,*** STARTED Implement callback recovery
+  :PROPERTIES:
+  :JIRA_TITLE: Complete callback recovery
+  :END:
+
+  Detailed local design notes stay here and are not sent to Jira.
+
+  ,**** JIRA_DESCRIPTION
+  Concise Jira-facing progress description.
+#+END_SRC
+
+The property and child form a bidirectional Jira projection.  Ejira pushes only
+the projected title and description, pulls Jira edits back into those fields,
+and leaves the local heading, body, and ordinary =Description= subtree intact.
+With =JIRA_TITLE= but no =JIRA_DESCRIPTION= child, the Jira description is
+deliberately empty.
+
 ** Usage
 *** Focus view
 In the focus view, the buffer is an indirect buffer into the main org-file buffer, it is narrowed to the selected item subtree and all of it's contents are expanded. The buffer also has a minor mode =ejira-mode= activated.

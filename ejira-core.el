@@ -79,6 +79,19 @@ if your project hierarchy uses them as Epic parents."
 (defvar ejira-description-heading-name "Description"
   "Subheading ejira uses for the description of the item.")
 
+(defconst ejira-jira-title-property "JIRA_TITLE"
+  "Property overriding an Org heading's title when synchronizing with Jira.
+
+When this property or `ejira-jira-description-heading-name' is present, ejira
+treats the heading as a Jira projection: its local title and normal
+`Description' subtree remain local-only.")
+
+(defconst ejira-jira-description-heading-name "JIRA_DESCRIPTION"
+  "Direct child heading containing the Jira-facing description projection.
+
+Unlike an Org property, this heading supports a full Org body and therefore
+round-trips arbitrary Jira markup without flattening it into one line.")
+
 (defcustom ejira-projects nil
   "Projects to synchronize."
   :group 'ejira
@@ -703,11 +716,8 @@ something a background auto-pull should ever do."
             (when-let ((minutes (and remaining-estimate (/ remaining-estimate 60))))
               (org-set-property "Left" (format "%02d:%02d" (/ minutes 60) (% minutes 60)))))
 
-          (ejira--get-subheading (ejira--find-heading key) ejira-description-heading-name)
           (ejira--get-subheading (ejira--find-heading key) ejira-comments-heading-name)
-          (ejira--set-heading-body-jira-markup
-           (ejira--find-task-subheading key ejira-description-heading-name)
-           description)
+          (ejira--set-jira-description-jira-markup key description)
 
           ;; Update existing, and insert missing comments
           (mapc (-partial #'ejira--update-comment key) comments)
@@ -858,6 +868,23 @@ can be compared against the current body to detect whether a push is needed."
 The content will be adjusted based on the heading level."
   (ejira--set-heading-body heading (ejira--expected-org-body heading content)))
 
+(defun ejira--set-jira-description-jira-markup (id content)
+  "Set issue ID's Jira-facing description from Jira markup CONTENT.
+
+For a projected heading, update its `JIRA_DESCRIPTION' child and leave the
+ordinary local description untouched.  Otherwise retain ejira's established
+`Description' child behavior."
+  (ejira--with-point-on id
+    (let ((description
+           (if (ejira--jira-projection-p)
+               (or (ejira--find-child-heading ejira-jira-description-heading-name)
+                   (when (and content (not (string-empty-p content)))
+                     (ejira--get-subheading (point-marker)
+                                            ejira-jira-description-heading-name)))
+             (ejira--get-subheading (point-marker) ejira-description-heading-name))))
+      (when description
+        (ejira--set-heading-body-jira-markup description content)))))
+
 (defun ejira--find-task-subheading (id heading)
   "Return marker to the subheading HEADING of task ID."
   (ejira--with-point-on id
@@ -942,16 +969,12 @@ body.  Normalized so the fingerprint ignores cosmetic whitespace changes."
      ((equal type "ejira-comment")
       (ejira--push-normalize (ejira--get-heading-body (point-marker))))
      ((member type ejira-pushable-types)
-      ;; Description is a direct child; find it point-locally to avoid org-id scans.
-      (let ((desc (ejira--find-child-heading ejira-description-heading-name)))
-        (concat (ejira--push-normalize
-                 (ejira--strip-properties (org-get-heading t t t t)))
-                "\0"
-                (ejira--push-normalize
-                 (if desc (ejira--get-heading-body desc) ""))
-                "\0"
-                (ejira--push-normalize
-                 (or (org-entry-get nil "Assignee") ""))
+       (concat (ejira--push-normalize (ejira--jira-summary))
+                 "\0"
+                 (ejira--push-normalize (ejira--jira-description))
+                 "\0"
+                 (ejira--push-normalize
+                  (or (org-entry-get nil "Assignee") ""))
                 "\0"
                 (ejira--push-normalize
                  (or (save-excursion
@@ -971,9 +994,9 @@ body.  Normalized so the fingerprint ignores cosmetic whitespace changes."
                  (or (when-let ((d (org-get-deadline-time (point-marker))))
                        (format-time-string "%Y-%m-%d" d))
                      ""))
-                "\0"
-                (ejira--push-normalize
-                 (or (org-get-todo-state) ""))))))))
+                 "\0"
+                 (ejira--push-normalize
+                  (or (org-get-todo-state) "")))))))
 
 (defun ejira--update-push-baseline ()
   "Store the :Pushhash: property fingerprinting the heading at point.
@@ -1035,8 +1058,58 @@ is established on the next sync or push, never during a plain save."
         ;; and dependency blockers (org-block-todo-from-children-or-siblings-or-parent,
         ;; org-edna) must not prevent reflecting Jira's authoritative status.
         (let ((org-inhibit-logging t)
-              (org-blocker-hook nil))
-          (org-todo state))))))
+               (org-blocker-hook nil))
+           (org-todo state))))))
+
+(defun ejira--jira-projection-p (&optional heading)
+  "Return non-nil when HEADING has an explicit Jira content projection.
+
+HEADING defaults to the heading at point.  A projection is enabled by either a
+`JIRA_TITLE' property or a direct `JIRA_DESCRIPTION' child heading."
+  (if heading
+      (org-with-point-at heading (ejira--jira-projection-p))
+    (or (org-entry-get nil ejira-jira-title-property)
+        (ejira--find-child-heading ejira-jira-description-heading-name))))
+
+(defun ejira--jira-summary (&optional heading)
+  "Return the Jira-facing summary for HEADING or the heading at point."
+  (if heading
+      (org-with-point-at heading (ejira--jira-summary))
+    (let ((title (org-entry-get nil ejira-jira-title-property)))
+      (if (and title (not (string-empty-p title)))
+          title
+        (ejira--strip-properties (org-get-heading t t t t))))))
+
+(defun ejira--jira-description (&optional heading)
+  "Return the Jira-facing description for HEADING or the heading at point.
+
+Projected headings deliberately default to an empty Jira description rather
+than exporting their local body or ordinary `Description' child subtree."
+  (if heading
+      (org-with-point-at heading (ejira--jira-description))
+    (if (ejira--jira-projection-p)
+        (when-let ((description
+                    (ejira--find-child-heading
+                     ejira-jira-description-heading-name)))
+          (ejira--get-heading-body description))
+      (when-let ((description
+                  (ejira--find-child-heading ejira-description-heading-name)))
+        (ejira--get-heading-body description)))))
+
+(defun ejira--expected-jira-description (heading content)
+  "Return local Org text expected from Jira markup CONTENT at HEADING.
+
+For a projection without an existing `JIRA_DESCRIPTION' child, non-empty
+remote text remains visibly different so the normal confirmation flow can
+either import it on pull or clear it on an intentional push."
+  (org-with-point-at heading
+    (let ((description
+           (if (ejira--jira-projection-p)
+               (ejira--find-child-heading ejira-jira-description-heading-name)
+             (ejira--find-child-heading ejira-description-heading-name))))
+      (if description
+          (ejira--expected-org-body description content)
+        (or content "")))))
 
 (defun ejira--is-parent-p (child parent)
   "Return t if CHILD is a subheading of PARENT."
@@ -1210,8 +1283,14 @@ still found by the `org-id' lookup that runs first."
                                                      summary)))))))
 
 (defun ejira--set-summary (id summary)
-  "Set the heading of item ID into SUMMARY."
-  (ejira--set-heading-summary (ejira--find-heading id) summary))
+  "Set item ID's Jira-facing summary to SUMMARY.
+
+Projected headings retain their local title and receive the remote value in
+`JIRA_TITLE'; ordinary headings keep ejira's historical title behavior."
+  (ejira--with-point-on id
+    (if (ejira--jira-projection-p)
+        (org-set-property ejira-jira-title-property summary)
+      (ejira--set-heading-summary (point-marker) summary))))
 
 (defun ejira--alist-get (l &rest keys)
   "Find a value from fields L recursively with KEYS."
