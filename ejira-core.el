@@ -944,6 +944,27 @@ If LEVEL is given, shift all heading by it."
       (set-text-properties 0 (length s) nil s)
       s)))
 
+(defun ejira--heading-own-body-region ()
+  "Return bounds of the current heading's body before its first child."
+  (org-with-wide-buffer
+   (save-excursion
+     (org-back-to-heading t)
+     (let ((heading (point-marker))
+           (begin (progn (org-end-of-meta-data t) (point))))
+       (let ((end (save-excursion
+                    (goto-char heading)
+                    (if (org-goto-first-child)
+                        (line-beginning-position)
+                      (org-end-of-subtree t t)))))
+         (cons begin end))))))
+
+(defun ejira--get-heading-own-body (&optional heading)
+  "Return direct body text of HEADING, excluding child headings."
+  (if heading
+      (org-with-point-at heading (ejira--get-heading-own-body))
+    (let ((region (ejira--heading-own-body-region)))
+      (buffer-substring-no-properties (car region) (cdr region)))))
+
 (defun ejira--strip-properties (s)
   "Remove text properties from string S."
   (set-text-properties 0 (length s) nil s)
@@ -1095,6 +1116,39 @@ than exporting their local body or ordinary `Description' child subtree."
       (when-let ((description
                   (ejira--find-child-heading ejira-description-heading-name)))
         (ejira--get-heading-body description)))))
+
+(defun ejira--new-issue-description (&optional heading)
+  "Return the Jira description for a local heading not yet created in Jira.
+
+An ordinary heading without a dedicated `Description' child exports its
+direct body.  Projected headings intentionally export only `JIRA_DESCRIPTION'."
+  (if heading
+      (org-with-point-at heading (ejira--new-issue-description))
+    (or (ejira--jira-description)
+        (unless (ejira--jira-projection-p)
+          (ejira--get-heading-own-body)))))
+
+(defun ejira--prepare-new-issue-description (&optional heading)
+  "Return a new heading's Jira description, migrating an ordinary body.
+
+Before creation, move a plain heading's direct body into its dedicated
+`Description' child.  This keeps local and remote descriptions aligned after
+the initial Jira refresh without exposing content from a projection."
+  (if heading
+      (org-with-point-at heading (ejira--prepare-new-issue-description))
+    (if (or (ejira--jira-projection-p)
+            (ejira--find-child-heading ejira-description-heading-name))
+        (or (ejira--jira-description) "")
+      (let* ((region (ejira--heading-own-body-region))
+             (body (buffer-substring-no-properties (car region) (cdr region))))
+        (if (string-empty-p (string-trim body))
+            ""
+          (let ((description
+                 (ejira--get-subheading (point-marker)
+                                        ejira-description-heading-name)))
+            (ejira--set-heading-body description body)
+            (delete-region (car region) (cdr region))
+            body))))))
 
 (defun ejira--expected-jira-description (heading content)
   "Return local Org text expected from Jira markup CONTENT at HEADING.

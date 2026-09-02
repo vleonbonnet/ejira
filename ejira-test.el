@@ -183,6 +183,49 @@ Private local description.
                           (ejira--find-child-heading "JIRA_DESCRIPTION")
                         (ejira--get-heading-body (point-marker)))))))))
 
+(ert-deftest ejira-new-issue-description--migrates-plain-body ()
+  "A plain new heading moves its direct body into Description before creation."
+  (ejira-test--with-org-buf
+      "* TODO Local task
+:PROPERTIES:
+:END:
+
+Content intended for Jira.
+"
+    (goto-char (point-min))
+    (should (equal "Content intended for Jira.\n"
+                   (ejira--new-issue-description)))
+    (should-not (ejira--find-child-heading "Description"))
+    (should (equal "Content intended for Jira.\n"
+                   (ejira--prepare-new-issue-description)))
+    (goto-char (point-min))
+    (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
+    (org-with-point-at (ejira--find-child-heading "Description")
+      (should (equal "Content intended for Jira."
+                     (string-trim (ejira--get-heading-body (point-marker))))))))
+
+(ert-deftest ejira-new-issue-description--projection-keeps-local-body-private ()
+  "Preparing a projected heading never moves local content into Description."
+  (ejira-test--with-org-buf
+      "* TODO Local task
+:PROPERTIES:
+:JIRA_TITLE: External task
+:END:
+
+Private implementation notes.
+
+** JIRA_DESCRIPTION
+
+External task description.
+"
+    (goto-char (point-min))
+    (should (equal "External task description."
+                   (string-trim (ejira--prepare-new-issue-description))))
+    (goto-char (point-min))
+    (should (equal "Private implementation notes."
+                   (string-trim (ejira--get-heading-own-body))))
+    (should-not (ejira--find-child-heading "Description"))))
+
 (ert-deftest ejira-priority--policy/filters-and-falls-back ()
   "Hidden Jira priorities share the configured lowest visible rank."
   (let ((ejira-priority-policies ejira-test--priority-policies))
@@ -517,7 +560,7 @@ Comment body.
   "New TEST subtasks explicitly receive the visible default priority."
   (let ((ejira-priority-policies ejira-test--priority-policies)
         (create-call nil))
-    (ejira-test--with-org-buf "* TODO New subtask\n"
+    (ejira-test--with-org-buf "* TODO New subtask\n\nCascaded body.\n"
       (goto-char (point-min))
       (re-search-forward org-heading-regexp)
       (let ((child (list :marker (point-marker)
@@ -533,6 +576,9 @@ Comment body.
                    (lambda (&rest _args) nil)))
           (ejira--push-create-cascaded-subtask
            "TEST-1" "TEST" child nil nil)
+          (should (equal "Cascaded body.\n" (nth 3 create-call)))
+          (goto-char (point-min))
+          (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
           (should (equal "p1"
                          (cdr (assoc 'id
                                      (cdr (assoc 'priority (nth 4 create-call))))))))))))
@@ -665,22 +711,62 @@ Draft body.
 
 (ert-deftest ejira-push--rule-e/new-subtask-under-issue ()
   "TODO heading without TYPE directly under ejira-issue → create-subtask op."
-  (let ((ops (ejira-test--scan
-              "* PROJ-1 Parent Issue
+  (ejira-test--with-org-buf
+      "* PROJ-1 Parent Issue
 :PROPERTIES:
 :TYPE:     ejira-issue
 :ID:       PROJ-1
 :Issuetype: Task
 :END:
 ** TODO My New Subtask
-")))
-    (let ((subtask-ops (cl-remove-if-not
-                        (lambda (op) (and (eq 'create  (plist-get op :op))
-                                          (eq 'subtask (plist-get op :object))))
-                        ops)))
+
+Body for Jira.
+"
+    (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+           (subtask-ops (cl-remove-if-not
+                         (lambda (op) (and (eq 'create (plist-get op :op))
+                                           (eq 'subtask (plist-get op :object))))
+                         ops)))
       (should (= 1 (length subtask-ops)))
       (should (equal "PROJ-1"
-                     (plist-get (plist-get (car subtask-ops) :data) :parent-key))))))
+                     (plist-get (plist-get (car subtask-ops) :data) :parent-key)))
+      (let* ((plan (car (ejira--push-build-plans subtask-ops)))
+             (description (cadr (assoc "description" (plist-get plan :fields)))))
+        (should (equal "Body for Jira.\n" description))))))
+
+(ert-deftest ejira-push--new-subtask/migrates-body-before-create ()
+  "Creating a subtask retains its direct body in the managed description."
+  (let ((ejira--assign-new-issues nil)
+        created-description)
+    (ejira-test--with-org-buf
+        "* PROJ-1 Parent Issue
+:PROPERTIES:
+:TYPE:     ejira-issue
+:ID:       PROJ-1
+:Issuetype: Task
+:END:
+** TODO My New Subtask
+
+Body for Jira.
+"
+      (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+             (subtask-op (cl-find-if (lambda (op) (eq 'subtask (plist-get op :object)))
+                                     ops))
+             (plan (car (ejira--push-build-plans (list subtask-op))))
+             (marker (plist-get subtask-op :marker)))
+        (cl-letf (((symbol-function 'ejira--default-priority-id) (lambda (&rest _) nil))
+                  ((symbol-function 'jiralib2-create-issue)
+                   (lambda (_project _type _summary description &rest _args)
+                     (setq created-description description)
+                     '((key . "PROJ-2"))))
+                  ((symbol-function 'ejira--finalize-new-issue) (lambda (&rest _) nil)))
+          (funcall (plist-get plan :send)))
+        (should (equal "Body for Jira.\n" created-description))
+        (org-with-point-at marker
+          (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
+          (org-with-point-at (ejira--find-child-heading "Description")
+            (should (equal "Body for Jira."
+                           (string-trim (ejira--get-heading-body (point-marker)))))))))))
 
 (ert-deftest ejira-push--rule-e/plain-heading-under-issue-ignored ()
   "Heading without TODO under ejira-issue is NOT detected as a new subtask."
@@ -741,21 +827,27 @@ Draft body.
 
 (ert-deftest ejira-push--rule-f/new-issue-under-project ()
   "TODO heading without TYPE directly under ejira-project → create-issue op."
-  (let ((ops (ejira-test--scan
-              "* PROJ
+  (ejira-test--with-org-buf
+      "* PROJ
 :PROPERTIES:
 :TYPE:     ejira-project
 :ID:       PROJ
 :END:
 ** TODO My New Issue
-")))
-    (let ((issue-ops (cl-remove-if-not
-                      (lambda (op) (and (eq 'create (plist-get op :op))
-                                        (eq 'issue  (plist-get op :object))))
-                      ops)))
+
+Body for Jira.
+"
+    (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+           (issue-ops (cl-remove-if-not
+                       (lambda (op) (and (eq 'create (plist-get op :op))
+                                         (eq 'issue (plist-get op :object))))
+                       ops)))
       (should (= 1 (length issue-ops)))
       (should (equal "PROJ"
-                     (plist-get (plist-get (car issue-ops) :data) :project-key))))))
+                     (plist-get (plist-get (car issue-ops) :data) :project-key)))
+      (let* ((plan (car (ejira--push-build-plans issue-ops)))
+             (description (cadr (assoc "description" (plist-get plan :fields)))))
+        (should (equal "Body for Jira.\n" description))))))
 
 ;;; ── ejira-push scan: Rule G (comment drafts) ─────────────────────────────────
 

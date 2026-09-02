@@ -122,7 +122,7 @@ Only scans direct children (depth 1) — Jira subtasks cannot have subtasks."
                   (push (list :marker (point-marker)
                               :title  (ejira--jira-summary)
                               :state  (substring-no-properties (or todo-state ""))
-                              :body   (ejira--jira-description))
+                              :body   (ejira--new-issue-description))
                         children))))))))
     (nreverse children)))
 
@@ -134,7 +134,9 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
   (let* ((child-marker (plist-get child :marker))
          (orig-state   (plist-get child :state))
          (summary      (plist-get child :title))
-         (desc         (ejira-parser-org-to-jira (or (plist-get child :body) "")))
+         (description  (org-with-point-at child-marker
+                         (ejira--prepare-new-issue-description)))
+         (desc         (ejira-parser-org-to-jira description))
          (priority-id (ejira--default-priority-id project-key parent-key))
          (result (apply #'jiralib2-create-issue
                         project-key ejira-subtask-type-name
@@ -592,7 +594,7 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  (project-key (plist-get data :project-key))
                   (heading-title (org-with-point-at marker (ejira--jira-summary)))
                   (local-body (or (org-with-point-at marker
-                                    (ejira--jira-description))
+                                    (ejira--new-issue-description))
                                   ""))
                  (local-state (org-with-point-at marker
                                 (substring-no-properties (or (org-get-todo-state) ""))))
@@ -611,7 +613,6 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                              :send (let ((marker marker) (project-key project-key)
                                          (parent-key parent-key)
                                          (summary heading-title)
-                                         (desc (ejira-parser-org-to-jira (or local-body "")))
                                          (subtask-type ejira-subtask-type-name)
                                          (orig-state local-state)
                                          (todo-kws (org-with-point-at marker
@@ -619,7 +620,11 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                                        org-todo-keywords-1)))
                                          (assign-self (list ejira--assign-new-issues)))
                                      (lambda ()
-                                       (let* ((priority-id
+                                       (let* ((description
+                                               (org-with-point-at marker
+                                                 (ejira--prepare-new-issue-description)))
+                                              (desc (ejira-parser-org-to-jira description))
+                                              (priority-id
                                                (ejira--default-priority-id
                                                 project-key parent-key))
                                               (result (apply #'jiralib2-create-issue
@@ -647,9 +652,10 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  (parent-initiative (plist-get data :parent-initiative))
                  (parent-issue     (or parent-epic parent-initiative
                                        (plist-get op :parent-issue)))
-                 (heading-title (org-with-point-at marker
-                                  (ejira--strip-properties (org-get-heading t t t t))))
-                 (local-body (ejira--get-heading-body marker))
+                 (heading-title (org-with-point-at marker (ejira--jira-summary)))
+                 (local-body (or (org-with-point-at marker
+                                   (ejira--new-issue-description))
+                                 ""))
                  (local-state (org-with-point-at marker
                                 (substring-no-properties (or (org-get-todo-state) ""))))
                  (fields `(("title" ,heading-title)
@@ -671,7 +677,6 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                              :send (let ((marker marker) (project-key project-key)
                                          (orig-state local-state)
                                          (summary heading-title)
-                                         (desc (ejira-parser-org-to-jira (or local-body "")))
                                          (children children)
                                          (issue-type issue-type)
                                          (parent-epic parent-epic)
@@ -683,7 +688,11 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                                      (when (boundp 'org-todo-keywords-1)
                                                        org-todo-keywords-1))))
                                      (lambda ()
-                                       (let* ((epic-name-arg
+                                       (let* ((description
+                                               (org-with-point-at marker
+                                                 (ejira--prepare-new-issue-description)))
+                                              (desc (ejira-parser-org-to-jira description))
+                                              (epic-name-arg
                                                (when (and is-epic epic-summary-field)
                                                  `(,epic-summary-field . ,summary)))
                                               (priority-id
