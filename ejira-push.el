@@ -155,8 +155,7 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
 (defun ejira--push-payload (&rest parts)
   "Join the non-nil PARTS into a payload preview for the review buffer."
   (let ((parts (delq nil parts)))
-    (when parts (string-join parts "
-"))))
+    (when parts (string-join parts "\n"))))
 
 (defun ejira--push-finalize (marker)
   "Refresh MARKER's push baseline after a successful push and save its buffer."
@@ -485,9 +484,7 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                             :changes changes
                             :payload (ejira--push-payload
                                       (when (or summary-changed desc-changed)
-                                        (format "summary: %s
-description (Jira markup):
-%s"
+                                        (format "summary: %s\ndescription (Jira markup):\n%s"
                                                 local-summary
                                                 (ejira-parser-org-to-jira local-desc-org
                                                                           desc-level)))
