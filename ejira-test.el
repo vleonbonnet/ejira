@@ -386,13 +386,15 @@ External task description.
 
 (ert-deftest ejira-priority--local-entry/legacy-heading-is-not-inferred ()
   "A legacy Org cookie without Jira metadata is not pushed as a priority."
-  (ejira-test--with-org-buf
-      "* TODO TEST-1 Issue\n:PROPERTIES:\n:ID: TEST-1\n:END:\n"
-    (goto-char (point-min))
-    (re-search-forward org-heading-regexp)
-    (org-priority 3)
-    (should-not (ejira--local-priority-entry (point-marker)
-                                             ejira-test--priority-scheme))))
+  (let ((org-priority-highest 1)
+        (org-priority-lowest 5)
+        (org-lowest-priority 5))
+    (ejira-test--with-org-buf
+        "* TODO [#3] TEST-1 Issue\n:PROPERTIES:\n:ID: TEST-1\n:END:\n"
+      (goto-char (point-min))
+      (re-search-forward org-heading-regexp)
+      (should-not (ejira--local-priority-entry (point-marker)
+                                               ejira-test--priority-scheme)))))
 
 (ert-deftest ejira-priority--update-task/migrates-clean-legacy-heading ()
   "A clean legacy heading is remapped and receives an exact Jira ID."
