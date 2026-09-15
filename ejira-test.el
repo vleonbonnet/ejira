@@ -86,14 +86,91 @@
     (should (= 1 (length (cdr (assoc "TEST" groups)))))
     (should (= 1 (length (cdr (assoc "CVE"    groups)))))))
 
-(ert-deftest ejira-confirm--op-summary/all-types ()
-  "Summarize creates, updates, and deletes independently."
-  (should (equal "  1 new, 2 modified, 1 deleted"
-                 (ejira-confirm--op-summary
-                  (list (list :op 'create)
-                        (list :op 'update)
-                        (list :op 'update)
-                        (list :op 'delete))))))
+(ert-deftest ejira-confirm--items/issue-update-is-the-node ()
+  "An issue's update plan becomes the node; its other plans are children."
+  (let* ((send-a (lambda () 'a))
+         (plans (list (list :op 'update :object 'issue :project "TEST" :title "TEST-1"
+                            :parent-issue "TEST-1" :changes '(("summary" "Old" "New"))
+                            :payload "summary: New" :send send-a)
+                      (list :op 'create :object 'subtask :project "TEST"
+                            :title "new subtask: Child" :parent-issue "TEST-1"
+                            :fields '(("title" "Child") ("state" "TODO") ("description" ""))
+                            :assign-self (list t) :send #'ignore)
+                      (list :op 'update :object 'status :project "TEST" :title "TEST-1"
+                            :parent-issue "TEST-1" :changes '(("transition" "" "Done"))
+                            :send #'ignore)))
+         (items (cl-letf (((symbol-function 'ejira-confirm--issue-title)
+                           (lambda (_) "Fix login")))
+                  (ejira-confirm--items plans)))
+         (project (car items))
+         (node (car (plist-get project :children)))
+         (children (plist-get node :children)))
+    (should (= 1 (length items)))
+    (should (equal "TEST" (plist-get project :label)))
+    (should (equal "Fix login" (plist-get node :label)))
+    (should (eq 'modified (plist-get node :kind)))
+    (should (equal '((:name "summary" :old "Old" :new "New")) (plist-get node :fields)))
+    (should (eq send-a (plist-get node :execute)))
+    (should (equal "summary: New" (plist-get node :payload)))
+    (should (= 2 (length children)))
+    (should (equal "subtask: TODO Child" (plist-get (car children) :label)))
+    (should (eq 'new (plist-get (car children) :kind)))
+    (should (equal '((:name "title" :new "Child") (:name "state" :new "TODO"))
+                   (plist-get (car children) :fields)))
+    (should (eq 'assign-self (plist-get (car (plist-get (car children) :toggles)) :key)))
+    (should (equal "transition" (plist-get (cadr children) :label)))
+    (should (equal '((:name "transition" :old nil :new "Done"))
+                   (plist-get (cadr children) :fields)))))
+
+(ert-deftest ejira-confirm--items/issue-without-update-is-a-container ()
+  "Comment plans under an issue with no update plan hang off a container."
+  (let* ((plans (list (list :op 'create :object 'comment :project "TEST"
+                            :title "new comment on TEST-2" :parent-issue "TEST-2"
+                            :preview "Hello there" :send #'ignore)
+                      (list :op 'delete :object 'comment :project "TEST"
+                            :title "delete comment on TEST-2" :parent-issue "TEST-2"
+                            :preview "Bye" :send #'ignore)))
+         (items (cl-letf (((symbol-function 'ejira-confirm--issue-title) (lambda (_) nil)))
+                  (ejira-confirm--items plans)))
+         (node (car (plist-get (car items) :children)))
+         (children (plist-get node :children)))
+    (should (equal "TEST-2" (plist-get node :label)))
+    (should (null (plist-get node :kind)))
+    (should (equal "comment: TEST-2" (plist-get (car children) :label)))
+    (should (equal '((:name "body" :new "Hello there")) (plist-get (car children) :fields)))
+    (should (eq 'deleted (plist-get (cadr children) :kind)))
+    (should (equal "permanent" (plist-get (cadr children) :warning)))
+    (should (equal '((:name "body" :old "Bye")) (plist-get (cadr children) :fields)))))
+
+(ert-deftest ejira-confirm--items/top-level-create-with-cascaded-children ()
+  "A new top-level issue lists its cascaded subtasks as fixed children."
+  (let* ((plans (list (list :op 'create :object 'issue :label "issue" :project "TEST"
+                            :title "new issue: Big thing" :parent-issue nil
+                            :fields '(("title" "Big thing") ("state" "TODO") ("description" "Body"))
+                            :children (list (list :title "Part one" :state "TODO" :body ""))
+                            :assign-self (list nil) :send #'ignore)))
+         (items (ejira-confirm--items plans))
+         (item (car (plist-get (car items) :children)))
+         (child (car (plist-get item :children))))
+    (should (equal "issue: TODO Big thing" (plist-get item :label)))
+    (should (equal '((:name "title" :new "Big thing") (:name "state" :new "TODO")
+                     (:name "description" :new "Body"))
+                   (plist-get item :fields)))
+    (should (equal "subtask: TODO Part one" (plist-get child :label)))
+    (should (plist-get child :fixed))))
+
+(ert-deftest ejira-confirm--execute/binds-pushing-and-reports-failures ()
+  "Thunks run with `ejira--pushing' bound; failures are reported, not raised."
+  (let ((seen nil)
+        (warned nil))
+    (cl-letf (((symbol-function 'display-warning)
+               (lambda (type msg &rest _) (setq warned (cons type msg)))))
+      (ejira-confirm--execute
+       (list (list :label "ok" :execute (lambda () (setq seen ejira--pushing)))
+             (list :label "bad" :execute (lambda () (error "boom"))))))
+    (should (eq t seen))
+    (should (eq 'ejira (car warned)))
+    (should (string-match-p "bad" (cdr warned)))))
 
 ;;; ── ejira-core helpers ────────────────────────────────────────────────────────
 

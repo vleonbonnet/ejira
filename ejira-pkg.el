@@ -6,7 +6,8 @@
     (ox-jira "0")
     (dash "2.19.1")
     (jiralib2 "1.0")
-    (language-detection "0"))
+    (language-detection "0")
+    (org-sync-confirm "0.1"))
   :keywords
   '("jira" "org")
   :authors

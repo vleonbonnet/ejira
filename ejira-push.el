@@ -152,6 +152,12 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
           (jiralib2-assign-issue new-key my-name))))
     (ejira--finalize-new-issue new-key child-marker orig-state todo-keywords)))
 
+(defun ejira--push-payload (&rest parts)
+  "Join the non-nil PARTS into a payload preview for the review buffer."
+  (let ((parts (delq nil parts)))
+    (when parts (string-join parts "
+"))))
+
 (defun ejira--push-finalize (marker)
   "Refresh MARKER's push baseline after a successful push and save its buffer."
   (org-with-point-at marker (ejira--update-push-baseline))
@@ -477,6 +483,22 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                             :title key
                             :parent-issue key
                             :changes changes
+                            :payload (ejira--push-payload
+                                      (when (or summary-changed desc-changed)
+                                        (format "summary: %s
+description (Jira markup):
+%s"
+                                                local-summary
+                                                (ejira-parser-org-to-jira local-desc-org
+                                                                          desc-level)))
+                                      (when assignee-changed
+                                        (format "assignee: %s" local-assignee))
+                                      (when (and priority-changed local-priority-id)
+                                        (format "priority id: %s" local-priority-id))
+                                      (when deadline-changed
+                                        (format "duedate: %s" (or local-deadline "")))
+                                      (when state-changed
+                                        (format "transition to org state: %s" local-state)))
                             :send (let ((key key) (marker marker)
                                         (local-summary local-summary)
                                         (local-desc-org local-desc-org)
@@ -545,6 +567,7 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                :title (format "%s comment %s" issue-key commid)
                                :parent-issue issue-key
                                :changes changes
+                               :payload (ejira-parser-org-to-jira local-body comment-level)
                                :send (let ((issue-key issue-key) (commid commid)
                                            (marker marker)
                                            (comment-level comment-level)
@@ -626,6 +649,12 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                                        0 (min 60 (length heading-title))))
                              :parent-issue parent-key
                              :fields fields
+                             :payload (ejira--push-payload
+                                       (format "summary: %s" heading-title)
+                                       (format "issue type: %s" ejira-subtask-type-name)
+                                       (format "parent: %s" parent-key)
+                                       "description (Jira markup):"
+                                       (ejira-parser-org-to-jira local-body))
                              :assign-self (list ejira--assign-new-issues)
                              :send (let ((marker marker) (project-key project-key)
                                          (parent-key parent-key)
@@ -690,6 +719,14 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                              :parent-issue parent-issue
                              :fields fields
                              :children children
+                             :payload (ejira--push-payload
+                                       (format "summary: %s" heading-title)
+                                       (format "issue type: %s" issue-type)
+                                       (when parent-epic (format "epic link: %s" parent-epic))
+                                       (when parent-initiative
+                                         (format "parent initiative: %s" parent-initiative))
+                                       "description (Jira markup):"
+                                       (ejira-parser-org-to-jira local-body))
                              :assign-self (list ejira--assign-new-issues)
                              :send (let ((marker marker) (project-key project-key)
                                          (orig-state local-state)
@@ -756,18 +793,18 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                                :error)))))))))))
          ((and (eq op-type 'create) (eq object 'comment))
           (let* ((issue-key (plist-get data :issue-key))
-                 (preview (let ((body (ejira--get-heading-body marker)))
-                            (if (and body (> (length body) 0))
-                                (substring body 0 (min 80 (length body)))
-                              "(no body)"))))
+                 (body (ejira--get-heading-body marker))
+                 (preview (if (and body (> (length body) 0)) body "(no body)")))
             (setq plan (list :op 'create
                              :object 'comment
                              :project project
                              :title (format "new comment on %s" issue-key)
                              :parent-issue issue-key
                              :preview preview
+                             :payload (when (and body (> (length body) 0))
+                                        (ejira-parser-org-to-jira body))
                              :send (let ((marker marker) (issue-key issue-key)
-                                         (body (ejira--get-heading-body marker)))
+                                         (body body))
                                      (lambda ()
                                        (let* ((comment (ejira--parse-comment
                                                         (jiralib2-add-comment

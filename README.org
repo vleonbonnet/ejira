@@ -14,7 +14,7 @@
 [[./agenda.png]]
 
 ** Installation
-Example configuration with =use-package=. Note, that for Ejira to work =org-id-track-globally= needs to be set to =t=, as =org-id=-lookups are heavily used by Ejira.
+Example configuration with =use-package=. Note, that for Ejira to work =org-id-track-globally= needs to be set to =t=, as =org-id=-lookups are heavily used by Ejira. Pushes are reviewed in an [[https://github.com/vleonbonnet/org-sync-confirm][org-sync-confirm]] buffer, which must be installed alongside.
 #+BEGIN_SRC elisp
   (use-package ejira
     :init
@@ -139,6 +139,27 @@ Additionally, following commands are provided, and are meant to be bound globall
 | =ejira-heading-to-subtask=           | Create a subtask from an org-heading under point, interactively select the story. |
 
 =ejira-heading-to-*task= uses the title of the heading as the summary of the issue, and the whole body as the description. The body is converted into JIRA-markup, and can contain any org-markup, including subheadings. If a region is active, repeat the action for all of the "top-level" headings within the region (the project or story is assumed to be the same for all).
+
+*** Push review
+Saving a managed org buffer, or =ejira-push-item-under-point=, opens the =*ejira-confirm*= buffer, an [[https://github.com/vleonbonnet/org-sync-confirm][org-sync-confirm]] review of every pending Jira write: summary and description edits, comment edits, new issues, subtasks and comments, comment deletions, state transitions, issue type and epic changes.
+
+#+BEGIN_EXAMPLE
+Ejira Push — 3 changes: 1 modified, 2 new
+══════════════════════════════════════════
+[x] Assign new issues to me
+
+▼ TEST  1 modified, 2 new
+  ▼ [x] ✎ Fix the login page  summary, description, 1 new
+      summary:      old title → new title
+      ▶ description:  -1 +2 lines, +80 chars
+      ▶ payload:      6 lines, sent as is
+      ▶ [x] + subtask: TODO Write the tests  new
+#+END_EXAMPLE
+
+- Each write is an item with a =[x]= checkbox; =RET= unticks it and the heading stays dirty for the next save.
+- Fields expand with =TAB= to a word-refined diff; =payload= shows the Jira markup that will be sent.
+- =Assign new issues to me= and the per-issue =assign to me= boxes control assignment of created issues.
+- =C-c C-c= pushes the ticked items; failures are collected into one warning and the other items still go through. =C-c C-k= cancels.
 
 *** Agenda & Boards
 Ejira integrates to =org-agenda= by providing a new type for the agenda definitions: =ejira-jql=. =ejira-jql= behaves exactly alike the =tags=-type, except instead of a tag/property filter it uses a jql-query. Below is an example of an agenda view that shows the issues from board "Ejira" and groups them by their assignment status:

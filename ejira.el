@@ -5,7 +5,7 @@
 ;; Author: Henrik Nyman
 ;; URL: https://github.com/nyyManni/ejira
 ;; Keywords: calendar, data, org, jira
-;; Package-Requires: ((emacs "26.1"))
+;; Package-Requires: ((emacs "29.1") (org-sync-confirm "0.1"))
 ;; Package-Version: 1.0
 
 ;; This file is NOT part of GNU Emacs.
