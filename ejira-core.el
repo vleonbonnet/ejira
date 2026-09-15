@@ -143,6 +143,16 @@ resolution-aware mappings (e.g. Closed+Fixed→DONE vs Closed+Won't Fix→CANCEL
   :group 'ejira
   :type 'string)
 
+(defcustom ejira-extra-scan-files nil
+  "Additional Org files `ejira--find-heading-by-scan' should search.
+
+Refiled issues live outside `ejira-org-directory'.  Their lookup
+normally goes through `org-id-locations'; when that index is stale or
+has been rebuilt without them, the scan fallback must know where to
+look, or `ejira--update-task' would create a duplicate heading."
+  :group 'ejira
+  :type '(repeat file))
+
 (defvar ejira-assigned-tagname "ejira_assigned"
   "Tagname used for issues that are assigned to me.
 Set to nil to disable assigned-tag management entirely.")
@@ -684,7 +694,15 @@ something a background auto-pull should ever do."
           (ejira--set-todo-state key (funcall ejira-todo-state-fn status resolution))
 
           (ejira--set-property key "TYPE" (symbol-name org-type))
-          (ejira--set-summary key summary)
+
+          ;; JIRA's copy of the summary and description must not overwrite
+          ;; unpushed local edits: the push-confirmation flow owns outbound
+          ;; changes, and clobbering here would silently drop them.
+          (when local-dirty-p
+            (message "ejira: %s has unpushed local edits; keeping local summary and description"
+                     key))
+          (unless local-dirty-p
+            (ejira--set-summary key summary))
 
           ;; Set the sprint tag
           (ejira--with-point-on key
@@ -709,15 +727,20 @@ something a background auto-pull should ever do."
             (org-set-property "Issuetype" type)
             (org-set-property "Created" (format-time-string "%Y-%m-%d %H:%M:%S"
                                                             created "UTC"))
-            (org-set-property "Modified" (format-time-string "%Y-%m-%d %H:%M:%S"
-                                                             updated "UTC"))
+            ;; Do not advance Modified while local edits are pending: the
+            ;; deferred summary/description update must be retried after the
+            ;; push resolves the dirtiness, not silently dropped.
+            (unless local-dirty-p
+              (org-set-property "Modified" (format-time-string "%Y-%m-%d %H:%M:%S"
+                                                               updated "UTC")))
             (when-let ((minutes (and estimate (/ estimate 60))))
               (org-set-property "Effort" (format "%02d:%02d" (/ minutes 60) (% minutes 60))))
             (when-let ((minutes (and remaining-estimate (/ remaining-estimate 60))))
               (org-set-property "Left" (format "%02d:%02d" (/ minutes 60) (% minutes 60)))))
 
           (ejira--get-subheading (ejira--find-heading key) ejira-comments-heading-name)
-          (ejira--set-jira-description-jira-markup key description)
+          (unless local-dirty-p
+            (ejira--set-jira-description-jira-markup key description))
 
           ;; Update existing, and insert missing comments
           (mapc (-partial #'ejira--update-comment key) comments)
@@ -745,7 +768,10 @@ something a background auto-pull should ever do."
           ;; local edits are detectable.  Kept inside the guard: an unchanged
           ;; item keeps its still-valid baseline and pays nothing — recomputing
           ;; it for every item turned a no-op sync into O(items) body scans.
-          (ejira--with-point-on key (ejira--update-push-baseline)))
+          ;; A dirty heading keeps its old baseline: re-recording it would
+          ;; erase the very signal that the local edit still needs pushing.
+          (unless local-dirty-p
+            (ejira--with-point-on key (ejira--update-push-baseline))))
 
         ;; For an unchanged, clean legacy heading, the priority migration is
         ;; the only content change and must establish a new clean baseline.
@@ -852,10 +878,8 @@ cache in a displayed buffer, can wedge into an uninterruptible loop."
 
 (defun ejira--heading-body-level (heading)
   "Return the heading-shift level used when parsing JIRA body under HEADING."
-  (+ 2 (org-with-point-at heading
-         (save-match-data
-           (search-forward-regexp "^\\**" (line-end-position) t)
-           (length (or (match-data) ""))))))
+  (org-with-point-at heading
+    (org-current-level)))
 
 (defun ejira--expected-org-body (heading content)
   "Return the org body that JIRA markup CONTENT would produce under HEADING.
@@ -897,9 +921,8 @@ If LEVEL is given, shift all heading by it."
     (concat
      (s-trim
       (ejira-parser-jira-to-org
-       (r "
-" ""    ; Windows line-endings
-          (r " " " " ; Non-breaking space, JIRA likes these, Emacs doesn't
+       (r "\r" ""  ; Windows line-endings: drop CR, keep the LF
+          (r "\u00a0" " " ; Non-breaking space, JIRA likes these, Emacs doesn't
              (decode-coding-string (or body "") 'utf-8)))
        level))
      "")))
@@ -910,25 +933,26 @@ If LEVEL is given, shift all heading by it."
     (nth 1 (ejira-get-id-under-point "ejira-project"))))
 
 (defmacro ejira--with-narrow-to-body (heading &rest body)
-  "Execute BODY while the buffer is narrowed to the content under HEADING."
+  "Execute BODY while the buffer is narrowed to the content under HEADING.
+
+Only HEADING's own planning line and drawers are skipped, via
+`org-end-of-meta-data'.  Searching the subtree for the drawer
+regexps instead would walk into a child heading that happens to have
+a drawer or a deadline line and silently discard the body before it.
+
+The subtree end is computed with point still on HEADING.  With
+`org-end-of-meta-data' called first, a body consisting only of blank
+lines would leave point on the *next* heading, and the subtree end
+would then be that heading's end -- deleting a sibling."
   `(org-with-point-at ,heading
      (ejira--with-expand-all
        (goto-char ,heading)
-       (org-narrow-to-subtree)
-       (end-of-line)
-
-       ;; TODO: Subheading content might have these...
-       (search-forward-regexp org-deadline-line-regexp nil t)
-       (search-forward-regexp org-property-drawer-re nil t)
-
-       ;; Clock drawer requires a hack, as the built-in regexp doesn't work
-       (search-forward-regexp
-        (let ((s (replace-regexp-in-string "CLOCK" "LOGBOOK" org-clock-drawer-re)))
-          (substring s 0 (- (length s) 2)))
-        nil t)
-       (narrow-to-region
-        (point)
-        (point-max))
+       (org-back-to-heading t)
+       (let ((end (save-excursion
+                    (org-end-of-subtree t t)
+                    (point))))
+         (org-end-of-meta-data t)
+         (narrow-to-region (min (point) end) end))
        ,@body)))
 (function-put #'ejira--with-narrow-to-body 'lisp-indent-function 'defun)
 
@@ -990,34 +1014,34 @@ body.  Normalized so the fingerprint ignores cosmetic whitespace changes."
      ((equal type "ejira-comment")
       (ejira--push-normalize (ejira--get-heading-body (point-marker))))
      ((member type ejira-pushable-types)
-       (concat (ejira--push-normalize (ejira--jira-summary))
-                 "\0"
-                 (ejira--push-normalize (ejira--jira-description))
-                 "\0"
-                 (ejira--push-normalize
-                  (or (org-entry-get nil "Assignee") ""))
-                "\0"
-                (ejira--push-normalize
-                 (or (save-excursion
-                       (org-back-to-heading t)
-                       (when (looking-at org-priority-regexp)
-                         (match-string 2)))
-                     ""))
-                ;; Include the exact Jira identity once a heading has been
-                ;; migrated.  Omitting it for legacy headings preserves their
-                ;; existing baseline until the safe migration path runs.
-                (or (when-let ((priority-id
-                                (org-entry-get nil ejira-priority-id-property)))
-                      (concat "\0" (ejira--push-normalize priority-id)))
-                    "")
-                "\0"
-                (ejira--push-normalize
-                 (or (when-let ((d (org-get-deadline-time (point-marker))))
-                       (format-time-string "%Y-%m-%d" d))
-                     ""))
-                 "\0"
-                 (ejira--push-normalize
-                  (or (org-get-todo-state) "")))))))
+      (concat (ejira--push-normalize (ejira--jira-summary))
+              "\0"
+              (ejira--push-normalize (ejira--jira-description))
+              "\0"
+              (ejira--push-normalize
+               (or (org-entry-get nil "Assignee") ""))
+              "\0"
+              (ejira--push-normalize
+               (or (save-excursion
+                     (org-back-to-heading t)
+                     (when (looking-at org-priority-regexp)
+                       (match-string 2)))
+                   ""))
+              ;; Include the exact Jira identity once a heading has been
+              ;; migrated.  Omitting it for legacy headings preserves their
+              ;; existing baseline until the safe migration path runs.
+              (or (when-let ((priority-id
+                              (org-entry-get nil ejira-priority-id-property)))
+                    (concat "\0" (ejira--push-normalize priority-id)))
+                  "")
+              "\0"
+              (ejira--push-normalize
+               (or (when-let ((d (org-get-deadline-time (point-marker))))
+                     (format-time-string "%Y-%m-%d" d))
+                   ""))
+              "\0"
+              (ejira--push-normalize
+               (or (org-get-todo-state) "")))))))
 
 (defun ejira--update-push-baseline ()
   "Store the :Pushhash: property fingerprinting the heading at point.
@@ -1079,8 +1103,8 @@ is established on the next sync or push, never during a plain save."
         ;; and dependency blockers (org-block-todo-from-children-or-siblings-or-parent,
         ;; org-edna) must not prevent reflecting Jira's authoritative status.
         (let ((org-inhibit-logging t)
-               (org-blocker-hook nil))
-           (org-todo state))))))
+              (org-blocker-hook nil))
+          (org-todo state))))))
 
 (defun ejira--jira-projection-p (&optional heading)
   "Return non-nil when HEADING has an explicit Jira content projection.
@@ -1185,32 +1209,32 @@ returns the existing one instead.  Callers reach here after a failed
 `ejira--find-heading', which a stale `org-id-locations' can make lie."
   (or (ejira--find-heading-by-scan id)
       (save-window-excursion
-    (with-current-buffer buffer
-      (org-with-wide-buffer
-       (ejira--with-expand-all
-         (goto-char (point-min))
+        (with-current-buffer buffer
+          (org-with-wide-buffer
+           (ejira--with-expand-all
+             (goto-char (point-min))
 
-         (if parent
-             ;; Jump to end of parent's subtree and insert one level deeper.
-             ;; Using org-end-of-subtree avoids inserting between the parent
-             ;; heading and its :PROPERTIES: drawer, which would displace the
-             ;; drawer and break org-id lookup on the parent.
-             (progn
-               (goto-char (ejira--find-heading parent))
-               (org-end-of-subtree t t)
-               (org-insert-heading t)
-               (org-demote))
-           ;; No parent: insert after the first line (startup keyword).
-           (forward-line)
-           (org-insert-heading-respect-content t))
-         (insert "<ejira new heading>")
-         (org-set-property "ID" id)
-         (org-beginning-of-line)
-         (basic-save-buffer)
-         (unless (hash-table-p org-id-locations)
-           (setq org-id-locations (make-hash-table :test 'equal)))
-         (puthash id (abbreviate-file-name (buffer-file-name buffer)) org-id-locations)
-         (point-marker)))))))
+             (if parent
+                 ;; Jump to end of parent's subtree and insert one level deeper.
+                 ;; Using org-end-of-subtree avoids inserting between the parent
+                 ;; heading and its :PROPERTIES: drawer, which would displace the
+                 ;; drawer and break org-id lookup on the parent.
+                 (progn
+                   (goto-char (ejira--find-heading parent))
+                   (org-end-of-subtree t t)
+                   (org-insert-heading t)
+                   (org-demote))
+               ;; No parent: insert after the first line (startup keyword).
+               (forward-line)
+               (org-insert-heading-respect-content t))
+             (insert "<ejira new heading>")
+             (org-set-property "ID" id)
+             (org-beginning-of-line)
+             (ejira--save-buffer-safe)
+             (unless (hash-table-p org-id-locations)
+               (setq org-id-locations (make-hash-table :test 'equal)))
+             (puthash id (abbreviate-file-name (buffer-file-name buffer)) org-id-locations)
+             (point-marker)))))))
 
 (defun ejira--project-files ()
   "Return the existing org files backing `ejira-projects'."
@@ -1230,11 +1254,14 @@ is how whole project trees came to be duplicated.  Scanning the project
 files is authoritative and repairs the index on the way.
 
 Return a marker on the heading owning ID, or nil when ID really is
-absent.  Only project files are scanned; items refiled elsewhere are
-still found by the `org-id' lookup that runs first."
+absent.  Project files and `ejira-extra-scan-files' are scanned;
+items refiled elsewhere are still found by the `org-id' lookup that
+runs first."
   (let ((re (concat "^[ \t]*:ID:[ \t]+" (regexp-quote id) "[ \t]*$"))
         found)
-    (cl-dolist (file (ejira--project-files))
+    (cl-dolist (file (seq-filter #'file-exists-p
+                                 (append (ejira--project-files)
+                                         ejira-extra-scan-files)))
       (with-current-buffer (find-file-noselect file t)
         (org-with-wide-buffer
          (goto-char (point-min))
@@ -1275,6 +1302,19 @@ still found by the `org-id' lookup that runs first."
       ;; The heading moved; evict from cache so the next lookup re-scans.
       (when ejira--heading-cache
         (remhash source-id ejira--heading-cache)))))
+
+(defun ejira--save-buffer-safe ()
+  "Save the current buffer unless the file changed on disk since it was visited.
+
+A conflicting file is left unsaved so the user can reconcile the two
+versions; forcing the save would silently discard the external change.
+Every save in the sync path goes through here instead of overriding
+`verify-visited-file-modtime' globally."
+  (cond
+   ((not (buffer-modified-p)) nil)
+   ((verify-visited-file-modtime (current-buffer)) (save-buffer))
+   (t (message "ejira: %s changed on disk; leaving local edits unsaved"
+               (buffer-file-name)))))
 
 (defun ejira--set-property (id property value)
   "Set PROPERTY of item ID into VALUE."

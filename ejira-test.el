@@ -519,7 +519,7 @@ Comment body.
                  (plan (car plans)))
             (should (= 1 (length plans)))
             (should (equal "Low" (nth 2 (assoc "priority"
-                                                        (plist-get plan :changes)))))
+                                               (plist-get plan :changes)))))
             (funcall (plist-get plan :send))
             (should (equal '("TEST-1" (priority . ((id . "p3"))))
                            update-args))))))))
@@ -991,6 +991,27 @@ Already on Jira.
   (ejira-test--with-project-dir ejira-test--project-content
     (should (null (ejira--find-heading-by-scan "TEST-999")))))
 
+(ert-deftest ejira-find-heading-by-scan/searches-extra-files ()
+  "A refiled issue is found through `ejira-extra-scan-files'.
+Refiled headings live outside the project directory; when the ID
+index has been rebuilt without them, the scan must still find them or
+a sync would create a duplicate heading."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let* ((extra (make-temp-file "ejira-refile-" nil ".org"))
+           (ejira-extra-scan-files (list extra)))
+      (unwind-protect
+          (progn
+            (with-temp-file extra
+              (insert "* Refiled\n:PROPERTIES:\n:ID:       TEST-EXTRA\n:TYPE:     ejira-issue\n:END:\n"))
+            (let ((m (ejira--find-heading-by-scan "TEST-EXTRA")))
+              (should (markerp m))
+              (should (equal (file-truename extra)
+                             (file-truename (buffer-file-name (marker-buffer m)))))))
+        (when-let ((b (find-buffer-visiting extra)))
+          (with-current-buffer b (set-buffer-modified-p nil))
+          (kill-buffer b))
+        (delete-file extra)))))
+
 (ert-deftest ejira-find-heading-by-scan/repairs-org-id-locations ()
   "A successful scan re-registers the ID so the fast path works next time."
   (ejira-test--with-project-dir ejira-test--project-content
@@ -1040,6 +1061,236 @@ This is the exact condition that used to duplicate project trees."
         (ejira--update-task-light "TEST-404" "Open" nil)
         (should (equal "TEST-404" called))
         (should (null ejira--deferred-keys))))))
+
+;;; ── JIRA -> Org conversion (regressions) ─────────────────────────────────────
+
+(defun ejira-test--parse (jira)
+  "Convert JIRA markup JIRA to org text with failure reporting disabled."
+  (let ((ejira-parser-failure-function nil))
+    (ejira-parser-jira-to-org jira)))
+
+(ert-deftest ejira-parser/keeps-line-structure ()
+  "Paragraphs, headings and lists stay on separate lines.
+A regression dropped every LF before parsing, collapsing whole
+descriptions into one line that no later rule could recognize."
+  ;; No shift level: h2 maps to two stars, preserving the relative
+  ;; hierarchy, and every later line stays recognizable markup.
+  (should (equal "** Outcome\nText\n\n** Done\n- First\n- Second"
+                 (ejira-test--parse "h2. Outcome\nText\n\nh2. Done\n* First\n* Second"))))
+
+(ert-deftest ejira-parser/preserves-backslashes-and-percent ()
+  "Literal backslashes and percent signs survive conversion.
+Restoration used to be computed and then discarded, leaking random
+identifiers into the output."
+  (should (equal "C:\\tmp\\file 100%"
+                 (ejira-test--parse "C:\\tmp\\file 100%"))))
+
+(ert-deftest ejira-parser/unescapes-literal-braces-and-brackets ()
+  "JIRA's \\{ and \\[ escapes become plain characters in Org."
+  (should (equal "a {b} [c]" (ejira-test--parse "a \\{b\\} \\[c]"))))
+
+(ert-deftest ejira-parser/table-keeps-dash-cells ()
+  "A body row starting with a dash is data, not an Org rule.
+Org reads | -1| rows as horizontal rules and discards them."
+  (let ((out (ejira-test--parse "||n||\n|-1|")))
+    (should (string-match-p "-1" out))
+    (should (= 1 (s-count-matches "^|---" out)))))
+
+(ert-deftest ejira-parser/literal-hash-markers-are-not-renumbered ()
+  "Only actual list markers are numbered; literal ######## text is not."
+  (should (equal "########banner" (ejira-test--parse "########banner")))
+  (let ((out (ejira-test--parse "{code}\nx\n######## banner\n{code}")))
+    (should (string-match-p "######## banner" out))))
+
+(ert-deftest ejira-parser/ordered-list-numbering ()
+  "Counters restart per list and per nesting level."
+  (should (equal "1. A\n    1. a\n2. B\n    1. b"
+                 (ejira-test--parse "# A\n## a\n# B\n## b")))
+  ;; An indented continuation keeps the list open...
+  (should (equal "1. A\n  continuation\n2. B"
+                 (ejira-test--parse "# A\n  continuation\n# B")))
+  ;; ...and a blank line does not split it either.
+  (should (equal "1. A\n\n2. B" (ejira-test--parse "# A\n\n# B")))
+  ;; A new top-level construct does.
+  (should (equal "1. A\n** X\n1. B"
+                 (ejira-test--parse "# A\nh2. X\n# B"))))
+
+(ert-deftest ejira-parser/seven-level-ordered-list ()
+  "Deep nesting beyond six levels still converts instead of failing."
+  (should (equal (concat "1. One\n" (make-string 20 ? ) "1. Seven")
+                 (ejira-test--parse "# One\n###### Seven"))))
+
+(ert-deftest ejira-parser/link-brackets-are-scoped ()
+  "A link label cannot span earlier bracketed text."
+  (should (equal "[a] and [[https://e][b]]"
+                 (ejira-test--parse "[a] and [b|https://e]"))))
+
+(ert-deftest ejira-parser/bare-link ()
+  "Links without a description, as emitted by the exporter, convert."
+  (should (equal "[[https://e]]" (ejira-test--parse "[https://e]"))))
+
+(ert-deftest ejira-parser/verbatim-is-protected ()
+  "Inline verbatim content is never rewritten by later rules."
+  (should (equal "=[x|https://e]=" (ejira-test--parse "{{[x|https://e]}}"))))
+
+(ert-deftest ejira-parser/verbatim-with-edge-spaces-kept ()
+  "Org emphasis cannot wrap edge whitespace; keep the JIRA form."
+  (should (equal "{{ x }}" (ejira-test--parse "{{ x }}"))))
+
+(ert-deftest ejira-parser/adjacent-italics ()
+  "A boundary character is not consumed by the preceding span."
+  (should (equal "/one/ /two/" (ejira-test--parse "_one_ _two_"))))
+
+(ert-deftest ejira-parser/emphasis-boundaries ()
+  "Word-internal underscores and arithmetic pluses stay literal."
+  (should (equal "a_b_c" (ejira-test--parse "a_b_c")))
+  (should (equal "2+3+4" (ejira-test--parse "2+3+4")))
+  (should (equal "x + y" (ejira-test--parse "x + y")))
+  (should (equal "_under_" (ejira-test--parse "+under+"))))
+
+(ert-deftest ejira-parser/code-block-escaping ()
+  "Block delimiters inside code cannot terminate the generated block."
+  (let ((out (ejira-test--parse "{code}\na\n#+END_SRC\nb\n{code}")))
+    (should (string-match-p "^\\(  \\|#\\+BEGIN_SRC\\|#\\+END_SRC\\)" out))
+    (should (string-match-p ",#\\+END_SRC" out))
+    (should (string-match-p "#\\+BEGIN_SRC\n  a" out))))
+
+(ert-deftest ejira-parser/trailing-whitespace-normalized ()
+  "Trailing whitespace is stripped everywhere, including code blocks.
+A global `whitespace-cleanup' save hook strips it on save regardless,
+so the converted form must already be clean or every save would look
+like a local edit."
+  (let ((out (ejira-test--parse "{code}\nx  \ny\n{code}")))
+    (should (string-match-p "x\n" out))
+    (should-not (string-match-p "  \n" out))))
+
+(ert-deftest ejira-parser/code-empty-lines-unindented ()
+  "Empty code lines carry no indentation, so whitespace cleanup is a no-op.
+A global `whitespace-cleanup' before-save hook strips whitespace-only
+line indent; emitting it would make every saved body compare modified."
+  (let ((out (ejira-test--parse "{code}\na\n\n  indented\nb\n{code}")))
+    ;; Block indent adds two spaces; the line's own two spaces stay.
+    (should (string-match-p "a\n\n    indented" out))
+    (should-not (string-match-p "  \n" out))))
+
+(ert-deftest ejira-parser/code-language ()
+  "An explicit language wins over detection; bare tokens are accepted."
+  (should (string-match-p "#\\+BEGIN_SRC java" (ejira-test--parse "{code:java}\nx\n{code}")))
+  (should (string-match-p "#\\+BEGIN_SRC python"
+                          (ejira-test--parse "{code:language=python}\nx\n{code}"))))
+
+(ert-deftest ejira-parser/noformat-is-literal ()
+  "Noformat contents are protected like code."
+  (let ((out (ejira-test--parse "{noformat}\n* literal\n{noformat}")))
+    (should (string-match-p "#\\+BEGIN_EXAMPLE" out))
+    (should (string-match-p "\\* literal" out))
+    (should-not (string-match-p "1\\. literal" out))))
+
+(ert-deftest ejira-parser/quote-body-converted ()
+  "Quote bodies are markup too and are converted recursively."
+  (let ((out (ejira-test--parse "{quote}\n# item\n{quote}")))
+    (should (string-match-p "#\\+BEGIN_QUOTE" out))
+    (should (string-match-p "1\\. item" out))))
+
+(ert-deftest ejira-parser/checkbox-emoticons ()
+  "Checkbox emoticons map onto Org checkbox states."
+  (should (equal "- [ ] todo\n- [X] done\n- [-] half"
+                 (ejira-test--parse "* (x) todo\n* (/) done\n* (i) half"))))
+
+(ert-deftest ejira-parser/horizontal-rule ()
+  "JIRA's four-dash rule becomes Org's five-dash rule."
+  (should (equal "-----" (ejira-test--parse "----"))))
+
+(ert-deftest ejira-parser/headings-roundtrip-at-offset ()
+  "Body headings exported relative to their container keep h-levels.
+Without the offset the exporter renormalizes the body's own minimum
+heading level to h1 and the original levels are lost on push."
+  (let* ((jira "h1. A\nText\nh2. B")
+         (org (ejira-parser-jira-to-org jira 2)))
+    (should (equal (string-trim org) "*** A\nText\n**** B"))
+    (should (equal (string-trim (ejira-parser-org-to-jira org 2))
+                   (string-trim jira)))
+    ;; Without the offset the minimum level is renormalized to h1.
+    (should (equal (string-trim (ejira-parser-org-to-jira org))
+                   "h1. A\nText\nh2. B"))))
+
+;;; ── Body extraction and heading levels ───────────────────────────────────────
+
+(ert-deftest ejira-parse-body/preserves-line-structure ()
+  "LF and CRLF input both keep paragraphs, headings and links."
+  (let* ((jira "h2. Outcome\nSelected engineers.\n\nOwner: Val.\n\nh2. Done\n* First\n\n[Plan|https://example.com/plan]\n")
+         (expected "**** Outcome\nSelected engineers.\n\nOwner: Val.\n\n**** Done\n- First\n\n[[https://example.com/plan][Plan]]"))
+    (dolist (input (list jira (replace-regexp-in-string "\n" "\r\n" jira)))
+      (should (equal expected (ejira--parse-body input 2))))))
+
+(ert-deftest ejira-parse-body/empty-and-nonbreaking-space ()
+  "Nil, empty and nonbreaking-space bodies are handled."
+  (should (equal "" (ejira--parse-body nil)))
+  (should (equal "" (ejira--parse-body "")))
+  (should (equal "One two" (ejira--parse-body "One\u00a0two"))))
+
+(ert-deftest ejira-heading-body-level/uses-outline-depth ()
+  "The shift level is the heading's outline depth, not match data."
+  (ejira-test--with-org-buf "* One\n** Two\n*** Three\n******* Seven\n"
+    (dolist (level '(1 2 3 7))
+      (should (= level (ejira--heading-body-level (point-marker))))
+      (forward-line))))
+
+(ert-deftest ejira-narrow-to-body/ignores-child-drawers ()
+  "A drawer on a child must not hide the parent's body before it."
+  (ejira-test--with-org-buf
+      "** Description\n\nIntro.\n*** Section\n:PROPERTIES:\n:CUSTOM_ID: section\n:END:\n\nSection body.\n"
+    (let ((body (ejira--get-heading-body (point-marker))))
+      (should (string-match-p "Intro\\." body))
+      (should (string-match-p "Section body\\." body))
+      (should (string-match-p "\\*\\*\\* Section" body)))))
+
+(ert-deftest ejira-narrow-to-body/blank-body-keeps-following-headings ()
+  "A body of only blank lines must not swallow the next heading.
+`org-end-of-meta-data' skips blank lines and lands on the next
+heading; computing the subtree end from there used to delete a
+sibling -- an issue subtree in the generated project files."
+  (ejira-test--with-org-buf
+      "* Issue\n** Description\n\n** TODO Child\n:PROPERTIES:\n:ID: X-1\n:END:\n\nKeep me.\n"
+    (let ((d (progn (goto-char (point-min))
+                    (re-search-forward "^\\*\\* Description")
+                    (org-back-to-heading t)
+                    (point-marker))))
+      (ejira--set-heading-body d "*** New body")
+      (should (string-match-p "\\*\\* TODO Child" (buffer-string)))
+      (should (string-match-p "Keep me\\." (buffer-string)))
+      (should (string-match-p "New body" (buffer-string)))
+      (org-with-point-at d
+        (save-excursion
+          (should (org-goto-first-child))
+          (should (equal "New body" (org-get-heading t t t t))))))))
+
+(ert-deftest ejira-description/pull-keeps-headings-contained ()
+  "Repeated description pulls are idempotent, keep siblings and deep levels.
+Reproduces the corrupted epics: newlines collapsed, the body became
+one long paragraph, and later pulls saw an empty description."
+  (dolist (level '(2 7))
+    (ejira-test--with-org-buf
+        (format "%s TODO Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:END:\n%s Description\n\nOld body.\n%s TODO Child\n:PROPERTIES:\n:ID: TEST-2\n:END:\nKeep me.\n"
+                (make-string (1- level) ?*) (make-string level ?*)
+                (make-string level ?*))
+      (let* ((issue (point-marker))
+             (description (ejira--find-child-heading "Description"))
+             (jira "h1. Outcome\nText.\n\nh2. Details\n* First\n* Second\n")
+             (expected (ejira--expected-org-body description jira)))
+        (dotimes (_ 2)
+          (ejira--set-heading-body-jira-markup description jira)
+          (should (equal expected (string-trim (ejira--get-heading-body description))))
+          (should (equal expected (ejira--expected-jira-description issue jira)))
+          (org-with-point-at issue (ejira--update-push-baseline))
+          (should-not (org-with-point-at issue (ejira--locally-modified-p)))
+          (org-with-point-at issue
+            (should (ejira--find-child-heading "Child")))
+          (goto-char description)
+          (should (org-goto-first-child))
+          (should (= (1+ level) (org-current-level)))
+          (should (equal "Outcome" (org-get-heading t t t t))))
+        (should (string-suffix-p "Keep me.\n" (buffer-string)))))))
 
 (provide 'ejira-test)
 ;;; ejira-test.el ends here

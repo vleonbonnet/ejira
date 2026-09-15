@@ -119,11 +119,11 @@ Only scans direct children (depth 1) — Jira subtasks cannot have subtasks."
                           (not type)
                           (not (equal heading ejira-description-heading-name))
                           (not (equal heading ejira-comments-heading-name)))
-                  (push (list :marker (point-marker)
-                              :title  (ejira--jira-summary)
-                              :state  (substring-no-properties (or todo-state ""))
-                              :body   (ejira--new-issue-description))
-                        children))))))))
+                 (push (list :marker (point-marker)
+                             :title  (ejira--jira-summary)
+                             :state  (substring-no-properties (or todo-state ""))
+                             :body   (ejira--new-issue-description))
+                       children))))))))
     (nreverse children)))
 
 (defun ejira--push-create-cascaded-subtask (parent-key project-key child todo-keywords assign-self)
@@ -157,7 +157,7 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
   (org-with-point-at marker (ejira--update-push-baseline))
   (let ((ejira--pushing t))
     (with-current-buffer (marker-buffer marker)
-      (when (buffer-modified-p) (save-buffer)))))
+      (ejira--save-buffer-safe))))
 
 (defun ejira--buffer-has-pushable-p ()
   "Return non-nil if the current buffer contains any ejira-managed heading."
@@ -397,10 +397,19 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  (item (cl-find-if (lambda (i)
                                      (equal (ejira--alist-get i 'key) key))
                                    remote-items))
-                  (local-summary (org-with-point-at marker (ejira--jira-summary)))
-                  (local-desc-org (or (org-with-point-at marker
-                                        (ejira--jira-description))
-                                      ""))
+                 (local-summary (org-with-point-at marker (ejira--jira-summary)))
+                 (local-desc-org (or (org-with-point-at marker
+                                       (ejira--jira-description))
+                                     ""))
+                 ;; Outline level of the heading holding the Jira-facing
+                 ;; description.  Exporting relative to it keeps the original
+                 ;; h1/h2/... levels when an edited description is pushed back.
+                 (desc-level (org-with-point-at marker
+                               (when-let ((d (ejira--find-child-heading
+                                              (if (ejira--jira-projection-p)
+                                                  ejira-jira-description-heading-name
+                                                ejira-description-heading-name))))
+                                 (ejira--heading-body-level d))))
                  (local-assignee (or (org-entry-get marker "Assignee") ""))
                  (priority-scheme (when item (ejira--get-priority-scheme key)))
                  (local-priority-entry
@@ -410,10 +419,10 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  (local-deadline (when-let ((d (org-get-deadline-time marker)))
                                    (format-time-string "%Y-%m-%d" d)))
                  (remote-summary (when item (ejira--alist-get item 'fields 'summary)))
-                  (remote-desc-org (when item
-                                     (ejira--expected-jira-description
-                                      marker
-                                      (ejira--alist-get item 'fields 'description))) )
+                 (remote-desc-org (when item
+                                    (ejira--expected-jira-description
+                                     marker
+                                     (ejira--alist-get item 'fields 'description))) )
                  (remote-assignee (or (when item
                                         (ejira--alist-get item 'fields 'assignee 'displayName))
                                       ""))
@@ -471,6 +480,7 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                             :send (let ((key key) (marker marker)
                                         (local-summary local-summary)
                                         (local-desc-org local-desc-org)
+                                        (desc-level desc-level)
                                         (local-assignee local-assignee)
                                         (local-priority-id local-priority-id)
                                         (local-deadline local-deadline)
@@ -486,7 +496,8 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                       (when (or summary-changed desc-changed)
                                         (jiralib2-update-summary-description
                                          key local-summary
-                                         (ejira-parser-org-to-jira local-desc-org)))
+                                         (ejira-parser-org-to-jira local-desc-org
+                                                                   desc-level)))
                                       (when assignee-changed
                                         (let* ((users (ejira--get-assignable-users key))
                                                (username (car (rassoc local-assignee users))))
@@ -520,6 +531,10 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  (remote-body (when comment-data (ejira--alist-get comment-data 'body)))
                  (remote-org (when comment-data
                                (ejira--expected-org-body marker remote-body)))
+                 ;; Comment bodies are imported relative to the comment
+                 ;; heading; export relative to the same level so edited
+                 ;; comments round-trip their heading levels.
+                 (comment-level (ejira--heading-body-level marker))
                  (local-body (ejira--get-heading-body marker))
                  (changes (ejira-confirm-field-changes
                            `(("body" ,(or remote-org "") ,local-body)))))
@@ -530,12 +545,14 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                :title (format "%s comment %s" issue-key commid)
                                :parent-issue issue-key
                                :changes changes
-                               :send (let ((issue-key issue-key) (commid commid) (marker marker)
+                               :send (let ((issue-key issue-key) (commid commid)
+                                           (marker marker)
+                                           (comment-level comment-level)
                                            (body local-body))
                                        (lambda ()
                                          (jiralib2-edit-comment
                                           issue-key commid
-                                          (ejira-parser-org-to-jira body))
+                                          (ejira-parser-org-to-jira body comment-level))
                                          (ejira--push-finalize marker))))))))
          ((and (eq op-type 'update) (eq object 'status))
           (let ((action-name (plist-get data :action-name)))
@@ -592,10 +609,10 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
          ((and (eq op-type 'create) (eq object 'subtask))
           (let* ((parent-key (plist-get data :parent-key))
                  (project-key (plist-get data :project-key))
-                  (heading-title (org-with-point-at marker (ejira--jira-summary)))
-                  (local-body (or (org-with-point-at marker
-                                    (ejira--new-issue-description))
-                                  ""))
+                 (heading-title (org-with-point-at marker (ejira--jira-summary)))
+                 (local-body (or (org-with-point-at marker
+                                   (ejira--new-issue-description))
+                                 ""))
                  (local-state (org-with-point-at marker
                                 (substring-no-properties (or (org-get-todo-state) ""))))
                  (fields `(("title" ,heading-title)
