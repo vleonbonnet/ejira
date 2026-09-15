@@ -419,6 +419,13 @@ local edits the issue is skipped and reported, so local work is never
 overwritten.  Baselines are refreshed from the repaired content, so a
 later push scan sees a clean issue.
 
+Headings whose trimmed content already matches the remote are still
+rewritten when their blank-line boundaries are not canonical: legacy
+bodies carry accumulated leading blanks (one was added on every pull
+by the old narrow-to-body) and a Comments child glued to the last
+paragraph.  The rewrite changes only whitespace around the content,
+so the push baseline stays valid and nothing is sent to Jira.
+
 Without APPLY (or a prefix argument when interactive) nothing is
 written; the report lists what would change.  Returns a plist with
 :repaired, :dirty, :unchanged and :missing keys.
@@ -458,7 +465,8 @@ thousands of issues, and remote-only issues have nothing to repair."
              (t
               (let ((current (or (ejira--jira-description m) ""))
                     (expected (or (ejira--expected-jira-description m markup) "")))
-                (if (equal (string-trim current) (string-trim expected))
+                (if (and (equal (string-trim current) (string-trim expected))
+                         (ejira--body-shape-canonical-p current))
                     (cl-incf unchanged)
                   (push key repaired)
                   (when apply-p

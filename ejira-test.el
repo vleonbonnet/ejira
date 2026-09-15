@@ -1413,5 +1413,45 @@ blank line, matching orgist and gdocs-mode."
     (should (equal (buffer-string)
                    "* Code\n\n#+BEGIN_SRC text\nalpha\nbeta\n#+END_SRC\n\n**** Next\n\nbody."))))
 
+(ert-deftest ejira-narrow-to-body/leading-blanks-included ()
+  "The body region starts right after the heading line.
+`org-end-of-meta-data' skips blank lines; a rewrite that started
+there left the old leading blanks behind and accumulated one more
+blank on every pull.  `ejira--get-heading-body' strips one leading
+newline (the region's first line break), so the three blank lines
+of the fixture come back as two."
+  (ejira-test--with-org-buf
+      "** Issue\n:PROPERTIES:\n:ID: X-1\n:END:\n** Description\n\n\n\nStaging.\n"
+    (let ((d (progn (goto-char (point-min))
+                    (re-search-forward "^\\*\\* Description")
+                    (org-back-to-heading t)
+                    (point-marker))))
+      (should (equal "\n\nStaging.\n"
+                     (ejira--get-heading-body d))))))
+
+(ert-deftest ejira-set-heading-body/canonical-boundaries-idempotent ()
+  "A rewrite replaces the whole old body, blanks included, and is stable."
+  (ejira-test--with-org-buf
+      "** Description\n\n\n\nOld body.\n** Comments\n:PROPERTIES:\n:ID: X-2\n:END:\n"
+    (let ((d (progn (goto-char (point-min))
+                    (re-search-forward "^\\*\\* Description")
+                    (org-back-to-heading t)
+                    (point-marker))))
+      (ejira--set-heading-body d "New body.")
+      (should (equal (buffer-string)
+                     "** Description\n\nNew body.\n\n** Comments\n:PROPERTIES:\n:ID: X-2\n:END:\n"))
+      (ejira--set-heading-body d "New body.")
+      (should (equal (buffer-string)
+                     "** Description\n\nNew body.\n\n** Comments\n:PROPERTIES:\n:ID: X-2\n:END:\n")))))
+
+(ert-deftest ejira-body-shape/canonical-p ()
+  "Boundary shape: exactly one blank line each side; empty bodies pass."
+  (should (ejira--body-shape-canonical-p "\n\nBody.\n\n"))
+  (should-not (ejira--body-shape-canonical-p "\n\n\nBody.\n\n"))
+  (should-not (ejira--body-shape-canonical-p "\n\nBody.\n"))
+  (should-not (ejira--body-shape-canonical-p "\n\nBody.\n\n\n"))
+  (should (ejira--body-shape-canonical-p "\n"))
+  (should (ejira--body-shape-canonical-p "")))
+
 (provide 'ejira-test)
 ;;; ejira-test.el ends here

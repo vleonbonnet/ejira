@@ -943,15 +943,26 @@ a drawer or a deadline line and silently discard the body before it.
 The subtree end is computed with point still on HEADING.  With
 `org-end-of-meta-data' called first, a body consisting only of blank
 lines would leave point on the *next* heading, and the subtree end
-would then be that heading's end -- deleting a sibling."
+would then be that heading's end -- deleting a sibling.
+
+`org-end-of-meta-data' also skips blank lines; the region starts at
+the first line after the metadata instead, so a body rewrite
+replaces the old leading blanks instead of leaving them behind to
+accumulate one more on every pull."
   `(org-with-point-at ,heading
      (ejira--with-expand-all
        (goto-char ,heading)
        (org-back-to-heading t)
        (let ((end (save-excursion
                     (org-end-of-subtree t t)
-                    (point))))
+                    (point)))
+             (limit (line-beginning-position 2)))
          (org-end-of-meta-data t)
+         (while (and (> (point) limit)
+                     (save-excursion
+                       (forward-line -1)
+                       (looking-at-p "^[ \t]*$")))
+           (forward-line -1))
          (narrow-to-region (min (point) end) end))
        ,@body)))
 (function-put #'ejira--with-narrow-to-body 'lisp-indent-function 'defun)
@@ -1043,6 +1054,20 @@ body.  Normalized so the fingerprint ignores cosmetic whitespace changes."
               (ejira--push-normalize
                (or (org-get-todo-state) "")))))))
 
+(defun ejira--body-shape-canonical-p (raw)
+  "Return non-nil when RAW body has canonical blank-line boundaries.
+Canonical means exactly one blank line between the heading's
+metadata and the first content line, and exactly one between the
+last content line and the next heading.  Trimmed-empty bodies are
+canonical whatever their raw shape: `ejira--set-heading-body' writes
+them to a single blank line and the content comparison cannot see
+the difference."
+  (or (string-empty-p (string-trim raw))
+      (and (string-prefix-p "\n\n" raw)
+           (not (string-prefix-p "\n\n\n" raw))
+           (string-suffix-p "\n\n" raw)
+           (not (string-suffix-p "\n\n\n" raw)))))
+
 (defun ejira--update-push-baseline ()
   "Store the :Pushhash: property fingerprinting the heading at point.
 A later save whose content hashes differently is treated as a local edit."
@@ -1086,8 +1111,12 @@ is established on the next sync or push, never during a plain save."
     (when (> (point-max) (point-min))
       (delete-region (point-min) (point-max)))
     (if (and contents (> (length contents) 0))
-        ;; One blank line before and after body text.
-        (insert (concat "\n\n" contents "\n"))
+        ;; One blank line before and after body text: the narrow
+        ;; starts right after the heading's own newline, so one
+        ;; leading newline is the blank line, and the trailing two
+        ;; keep the next heading (the Comments child, say) from
+        ;; gluing to the last paragraph.
+        (insert (concat "\n" contents "\n\n"))
       ;; No body: one blank line between drawer and next heading.
       (insert "\n"))))
 
