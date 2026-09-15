@@ -1154,7 +1154,7 @@ A regression dropped every LF before parsing, collapsing whole
 descriptions into one line that no later rule could recognize."
   ;; No shift level: h2 maps to two stars, preserving the relative
   ;; hierarchy, and every later line stays recognizable markup.
-  (should (equal "** Outcome\nText\n\n** Done\n- First\n- Second"
+  (should (equal "** Outcome\n\nText\n\n** Done\n\n- First\n- Second"
                  (ejira-test--parse "h2. Outcome\nText\n\nh2. Done\n* First\n* Second"))))
 
 (ert-deftest ejira-parser/preserves-backslashes-and-percent ()
@@ -1191,7 +1191,7 @@ Org reads | -1| rows as horizontal rules and discards them."
   ;; ...and a blank line does not split it either.
   (should (equal "1. A\n\n2. B" (ejira-test--parse "# A\n\n# B")))
   ;; A new top-level construct does.
-  (should (equal "1. A\n** X\n1. B"
+  (should (equal "1. A\n\n** X\n\n1. B"
                  (ejira-test--parse "# A\nh2. X\n# B"))))
 
 (ert-deftest ejira-parser/seven-level-ordered-list ()
@@ -1284,7 +1284,7 @@ line indent; emitting it would make every saved body compare modified."
   "JIRA's hard-wrapped prose becomes long Org lines.
 A prose guard rejects wrapped paragraphs on commit, and ox-jira
 flattens them on export anyway, so the joined form is canonical."
-  (should (equal "** Outcome\nA sentence that was wrapped across two Jira source lines."
+  (should (equal "** Outcome\n\nA sentence that was wrapped across two Jira source lines."
                  (string-trim (ejira-test--parse "h2. Outcome\nA sentence that was wrapped\nacross two Jira source lines."))))
   ;; An explicit hard break keeps its break.
   (should (equal "first \\\\\nsecond"
@@ -1296,7 +1296,7 @@ Without the offset the exporter renormalizes the body's own minimum
 heading level to h1 and the original levels are lost on push."
   (let* ((jira "h1. A\nText\nh2. B")
          (org (ejira-parser-jira-to-org jira 2)))
-    (should (equal (string-trim org) "*** A\nText\n**** B"))
+    (should (equal (string-trim org) "*** A\n\nText\n\n**** B"))
     (should (equal (string-trim (ejira-parser-org-to-jira org 2))
                    (string-trim jira)))
     ;; Without the offset the minimum level is renormalized to h1.
@@ -1308,7 +1308,7 @@ heading level to h1 and the original levels are lost on push."
 (ert-deftest ejira-parse-body/preserves-line-structure ()
   "LF and CRLF input both keep paragraphs, headings and links."
   (let* ((jira "h2. Outcome\nSelected engineers.\n\nOwner: Val.\n\nh2. Done\n* First\n\n[Plan|https://example.com/plan]\n")
-         (expected "**** Outcome\nSelected engineers.\n\nOwner: Val.\n\n**** Done\n- First\n\n[[https://example.com/plan][Plan]]"))
+         (expected "**** Outcome\n\nSelected engineers.\n\nOwner: Val.\n\n**** Done\n\n- First\n\n[[https://example.com/plan][Plan]]"))
     (dolist (input (list jira (replace-regexp-in-string "\n" "\r\n" jira)))
       (should (equal expected (ejira--parse-body input 2))))))
 
@@ -1380,6 +1380,38 @@ one long paragraph, and later pulls saw an empty description."
           (should (= (1+ level) (org-current-level)))
           (should (equal "Outcome" (org-get-heading t t t t))))
         (should (string-suffix-p "Keep me.\n" (buffer-string)))))))
+
+(ert-deftest ejira-parser/heading-spacing-canonical ()
+  "Converted headings are separated from surrounding content.
+JIRA glues `h2.' to its paragraph; the stored Org body keeps one
+blank line, matching orgist and gdocs-mode."
+  (should (equal "**** Outcome\n\nParagraph.\n\n**** Next\n\nOther."
+                 (ejira-parser-jira-to-org "h2. Outcome\nParagraph.\n\nh2. Next\nOther." 2)))
+  (should (equal "Paragraph.\n\n** Next"
+                 (ejira-parser-jira-to-org "Paragraph.\nh2. Next"))))
+
+(ert-deftest ejira-parser/heading-spacing-idempotent ()
+  "Already-canonical bodies pass through unchanged."
+  (let ((canonical "**** Outcome\n\nParagraph.\n\n**** Next\n\nOther."))
+    (with-temp-buffer
+      (insert canonical)
+      (ejira-parser--normalize-heading-spacing)
+      (should (equal (buffer-string) canonical)))))
+
+(ert-deftest ejira-parser/heading-spacing-preserves-blank-runs ()
+  "Only missing blanks are inserted; intentional runs are kept."
+  (with-temp-buffer
+    (insert "**** H\n\n\n\nBody")
+    (ejira-parser--normalize-heading-spacing)
+    (should (equal (buffer-string) "**** H\n\n\n\nBody"))))
+
+(ert-deftest ejira-parser/heading-spacing-skips-blocks ()
+  "Blank lines are never inserted inside literal blocks."
+  (with-temp-buffer
+    (insert "* Code\n#+BEGIN_SRC text\nalpha\nbeta\n#+END_SRC\n**** Next\nbody.")
+    (ejira-parser--normalize-heading-spacing)
+    (should (equal (buffer-string)
+                   "* Code\n\n#+BEGIN_SRC text\nalpha\nbeta\n#+END_SRC\n\n**** Next\n\nbody."))))
 
 (provide 'ejira-test)
 ;;; ejira-test.el ends here

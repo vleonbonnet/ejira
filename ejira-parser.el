@@ -145,6 +145,42 @@ Lines ending with an explicit Org break (`\\\\') keep their break."
             (goto-char (car range))
             (insert joined)))))))
 
+(defun ejira-parser--normalize-heading-spacing ()
+  "Ensure one blank line before and after every Org heading line.
+JIRA glues `h2.' headings to their paragraphs; the canonical Org form
+shared with orgist and gdocs-mode separates headings from surrounding
+content with exactly one blank line.  Only missing blanks are
+inserted, so the pass is idempotent and never collapses intentional
+blank runs.  Block contents are skipped: generated code and example
+bodies are escaped or indented there and must keep their exact shape."
+  (goto-char (point-min))
+  (let ((block-depth 0)
+        prev-kind)
+    (while (not (eobp))
+      (let ((kind (cond
+                   ((looking-at "^[ \t]*#\\+BEGIN_") 'begin)
+                   ((looking-at "^[ \t]*#\\+END_") 'end)
+                   ((> block-depth 0) 'block)
+                   ((looking-at "^\\*+ ") 'heading)
+                   ((looking-at "^[ \t]*$") 'blank)
+                   (t 'content))))
+        ;; The line after a heading is separated by the same rule that
+        ;; separates a heading from preceding content.  Insert at point
+        ;; without saving it: point must stay on the current line, or
+        ;; forward-line skips the inserted blank and the loop never
+        ;; advances past consecutive headings.
+        (when (and (eq kind 'heading)
+                   (memq prev-kind '(content heading begin end)))
+          (insert "\n"))
+        (when (and (memq kind '(content begin end))
+                   (eq prev-kind 'heading))
+          (insert "\n"))
+        (pcase kind
+          ('begin (cl-incf block-depth))
+          ('end (cl-decf block-depth)))
+        (setq prev-kind kind))
+    (forward-line 1))))
+
 (defun ejira-parser--renumber-ordered-lists (token)
   "Renumber ordered-list placeholders containing TOKEN in the buffer.
 Each placeholder line looks like \"<indent><TOKEN>-<level> item\".
@@ -462,6 +498,7 @@ headings to the right by that amount."
               ;; placeholders are real again, so the `\\' hard-break check
               ;; sees actual breaks.
               (ejira-parser--unwrap-paragraphs)
+              (ejira-parser--normalize-heading-spacing)
               (buffer-string)))))
     (error
      (when ejira-parser-failure-function
