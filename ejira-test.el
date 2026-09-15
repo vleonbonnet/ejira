@@ -1201,6 +1201,16 @@ line indent; emitting it would make every saved body compare modified."
   "JIRA's four-dash rule becomes Org's five-dash rule."
   (should (equal "-----" (ejira-test--parse "----"))))
 
+(ert-deftest ejira-parser/unwraps-prose-paragraphs ()
+  "JIRA's hard-wrapped prose becomes long Org lines.
+A prose guard rejects wrapped paragraphs on commit, and ox-jira
+flattens them on export anyway, so the joined form is canonical."
+  (should (equal "** Outcome\nA sentence that was wrapped across two Jira source lines."
+                 (string-trim (ejira-test--parse "h2. Outcome\nA sentence that was wrapped\nacross two Jira source lines."))))
+  ;; An explicit hard break keeps its break.
+  (should (equal "first \\\\\nsecond"
+                 (string-trim (ejira-test--parse "first \\\\\nsecond")))))
+
 (ert-deftest ejira-parser/headings-roundtrip-at-offset ()
   "Body headings exported relative to their container keep h-levels.
 Without the offset the exporter renormalizes the body's own minimum

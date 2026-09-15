@@ -112,6 +112,39 @@ from the scan."
     (or (and before (memq (char-syntax before) '(?w ?_)))
         (and after (memq (char-syntax after) '(?w ?_))))))
 
+(defun ejira-parser--unwrap-paragraphs ()
+  "Join wrapped prose lines in the current buffer into single lines.
+
+JIRA hard-wraps prose at its UI width.  Org here prefers long lines,
+and a global prose guard rejects accidentally wrapped paragraphs on
+commit; `ox-jira' flattens a paragraph's internal newlines on export
+anyway, so joining them at import keeps both directions consistent.
+Lines ending with an explicit Org break (`\\\\') keep their break."
+  ;; Org refuses to parse with a foreign `tab-width'; the user's global
+  ;; setting (4) must not leak into the parse buffer.
+  (let ((tab-width 8)
+        (ranges nil))
+    (delay-mode-hooks (org-mode))
+    (org-element-map (org-element-parse-buffer) 'paragraph
+      (lambda (p)
+        (push (cons (org-element-property :begin p)
+                    (org-element-property :contents-end p))
+              ranges)))
+    (dolist (range (sort ranges (lambda (a b) (> (car a) (car b)))))
+      (save-excursion
+        (goto-char (car range))
+        (let* ((text (buffer-substring-no-properties (car range) (cdr range)))
+               (joined text))
+          ;; Replace only interior line breaks: never the region's own
+          ;; trailing newline, blank lines, or a line ending in the
+          ;; Org hard break `\\'.
+          (while (string-match "\\([^\\\\\n]\\)\n\\([^ \t\n]\\)" joined)
+            (setq joined (replace-match "\\1 \\2" t nil joined)))
+          (unless (equal joined text)
+            (delete-region (car range) (cdr range))
+            (goto-char (car range))
+            (insert joined)))))))
+
 (defun ejira-parser--renumber-ordered-lists (token)
   "Renumber ordered-list placeholders containing TOKEN in the buffer.
 Each placeholder line looks like \"<indent><TOKEN>-<level> item\".
@@ -415,13 +448,21 @@ headings to the right by that amount."
           ;; the exporter writes them for literal braces and brackets, and
           ;; JIRA uses them for the same purpose.  Return this value -- the
           ;; restoration must not be computed and then discarded.
-          (replace-regexp-in-string
-           percent-replacement "%"
-           (replace-regexp-in-string
-            "\\\\\\([][{}]\\)" "\\1"
-            (replace-regexp-in-string
-             backslash-replacement "\\\\"
-             (buffer-string))))))
+          (let ((restored
+                 (replace-regexp-in-string
+                  percent-replacement "%"
+                  (replace-regexp-in-string
+                   "\\\\\\([][{}]\\)" "\\1"
+                   (replace-regexp-in-string
+                    backslash-replacement "\\\\"
+                    (buffer-string))))))
+            (with-temp-buffer
+              (insert restored)
+              ;; Unwrap Jira's hard-wrapped prose only after the backslash
+              ;; placeholders are real again, so the `\\' hard-break check
+              ;; sees actual breaks.
+              (ejira-parser--unwrap-paragraphs)
+              (buffer-string)))))
     (error
      (when ejira-parser-failure-function
        (funcall ejira-parser-failure-function s))
