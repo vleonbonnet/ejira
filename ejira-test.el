@@ -12,6 +12,7 @@
 (require 'ejira-core)
 (require 'ejira-push)
 (require 'ejira-confirm)
+(require 'ejira)
 
 ;;; ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1718,6 +1719,171 @@ reviewed snapshot; later edits stay dirty."
                                       (setq reviewed (md5 (ejira--heading-reviewed-hash)))
                                       (ejira--push-finalize marker reviewed)
                                       (should-not (ejira--locally-modified-p)))))))
+
+;;; ── Automatic reconciliation (auto-sync) ─────────────────────────────────────
+
+(defun ejira-test--mock-item (summary status description)
+  "Build a Jira item alist like `jiralib2-jql-search' returns."
+  `((key . "TEST-1")
+    (fields . ((summary . ,summary)
+               (description . ,description)
+               (status . ((name . ,status)))))))
+
+(ert-deftest ejira-auto-sync/remote-identity-reflects-fields ()
+  "The identity changes when a synced field changes and otherwise not."
+  (let ((a (ejira-test--mock-item "Summary" "Open" "Body"))
+        (b (ejira-test--mock-item "Summary" "Open" "Body"))
+        (c (ejira-test--mock-item "Summary" "Done" "Body"))
+        (d (ejira-test--mock-item "Other summary" "Open" "Body")))
+    (should (equal (md5 (ejira--remote-fields-identity a))
+                   (md5 (ejira--remote-fields-identity b))))
+    (should-not (equal (md5 (ejira--remote-fields-identity a))
+                       (md5 (ejira--remote-fields-identity c))))
+    (should-not (equal (md5 (ejira--remote-fields-identity a))
+                       (md5 (ejira--remote-fields-identity d))))))
+
+(ert-deftest ejira-auto-sync/store-and-detect-remote-change ()
+  "A stored baseline detects remote changes; its absence means unknown."
+  (ejira-test--with-org-buf
+   "* TODO An issue\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n:END:\n"
+   (let ((old (ejira-test--mock-item "An issue" "Open" nil))
+         (new (ejira-test--mock-item "An issue" "Done" nil)))
+     ;; Unknown baseline: not reported as a change.
+     (should-not (ejira--remote-changed-p new))
+     (ejira--store-remote-baseline old)
+     (should (equal (org-entry-get nil "Remotehash")
+                    (md5 (ejira--remote-fields-identity old))))
+     (should-not (ejira--remote-changed-p old))
+     (should (ejira--remote-changed-p new)))))
+
+(ert-deftest ejira-auto-sync/buffer-issue-keys-all-depths ()
+  "Issue keys are collected at every depth, including terminal issues;
+projects and comments are excluded."
+  (ejira-test--with-org-buf
+   "* Project
+:PROPERTIES:
+:ID:       TEST
+:TYPE:     ejira-project
+:END:
+** TODO A
+:PROPERTIES:
+:ID:       TEST-1
+:END:
+*** Section
+**** DONE Deep
+:PROPERTIES:
+:ID:       TEST-2
+:END:
+** Comments
+*** [2026-09-17 Thu 10:00] c
+:PROPERTIES:
+:CommId:   1
+:TYPE:     ejira-comment
+:END:
+"
+   (should (equal '("TEST-1" "TEST-2") (ejira--buffer-issue-keys)))))
+
+(ert-deftest ejira-auto-sync/save-routes-to-queue ()
+  "Saving an auto-sync file schedules reconciliation instead of the
+confirmation buffer."
+  (ejira-test--with-project-dir ejira-test--project-content
+                                (let* ((file (expand-file-name "TEST.org" ejira-org-directory))
+                                       (ejira-auto-sync-files (list file))
+                                       (shown nil))
+                                  (with-current-buffer (find-file-noselect file t)
+                                    (cl-letf (((symbol-function 'ejira-confirm-show)
+                                               (lambda (plans) (setq shown plans))))
+                                      (ejira--push-on-save))
+                                    (should (member (file-truename file) ejira--auto-sync-queue))
+                                    (should-not shown)
+                                    (setq ejira--auto-sync-queue nil)))))
+
+(ert-deftest ejira-auto-sync/execute-holds-conflicts-and-comment-edits ()
+  "Remote-changed plans, comment edits and comment deletions are held;
+everything else executes.  Creation follows `ejira-auto-sync-create'."
+  ;; let*: the :send lambdas capture `sent', so `sent' must be bound
+  ;; before the plans are built.
+  (let* ((sent nil)
+         (plans (list
+                 (list :op 'update :object 'issue :title "conflicted"
+                       :remote-changed t :send (lambda () (push 'conflict sent)))
+                 (list :op 'update :object 'comment :title "comment edit"
+                       :send (lambda () (push 'comment-edit sent)))
+                 (list :op 'delete :object 'comment :title "comment delete"
+                       :send (lambda () (push 'comment-del sent)))
+                 (list :op 'create :object 'issue :title "new issue"
+                       :send (lambda () (push 'created sent)))
+                 (list :op 'update :object 'issue :title "plain update"
+                       :send (lambda () (push 'updated sent))))))
+    (let ((ejira-auto-sync-create t))
+      (ejira--auto-sync-execute "test.org" plans))
+    (should (equal sent '(updated created)))
+    (setq sent nil)
+    (let ((ejira-auto-sync-create nil))
+      (ejira--auto-sync-execute "test.org" plans))
+    (should (equal sent '(updated)))))
+
+(ert-deftest ejira-auto-sync/reconcile-classification ()
+  "One reconcile cycle: clean+remote-changed pulls, dirty+remote-changed
+holds as conflict, clean+unchanged does nothing."
+  ;; Start from a clean log so assertions only see this test's entries.
+  (when (get-buffer "*ejira sync log*")
+    (with-current-buffer "*ejira sync log*" (erase-buffer)))
+  (ejira-test--with-project-dir ejira-test--project-content
+                                (let* ((file (expand-file-name "TEST.org" ejira-org-directory))
+                                       (buf (find-file-noselect file t))
+                                       (old-item (ejira-test--mock-item "An issue" "Open" nil))
+                                       (new-item (ejira-test--mock-item "An issue" "Done" nil))
+                                       (pulled nil))
+                                  (with-current-buffer buf
+                                    ;; Baseline the issue against the OLD remote state so the new
+                                    ;; item registers as a remote change, then save: reconcile
+                                    ;; defers while the buffer has unsaved edits.
+                                    (goto-char (point-min))
+                                    (re-search-forward "^\\*\\* TODO An issue")
+                                    (ejira--store-remote-baseline old-item)
+                                    (save-buffer))
+                                  (cl-letf (((symbol-function 'ejira--auto-sync-fetch)
+                                             (lambda (_keys) (list new-item)))
+                                            ((symbol-function 'ejira--update-task)
+                                             (lambda (task) (setq pulled (ejira-task-key task))))
+                                            ((symbol-function 'ejira--issue-comments-dirty-p)
+                                             (lambda (_key) nil))
+                                            ((symbol-function 'ejira--push-scan-buffer)
+                                             (lambda (_buf) nil)))
+                                    ;; Clean heading + remote change → pulled and re-baselined.
+                                    (ejira--auto-sync-reconcile file)
+                                    (should (equal "TEST-1" pulled))
+                                    (with-current-buffer buf
+                                      (goto-char (point-min))
+                                      (re-search-forward "^\\*\\* TODO An issue")
+                                      (should (equal (org-entry-get nil "Remotehash")
+                                                     (md5 (ejira--remote-fields-identity new-item)))))
+                                    ;; Dirty heading + remote change → held as conflict.  Reset the
+                                    ;; remote baseline to the old state, because the first cycle
+                                    ;; legitimately re-baselined it to the new item.
+                                    (setq pulled nil)
+                                    (with-current-buffer buf
+                                      (goto-char (point-min))
+                                      (re-search-forward "^\\*\\* TODO An issue")
+                                      (ejira--migrate-push-baseline)
+                                      (ejira--store-remote-baseline old-item)
+                                      (beginning-of-line)
+                                      (org-with-point-at (point-marker)
+                                        (replace-regexp "TODO An issue" "TODO An issue edited" nil
+                                                        (point) (line-end-position)))
+                                      (save-buffer))
+                                    (ejira--auto-sync-reconcile file)
+                                    (should-not pulled)
+                                    (with-current-buffer "*ejira sync log*"
+                                      (should (string-match-p
+                                               "TEST-1: changed locally and remotely"
+                                               (buffer-substring (point-min) (point-max)))))
+                                    ;; The dirty heading keeps its state for the push flow.
+                                    (with-current-buffer buf
+                                      (goto-char (point-min))
+                                      (re-search-forward "^\\*\\* TODO An issue edited")
+                                      (should (ejira--locally-modified-p)))))))
 
 (provide 'ejira-test)
 ;;; ejira-test.el ends here

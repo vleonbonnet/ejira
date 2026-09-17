@@ -110,12 +110,12 @@ legacy layout until they are migrated."
   "Org property opting a file or heading into body-as-description mode.")
 
 (defconst ejira-state-hash-property "Statehash"
-  "Property hashing the state fields (todo state, assignee, status) of a v2 heading.
+  "Property hashing the state fields (todo state, assignee, status).
 
-v2 baselines are written by `ejira--update-push-baseline' next to a
-version-prefixed `Pushhash' covering only content fields (summary,
-description, priority identity, deadline).  The split lets a shallow
-pull acknowledge the state fields it actually fetched without also
+Written by `ejira--update-push-baseline' next to a version-prefixed
+`Pushhash' covering only content fields (summary, description,
+priority identity, deadline).  The split lets a shallow pull
+acknowledge the state fields it actually fetched without also
 acknowledging content edits it never pushed.")
 
 (defconst ejira-pushhash-v2-prefix "v2:"
@@ -1091,8 +1091,8 @@ and the reserved Comments container are never tasks."
 Point must be on the task heading.  The region ends before the first
 descendant heading that is itself a task or the reserved Comments
 container, or at the end of the task's subtree.  Content after such a
-boundary (for example prose following a nested task's subtree inside a
-section) is not part of the owned region and stays local-only."
+boundary, for example prose following a nested task's subtree inside a
+section, is not part of the owned region and stays local-only."
   (save-excursion
     (org-back-to-heading t)
     (let* ((level (org-current-level))
@@ -1315,6 +1315,78 @@ the heading dirty instead of being acknowledged without being sent."
               "\0"
               (ejira--heading-state-fields))
     (ejira--heading-pushable-content)))
+
+(defconst ejira-remote-hash-property "Remotehash"
+  "Property hashing the remote field values at the last acknowledgment.
+
+The remote baseline enables three-way reconciliation: the automatic
+sync compares a freshly fetched issue against this hash to tell
+\"remote changed since we last synchronized\" apart from \"only the
+local copy changed\".  Written by the auto-sync cycle after applying a
+pull, and by push finalization with the identity of the values that
+were just sent.  A missing hash means unknown, not unchanged.")
+
+(defconst ejira-remote-identity-unknown "?status-unknown?"
+  "Placeholder for the status component of a sent-fields identity when
+the push performed a state transition whose resulting status name is
+not known until the next fetch; the discrepancy self-heals on the next
+pull.")
+
+(defun ejira--remote-fields-identity (item)
+  "Return the canonical identity of remote issue ITEM's synced fields.
+ITEM is an issue alist as returned by `jiralib2-jql-search' or
+`jiralib2-get-issue'.  Push finalization computes the same identity
+from the values it sent, so drift (for example from server-side
+normalization) only registers as a remote change and self-heals on the
+next pull."
+  (concat (ejira--push-normalize (ejira--alist-get item 'fields 'summary))
+          "\0"
+          (ejira--push-normalize
+           (or (ejira--alist-get item 'fields 'description) ""))
+          "\0"
+          (ejira--push-normalize
+           (or (ejira--priority-id-string
+                (ejira--alist-get item 'fields 'priority 'id))
+               ""))
+          "\0"
+          (ejira--push-normalize
+           (or (ejira--alist-get item 'fields 'duedate) ""))
+          "\0"
+          (ejira--push-normalize
+           (or (ejira--alist-get item 'fields 'status 'name) ""))
+          "\0"
+          (ejira--push-normalize
+           (or (ejira--alist-get item 'fields 'assignee 'displayName) ""))))
+
+(defun ejira--store-remote-baseline (item)
+  "Store the :Remotehash: of remote issue ITEM on the heading at point."
+  (org-set-property
+   ejira-remote-hash-property
+   (md5 (ejira--remote-fields-identity item))))
+
+(defun ejira--remote-changed-p (item)
+  "Return non-nil when remote issue ITEM differs from its known baseline.
+A missing :Remotehash: means the baseline is unknown; that returns nil
+here, and callers distinguish it from a known change explicitly."
+  (let ((stored (org-entry-get nil ejira-remote-hash-property)))
+    (and stored
+         (not (equal stored
+                     (md5 (ejira--remote-fields-identity item)))))))
+
+(defun ejira--issue-comments-dirty-p (key)
+  "Return non-nil when issue KEY has locally modified comments.
+Such comments must not be overwritten by a comment rewrite during a
+full pull."
+  (ejira--with-point-on key
+    (when-let ((comments (ejira--find-child-heading
+                          ejira-comments-heading-name)))
+      (org-with-point-at comments
+        (org-map-entries
+         (lambda ()
+           (when (and (org-entry-get (point-marker) "CommId")
+                      (ejira--locally-modified-p))
+             (point)))
+         nil 'tree)))))
 
 (defun ejira--normalize-end-spacing ()
   "Ensure exactly one blank line after every :END: drawer closer in the current buffer."

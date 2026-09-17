@@ -20,6 +20,11 @@ Individual cells are mutable `(list t)' stored on each plan's
 (defvar ejira--pushing nil
   "Bound to t while a push batch is executing (inhibits re-scan on save).")
 
+;; Defined in ejira.el; loaded after this file.  Auto-sync files route
+;; their saves to the reconciliation queue instead of the review buffer.
+(defvar ejira-auto-sync-files)
+(declare-function ejira--auto-sync-enqueue "ejira.el" (file))
+
 (defvar ejira-state-resolution-alist
   '((5 . "Done")
     (6 . "Won't Fix"))
@@ -157,19 +162,23 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
   (let ((parts (delq nil parts)))
     (when parts (string-join parts "\n"))))
 
-(defun ejira--push-finalize (marker &optional reviewed-hash)
+(defun ejira--push-finalize (marker &optional reviewed-hash remote-identity)
   "Refresh MARKER's push baseline after a successful push and save its buffer.
 
 With REVIEWED-HASH, re-baseline only when the heading still matches the
 state that was reviewed and sent; content edited while the confirmation
 was open was never sent, and keeps the heading dirty so the next save
-re-reviews it."
+re-reviews it.  With REMOTE-IDENTITY, also record the acknowledged
+remote field state for three-way reconciliation."
   (org-with-point-at marker
     (if (and reviewed-hash
              (not (equal reviewed-hash
                          (md5 (ejira--heading-reviewed-hash)))))
         (message "ejira: %s changed since review; keeping it dirty"
                  (or (org-entry-get nil "ID") "<heading>"))
+      (when remote-identity
+        (org-set-property ejira-remote-hash-property
+                          (md5 remote-identity)))
       (ejira--update-push-baseline)))
   (let ((ejira--pushing t))
     (with-current-buffer (marker-buffer marker)
@@ -495,7 +504,43 @@ re-reviews it."
                  ;; made while the confirmation was open were never sent and
                  ;; must stay dirty for the next save.
                  (reviewed-hash (org-with-point-at marker
-                                  (md5 (ejira--heading-reviewed-hash)))))
+                                  (md5 (ejira--heading-reviewed-hash))))
+                 ;; Whether the remote fields changed since their last
+                 ;; acknowledged state.  A missing baseline is unknown:
+                 ;; treated as changed for automatic pulls, but not as a
+                 ;; conflict.
+                 (remote-changed-p (org-with-point-at marker
+                                     (ejira--remote-changed-p item)))
+                 ;; Identity of the remote values as they will be after this
+                 ;; plan's send.  Stored as the remote baseline on success.
+                 (sent-identity
+                  (concat
+                   (ejira--push-normalize
+                    (if summary-changed local-summary
+                      (or remote-summary local-summary "")))
+                   "\0"
+                   (ejira--push-normalize
+                    (if (or summary-changed desc-changed)
+                        (ejira-parser-org-to-jira local-desc-org desc-level)
+                      (or (when item (ejira--alist-get item 'fields 'description))
+                          "")))
+                   "\0"
+                   (ejira--push-normalize
+                    (or (if (and priority-changed local-priority-id)
+                            local-priority-id remote-priority-id)
+                        ""))
+                   "\0"
+                   (ejira--push-normalize
+                    (or (if deadline-changed local-deadline remote-deadline)
+                        ""))
+                   "\0"
+                   (ejira--push-normalize
+                    (if state-changed ejira-remote-identity-unknown
+                      (or remote-status-name "")))
+                   "\0"
+                   (ejira--push-normalize
+                    (if assignee-changed local-assignee
+                      (or remote-assignee ""))))))
             (if changes
                 (push (list :op 'update
                             :object 'issue
@@ -503,6 +548,7 @@ re-reviews it."
                             :title key
                             :parent-issue key
                             :changes changes
+                            :remote-changed remote-changed-p
                             :payload (ejira--push-payload
                                       (when (or summary-changed desc-changed)
                                         (format "summary: %s\ndescription (Jira markup):\n%s"
@@ -527,6 +573,7 @@ re-reviews it."
                                         (local-state local-state)
                                         (todo-kws todo-kws)
                                         (reviewed-hash reviewed-hash)
+                                        (sent-identity sent-identity)
                                         (summary-changed summary-changed)
                                         (desc-changed desc-changed)
                                         (assignee-changed assignee-changed)
@@ -551,11 +598,15 @@ re-reviews it."
                                          key `(duedate . ,(or local-deadline ""))))
                                       (when state-changed
                                         (ejira--transition-to-org-state key local-state todo-kws))
-                                      (ejira--push-finalize marker reviewed-hash))))
+                                      (ejira--push-finalize marker reviewed-hash
+                                                            sent-identity))))
                       plans)
-              ;; No changes vs remote — re-baseline to clear the dirty hash.
+              ;; No changes vs remote — re-baseline to clear the dirty hash
+              ;; and record the remote fields as the new acknowledged state.
               (when item
-                (org-with-point-at marker (ejira--migrate-push-baseline))))))))
+                (org-with-point-at marker
+                  (ejira--store-remote-baseline item)
+                  (ejira--migrate-push-baseline))))))))
     (dolist (op (nreverse other-ops))
       (let* ((op-type (plist-get op :op))
              (object (plist-get op :object))
@@ -884,12 +935,29 @@ operates on buffer text regardless of fold state."
           (ejira-confirm-show plans)
         (message "ejira: nothing to push at point")))))
 
+(defun ejira--auto-sync-file-p (&optional file)
+  "Return non-nil when FILE (default: current buffer's file) auto-syncs.
+Auto-sync files are reconciled by the coordinated pull-then-push cycle
+instead of the save-time confirmation buffer."
+  (and (or file (buffer-file-name))
+       (member (file-truename (or file (buffer-file-name)))
+               (mapcar #'file-truename ejira-auto-sync-files))))
+
 (defun ejira--push-on-save ()
-  "Offer to push locally-edited ejira items after saving a managed buffer."
+  "Offer to push locally-edited ejira items after saving a managed buffer.
+Files in `ejira-auto-sync-files' are handed to the automatic
+reconciliation queue instead."
   (when (and ejira-push-on-save
              (not ejira--pushing)
              (not ejira--syncing)
              (derived-mode-p 'org-mode)
+             (ejira--auto-sync-file-p))
+    (ejira--auto-sync-enqueue (buffer-file-name)))
+  (when (and ejira-push-on-save
+             (not ejira--pushing)
+             (not ejira--syncing)
+             (derived-mode-p 'org-mode)
+             (not (ejira--auto-sync-file-p))
              (ejira--buffer-has-pushable-p))
     (ejira--with-pre-scan (current-buffer)
       (let* ((ops   (ejira--push-scan-buffer (current-buffer)))

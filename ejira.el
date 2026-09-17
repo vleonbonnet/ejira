@@ -664,6 +664,239 @@ Added to `window-buffer-change-functions' by `ejira--start-auto-pull'."
     (setq ejira--auto-pull-timer nil))
   (remove-hook 'window-buffer-change-functions #'ejira--on-window-buffer-change))
 
+;;; Automatic reconciliation (auto-sync)
+
+(defcustom ejira-auto-sync-files nil
+  "Org files that reconcile automatically when saved or changed externally.
+A save of (or external change to) one of these files schedules a full
+reconciliation cycle: remote-only changes are pulled and applied,
+local-only changes are pushed without confirmation, and issues changed
+on both sides since their last acknowledgment are held out of the cycle
+and reported in the `*ejira sync log*' buffer.  Files not listed keep
+the save-time push-review behavior.  List canonical paths only: git
+worktrees must not independently publish their own copy of a managed
+file."
+  :group 'ejira
+  :type '(repeat file))
+
+(defcustom ejira-auto-sync-create t
+  "Whether the automatic sync creates Jira issues for new local TODOs.
+When nil, issue/subtask/epic creation plans are held for the normal
+save-time review; updates to existing issues, comment drafts and
+pending transitions still push automatically."
+  :group 'ejira
+  :type 'boolean)
+
+(defcustom ejira-auto-sync-interval 3
+  "Idle seconds between automatic reconciliation queue processing."
+  :group 'ejira
+  :type 'integer)
+
+(defvar ejira--auto-sync-queue nil
+  "Files awaiting an automatic reconciliation cycle, newest last.")
+(defvar ejira--auto-sync-timer nil)
+(defvar ejira--auto-sync-mtimes (make-hash-table :test 'equal)
+  "Last seen modification times of `ejira-auto-sync-files'.")
+
+(defun ejira--auto-sync-enqueue (file)
+  "Schedule FILE for an automatic reconciliation cycle."
+  (when (ejira--auto-sync-file-p file)
+    (cl-pushnew (file-truename file) ejira--auto-sync-queue
+                :test #'equal)))
+
+(defun ejira--buffer-issue-keys ()
+  "Return the issue keys of all ejira-managed headings in the buffer.
+Unlike `ejira--local-todo-keys' this covers every outline depth and
+also terminal issues (DONE/CANCELED), which can still carry local
+pushes; project headings and comments are excluded."
+  (let (keys)
+    (org-with-wide-buffer
+     (goto-char (point-min))
+     (while (re-search-forward org-heading-regexp nil t)
+       (let ((id (org-entry-get nil "ID")))
+         (when (and id
+                    (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" id)
+                    (not (equal (org-entry-get nil "TYPE") "ejira-comment")))
+           (push id keys)))))
+    (nreverse (delete-dups keys))))
+
+(defun ejira--auto-sync-fetch (keys)
+  "Fetch issues KEYS from Jira in batches, as item alists."
+  (let (items)
+    (while keys
+      (let ((batch (seq-take keys 50)))
+        (setq keys (seq-drop keys 50))
+        (setq items
+              (append items
+                      (apply #'jiralib2-jql-search
+                             (format "key in (%s)" (s-join ", " batch))
+                             (ejira--get-fields-to-sync nil))))))
+    items))
+
+(defun ejira--auto-sync-log (file lines)
+  "Append LINES for FILE to the `*ejira sync log*' buffer.
+The log buffer is never displayed automatically."
+  (when lines
+    (with-current-buffer (get-buffer-create "*ejira sync log*")
+      (goto-char (point-max))
+      (insert (format-time-string "[%Y-%m-%d %H:%M:%S] ") file "\n")
+      (dolist (l lines)
+        (insert "  " l "\n")))))
+
+(defun ejira--auto-sync-execute (file plans)
+  "Execute conflict-free PLANs for FILE without confirmation.
+Comment edits/deletions and plans whose remote changed since the last
+acknowledgment are held for the normal review flow."
+  (dolist (plan plans)
+    (let* ((op (plist-get plan :op))
+           (object (plist-get plan :object))
+           (send (plist-get plan :send))
+           (title (plist-get plan :title)))
+      (cond
+       ((plist-get plan :remote-changed)
+        (ejira--auto-sync-log
+         file (list (format "%s: changed remotely since last sync; held for review" title))))
+       ((and (eq op 'update) (eq object 'comment))
+        (ejira--auto-sync-log
+         file (list (format "%s: comment edit held for review" title))))
+       ((and (eq op 'delete) (eq object 'comment))
+        (ejira--auto-sync-log
+         file (list (format "%s: comment deletion held for review" title))))
+       ((and (eq op 'create)
+             (not (eq object 'comment))
+             (not ejira-auto-sync-create))
+        (ejira--auto-sync-log
+         file (list (format "%s: creation held (ejira-auto-sync-create is nil)" title))))
+       (send
+        (condition-case err
+            (funcall send)
+          (error (ejira--auto-sync-log
+                  file
+                  (list (format "%s: push failed: %s"
+                                title (error-message-string err)))))))))))
+
+(defun ejira--auto-sync-reconcile (file)
+  "Run one pull-then-push reconciliation cycle for FILE."
+  (catch 'defer
+    (when (not (file-exists-p file))
+      (remhash file ejira--auto-sync-mtimes)
+      (throw 'defer nil))
+    (let* ((buf (find-file-noselect file t))
+           (ejira--syncing t)
+           (ejira--pushing t)
+           (ejira--heading-cache (make-hash-table :test 'equal))
+           (pulls nil)
+           (conflicts nil))
+      (with-current-buffer buf
+        ;; Revert an unmodified buffer whose file changed externally; a
+        ;; buffer with unsaved edits is a moving target — wait for its
+        ;; next save instead of reconciling half-written work.
+        (if (buffer-modified-p)
+            (throw 'defer (ejira--auto-sync-enqueue file))
+          (unless (verify-visited-file-modtime buf)
+            (revert-buffer nil t t))))
+      (with-current-buffer buf
+        (org-with-wide-buffer
+         (let ((vis (org-fold-core-get-regions)))
+           (outline-show-all)
+           (unwind-protect
+               (progn
+                 ;; ── classify against the remote baselines ──
+                 (dolist (item (ejira--auto-sync-fetch
+                                (ejira--buffer-issue-keys)))
+                   (let* ((key (ejira--alist-get item 'key))
+                          (m (ejira--find-heading key))
+                          (stored (and m (org-with-point-at m
+                                           (org-entry-get nil
+                                                          ejira-remote-hash-property))))
+                          (remote-changed-p
+                           (and stored
+                                (not (equal stored
+                                            (md5 (ejira--remote-fields-identity
+                                                  item))))))
+                          (remote-unknown-p (and m (not stored)))
+                          (dirty (and m (org-with-point-at m
+                                          (ejira--locally-modified-p)))))
+                     (cond
+                      ((and dirty (not remote-changed-p))) ; push candidate
+                      ;; Remote-only change, or no baseline yet: a pull
+                      ;; applies the remote state and establishes the
+                      ;; baseline (a no-op fetch for unchanged issues).
+                      ((and (not dirty)
+                            (or remote-changed-p remote-unknown-p))
+                       (push item pulls))
+                      ((and remote-changed-p dirty)
+                       (push (format "%s: changed locally and remotely" key)
+                             conflicts)))))
+                 ;; ── pull remote-only changes ──
+                 (dolist (item (nreverse pulls))
+                   (let ((key (ejira--alist-get item 'key)))
+                     (if (ejira--issue-comments-dirty-p key)
+                         (push (format "%s: locally edited comments; pull deferred"
+                                       key)
+                               conflicts)
+                       (ejira--update-task (ejira--parse-item item))
+                       ;; The heading may have been refiled; re-find it.
+                       (when-let ((m (ejira--find-heading key)))
+                         (org-with-point-at m
+                           (ejira--store-remote-baseline item))))))
+                 ;; ── push local-only changes ──
+                 (let* ((ops (ejira--with-pre-scan buf
+                               (ejira--push-scan-buffer buf)))
+                        (plans (when ops (ejira--push-build-plans ops))))
+                   (when plans
+                     (ejira--auto-sync-execute file plans)))
+                 (when conflicts
+                   (setq conflicts (nreverse conflicts))
+                   (message "ejira auto-sync: %d issue(s) held back"
+                            (length conflicts))
+                   (ejira--auto-sync-log file conflicts))
+                 (ejira--save-buffer-safe))
+             (org-fold-core-regions vis :override t))))))))
+
+(defun ejira--auto-sync-worker ()
+  "Process queued and externally changed auto-sync files."
+  (when (and ejira-auto-sync-files
+             (not ejira--sync-in-progress)
+             (not (and (boundp 'ejira--pushing) ejira--pushing))
+             (not (and (boundp 'ejira--syncing) ejira--syncing)))
+    (let* ((queued (prog1 ejira--auto-sync-queue
+                     (setq ejira--auto-sync-queue nil)))
+           (files (delete-dups (append (reverse queued)
+                                       (mapcar #'file-truename
+                                               ejira-auto-sync-files)))))
+      (dolist (file files)
+        (let ((mtime (ignore-errors
+                       (file-attribute-modification-time
+                        (file-attributes file)))))
+          ;; Explicitly queued files always run (a deferred cycle is not
+          ;; behind an mtime change); the rest run when the file changed.
+          (when (or (member file queued)
+                    (and mtime
+                         (not (equal mtime
+                                     (gethash file ejira--auto-sync-mtimes)))))
+            (puthash file mtime ejira--auto-sync-mtimes)
+            (condition-case err
+                (ejira--auto-sync-reconcile file)
+              (error (message "ejira auto-sync: %s failed: %s"
+                              file (error-message-string err))))))))))
+
+(defun ejira--start-auto-sync ()
+  "Start the automatic reconciliation timer for `ejira-auto-sync-files'."
+  (when (and ejira-auto-sync-files (not ejira--auto-sync-timer))
+    (setq ejira--auto-sync-timer
+          (run-with-idle-timer ejira-auto-sync-interval
+                               ejira-auto-sync-interval
+                               #'ejira--auto-sync-worker))
+    (message "ejira: auto-sync enabled for %d file(s)"
+             (length ejira-auto-sync-files))))
+
+(defun ejira--stop-auto-sync ()
+  "Tear down the automatic reconciliation timer."
+  (when ejira--auto-sync-timer
+    (cancel-timer ejira--auto-sync-timer)
+    (setq ejira--auto-sync-timer nil)))
+
 
 ;;;###autoload
 (defun ejira-set-deadline (arg &optional time)
