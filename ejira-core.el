@@ -1018,6 +1018,21 @@ If LEVEL is given, shift all heading by it."
   (ejira--with-point-on key
     (nth 1 (ejira-get-id-under-point "ejira-project"))))
 
+(defun ejira--true-subtree-end ()
+  "Return the buffer position where the current heading's subtree ends.
+Computed by walking: the next heading at the same or a shallower level.
+Do not rely on `org-end-of-subtree' with a second argument: recent org
+versions changed that argument's meaning from \"to-the-end\" to
+\"to-the-next-heading\", which silently changes every region built on
+it."
+  (save-excursion
+    (let ((level (org-current-level)))
+      (catch 'done
+        (while (outline-next-heading)
+          (when (<= (org-current-level) level)
+            (throw 'done (line-beginning-position))))
+        (point-max)))))
+
 (defmacro ejira--with-narrow-to-body (heading &rest body)
   "Execute BODY while the buffer is narrowed to the content under HEADING.
 
@@ -1040,8 +1055,7 @@ accumulate one more on every pull."
        (goto-char ,heading)
        (org-back-to-heading t)
        (let ((end (save-excursion
-                    (org-end-of-subtree t t)
-                    (point)))
+                    (ejira--true-subtree-end)))
              (limit (line-beginning-position 2)))
          (org-end-of-meta-data t)
          (while (and (> (point) limit)
@@ -1076,7 +1090,7 @@ accumulate one more on every pull."
                     (goto-char heading)
                     (if (org-goto-first-child)
                         (line-beginning-position)
-                      (org-end-of-subtree t t)))))
+                      (ejira--true-subtree-end)))))
          (cons begin end))))))
 
 (defun ejira--get-heading-own-body (&optional heading)
@@ -1116,21 +1130,22 @@ boundary, for example prose following a nested task's subtree inside a
 section, is not part of the owned region and stays local-only."
   (save-excursion
     (org-back-to-heading t)
-    (let* ((level (org-current-level))
-           (end (save-excursion (org-end-of-subtree t t) (point))))
-      (ejira--with-expand-all
-        (catch 'boundary
-          (save-excursion
-            (org-end-of-meta-data t)
-            (while (outline-next-heading)
-              (cond
-               ((>= (point) end) (throw 'boundary end))
-               ((<= (org-current-level) level) (throw 'boundary end))
-               ((or (ejira--task-heading-p)
-                    (equal (org-get-heading t t t t)
-                           ejira-comments-heading-name))
-                (throw 'boundary (line-beginning-position))))))
-          end)))))
+    (let ((level (org-current-level)))
+      (catch 'boundary
+        (save-excursion
+          (org-end-of-meta-data t)
+          (while (outline-next-heading)
+            (cond
+             ((<= (org-current-level) level)
+              (throw 'boundary (line-beginning-position)))
+             ((or (ejira--task-heading-p)
+                  (equal (org-get-heading t t t t)
+                         ejira-comments-heading-name))
+              (throw 'boundary (line-beginning-position)))))
+          ;; No boundary found: the owned region extends to the end of
+          ;; the task's subtree (never past it, or sibling sections would
+          ;; be swallowed).
+          (ejira--true-subtree-end))))))
 
 (defun ejira--task-description-region ()
   "Return (BEGIN . END) of the description-owned region of the task at point.
@@ -1596,12 +1611,14 @@ returns the existing one instead.  Callers reach here after a failed
 
              (if parent
                  ;; Jump to end of parent's subtree and insert one level deeper.
-                 ;; Using org-end-of-subtree avoids inserting between the parent
-                 ;; heading and its :PROPERTIES: drawer, which would displace the
-                 ;; drawer and break org-id lookup on the parent.
+                 ;; Walking to the true subtree end avoids inserting between the
+                 ;; parent heading and its :PROPERTIES: drawer, which would
+                 ;; displace the drawer and break org-id lookup on the parent
+                 ;; (and, with recent org, org-end-of-subtree's second argument
+                 ;; would insert before the parent's first child instead).
                  (progn
                    (goto-char (ejira--find-heading parent))
-                   (org-end-of-subtree t t)
+                   (ejira--true-subtree-end)
                    (org-insert-heading t)
                    (org-demote))
                ;; No parent: insert after the first line (startup keyword).
