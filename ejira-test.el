@@ -35,6 +35,12 @@
                                        (lambda (key) (car (split-string key "-")))))
                               (ejira--push-scan-buffer (current-buffer)))))
 
+(defun ejira-test--scan-current ()
+  "Return scan ops for the current buffer with `ejira--get-project' mocked."
+  (cl-letf (((symbol-function 'ejira--get-project)
+             (lambda (key) (car (split-string key "-")))))
+    (ejira--push-scan-buffer (current-buffer))))
+
 ;;; ── ejira-confirm helpers ─────────────────────────────────────────────────────
 
 (ert-deftest ejira-confirm--normalize/nil ()
@@ -640,25 +646,28 @@ Comment body.
   "New TEST subtasks explicitly receive the visible default priority."
   (let ((ejira-priority-policies ejira-test--priority-policies)
         (create-call nil))
-    (ejira-test--with-org-buf "* TODO New subtask\n\nCascaded body.\n"
+    (ejira-test--with-org-buf "* TODO New subtask\n"
                               (goto-char (point-min))
                               (re-search-forward org-heading-regexp)
                               (let ((child (list :marker (point-marker)
                                                  :title "New subtask"
                                                  :state "TODO"
-                                                 :body "")))
+                                                 ;; The body is prepared and
+                                                 ;; captured at scan time; the
+                                                 ;; cascade consumes it as-is.
+                                                 :body "Cascaded body.\n")))
                                 (cl-letf (((symbol-function 'jiralib2-create-issue)
                                            (lambda (project type summary description &rest args)
                                              (setq create-call
                                                    (list project type summary description args))
                                              '((key . "TEST-2"))))
+                                          ((symbol-function 'ejira--record-new-issue-key)
+                                           (lambda (&rest _args) nil))
                                           ((symbol-function 'ejira--finalize-new-issue)
                                            (lambda (&rest _args) nil)))
-                                  (ejira--push-create-cascaded-subtask
-                                   "TEST-1" "TEST" child nil nil)
+                                  (ejira--push-create-cascaded-child
+                                   "TEST-1" "Task" "TEST" child nil nil)
                                   (should (equal "Cascaded body.\n" (nth 3 create-call)))
-                                  (goto-char (point-min))
-                                  (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
                                   (should (equal "p1"
                                                  (cdr (assoc 'id
                                                              (cdr (assoc 'priority (nth 4 create-call))))))))))))
@@ -1826,7 +1835,7 @@ everything else executes.  Creation follows `ejira-auto-sync-create'."
 (ert-deftest ejira-auto-sync/reconcile-classification ()
   "One reconcile cycle: clean+remote-changed pulls, dirty+remote-changed
 holds as conflict, clean+unchanged does nothing."
-  ;; Start from a clean log so assertions only see this test's entries.
+  ;; Start from a clean log so assertions only see this test entries.
   (when (get-buffer "*ejira sync log*")
     (with-current-buffer "*ejira sync log*" (erase-buffer)))
   (ejira-test--with-project-dir ejira-test--project-content
@@ -1843,15 +1852,15 @@ holds as conflict, clean+unchanged does nothing."
                                     (re-search-forward "^\\*\\* TODO An issue")
                                     (ejira--store-remote-baseline old-item)
                                     (save-buffer))
-                                  (cl-letf (((symbol-function 'ejira--auto-sync-fetch)
+                                  (cl-letf (((symbol-function (quote ejira--auto-sync-fetch))
                                              (lambda (_keys) (list new-item)))
-                                            ((symbol-function 'ejira--update-task)
+                                            ((symbol-function (quote ejira--update-task))
                                              (lambda (task) (setq pulled (ejira-task-key task))))
-                                            ((symbol-function 'ejira--issue-comments-dirty-p)
+                                            ((symbol-function (quote ejira--issue-comments-dirty-p))
                                              (lambda (_key) nil))
-                                            ((symbol-function 'ejira--push-scan-buffer)
+                                            ((symbol-function (quote ejira--push-scan-buffer))
                                              (lambda (_buf) nil)))
-                                    ;; Clean heading + remote change → pulled and re-baselined.
+                                    ;; Clean heading + remote change: pulled and re-baselined.
                                     (ejira--auto-sync-reconcile file)
                                     (should (equal "TEST-1" pulled))
                                     (with-current-buffer buf
@@ -1859,7 +1868,7 @@ holds as conflict, clean+unchanged does nothing."
                                       (re-search-forward "^\\*\\* TODO An issue")
                                       (should (equal (org-entry-get nil "Remotehash")
                                                      (md5 (ejira--remote-fields-identity new-item)))))
-                                    ;; Dirty heading + remote change → held as conflict.  Reset the
+                                    ;; Dirty heading + remote change: held as conflict.  Reset the
                                     ;; remote baseline to the old state, because the first cycle
                                     ;; legitimately re-baselined it to the new item.
                                     (setq pulled nil)
@@ -1885,5 +1894,5 @@ holds as conflict, clean+unchanged does nothing."
                                       (re-search-forward "^\\*\\* TODO An issue edited")
                                       (should (ejira--locally-modified-p)))))))
 
-(provide 'ejira-test)
+(provide (quote ejira-test))
 ;;; ejira-test.el ends here

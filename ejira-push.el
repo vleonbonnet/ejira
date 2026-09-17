@@ -78,16 +78,53 @@ Signals an error if no matching transition is available or the API call fails."
                                   (fields . ((resolution . ((name . ,resolution-name))))))))
           (jiralib2-do-action key action-id))))))
 
+(defun ejira--nearest-task-ancestor ()
+  "Return (TYPE ID ISSUETYPE) of the nearest task ancestor of the heading at point.
+Plain (non-task) sections between a TODO and its task ancestor are
+skipped, so a TODO nested under a descriptive heading still belongs to
+the enclosing task's hierarchy.  Returns nil when there is no task or
+project ancestor."
+  (save-excursion
+    (catch 'result
+      (while (org-up-heading-safe)
+        (let ((type (org-entry-get nil "TYPE"))
+              (id (org-entry-get nil "ID")))
+          (cond
+           ((and id
+                 (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" id)
+                 (member type '("ejira-issue" "ejira-story"
+                                "ejira-subtask" "ejira-epic")))
+            (throw 'result (list type id (org-entry-get nil "Issuetype"))))
+           ((equal type "ejira-project")
+            (throw 'result (list type id nil)))))))))
+
+(defun ejira--record-new-issue-key (new-key marker)
+  "Record newly created Jira issue key NEW-KEY on MARKER's heading.
+
+The identity is written before any follow-up step (assignment,
+transition, cascade): when a later step fails, the heading must already
+look created, or a retry would duplicate the ticket.  A pre-existing
+non-key Org ID (a plain UUID) is preserved in `ORIG_ID' first, so
+existing org-id links stay recoverable."
+  (org-with-point-at marker
+    (when-let ((orig (org-entry-get nil "ID")))
+      (unless (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" orig)
+        (org-set-property "ORIG_ID" orig)))
+    (org-set-property "ID" new-key))
+  (when (buffer-file-name (marker-buffer marker))
+    (unless (hash-table-p org-id-locations)
+      (setq org-id-locations (make-hash-table :test 'equal)))
+    (puthash new-key
+             (abbreviate-file-name (buffer-file-name (marker-buffer marker)))
+             org-id-locations)))
+
 (defun ejira--finalize-new-issue (new-key marker orig-state todo-keywords)
   "Post-create housekeeping for a newly-created Jira issue NEW-KEY.
-Sets the org ID property, updates org-id-locations, tries to transition the Jira
-issue to ORIG-STATE before refreshing so the Pushhash is stamped with the final
-state.  If the transition is unavailable, force-sets the org state locally and
-leaves the heading dirty so the next save retries the state push."
-  (org-with-point-at marker (org-set-property "ID" new-key))
-  (puthash new-key
-           (abbreviate-file-name (buffer-file-name (marker-buffer marker)))
-           org-id-locations)
+Tries to transition the Jira issue to ORIG-STATE before refreshing so
+the push baseline is stamped with the final state.  If the transition
+is unavailable, force-sets the org state locally and leaves the heading
+dirty so the next save retries the state push.  The issue key itself
+must already be recorded (via `ejira--record-new-issue-key')."
   (condition-case err
       (ejira--transition-to-org-state new-key orig-state todo-keywords)
     (error (display-warning 'ejira (format "transition skipped for new issue %s: %s"
@@ -107,7 +144,10 @@ leaves the heading dirty so the next save retries the state push."
 (defun ejira--push-scan-issue-children (parent-marker project-key)
   "Return a list of child plists for the new issue heading at PARENT-MARKER.
 Each child plist has keys :marker :title :state :body.
-Only scans direct children (depth 1) — Jira subtasks cannot have subtasks."
+Only scans direct children (depth 1) — the native Jira hierarchy stops
+at subtasks, and deeper TODOs are reported as blocked instead.  The
+child bodies are prepared (moved into description position) here, at
+plan-build time, so the reviewed payload is exactly what creation sends."
   (ignore project-key)
   (let (children)
     (org-with-wide-buffer
@@ -122,35 +162,69 @@ Only scans direct children (depth 1) — Jira subtasks cannot have subtasks."
                     (heading    (org-get-heading t t t t)))
                (when (and todo-state
                           (not type)
+                          (not (org-in-commented-heading-p))
                           (not (equal heading ejira-description-heading-name))
                           (not (equal heading ejira-comments-heading-name)))
                  (push (list :marker (point-marker)
                              :title  (ejira--jira-summary)
                              :state  (substring-no-properties (or todo-state ""))
-                             :body   (ejira--new-issue-description))
+                             :body   (ejira--prepare-new-issue-description))
                        children))))))))
     (nreverse children)))
 
-(defun ejira--push-create-cascaded-subtask (parent-key project-key child todo-keywords assign-self)
-  "Create a Jira subtask for CHILD under PARENT-KEY in PROJECT-KEY.
-CHILD is a plist with :marker :title :state :body.
-TODO-KEYWORDS is the org-todo-keywords-1 list for state-transition lookup.
-ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
+(defun ejira--push-create-cascaded-child (parent-key parent-issuetype project-key child todo-keywords assign-self)
+  "Create CHILD under PARENT-KEY following the native hierarchy policy.
+PARENT-ISSUETYPE is the Jira issue type of PARENT-KEY; the child's type
+and relationship follow it: under an Initiative another Epic, under an
+Epic a Task/Story with an Epic Link, otherwise a Sub-task.  CHILD is a
+plist with :marker :title :state :body (the body already prepared at
+scan time).  TODO-KEYWORDS is the org-todo-keywords-1 list for
+state-transition lookup; ASSIGN-SELF is the value (t/nil) of the
+parent's assign-self cell."
   (let* ((child-marker (plist-get child :marker))
          (orig-state   (plist-get child :state))
          (summary      (plist-get child :title))
-         (description  (org-with-point-at child-marker
-                         (ejira--prepare-new-issue-description)))
-         (desc         (ejira-parser-org-to-jira description))
+         (description  (plist-get child :body))
+         (child-type
+          (cond
+           ((member parent-issuetype ejira-epic-parent-issuetypes)
+            ejira-epic-type-name)
+           ((equal parent-issuetype ejira-epic-type-name)
+            ejira-epic-child-type-name)
+           (t ejira-subtask-type-name)))
+         (extra-fields
+          (cond
+           ((member parent-issuetype ejira-epic-parent-issuetypes)
+            (unless ejira-parent-link-field
+              (display-warning
+               'ejira
+               (format "ejira-parent-link-field is nil — new Epic %s is not linked to Initiative %s"
+                       summary parent-key)
+               :warning))
+            (delq nil
+                  (list (when (and ejira-epic-summary-field)
+                          `(,ejira-epic-summary-field . ,summary))
+                        (when ejira-parent-link-field
+                          `(,ejira-parent-link-field . ,parent-key)))))
+           ((equal parent-issuetype ejira-epic-type-name)
+            (when ejira-epic-field
+              (list `(,ejira-epic-field . ,parent-key))))
+           (t nil)))
          (priority-id (ejira--default-priority-id project-key parent-key))
          (result (apply #'jiralib2-create-issue
-                        project-key ejira-subtask-type-name
-                        summary desc
+                        project-key child-type
+                        summary
+                        (ejira-parser-org-to-jira description)
                         (delq nil
-                              (list `(parent . ((key . ,parent-key)))
-                                    (when priority-id
-                                      `(priority . ((id . ,priority-id))))))))
+                              (append extra-fields
+                                      (list
+                                       (when (equal child-type
+                                                    ejira-subtask-type-name)
+                                         `(parent . ((key . ,parent-key))))
+                                       (when priority-id
+                                         `(priority . ((id . ,priority-id)))))))))
          (new-key (ejira--alist-get result 'key)))
+    (ejira--record-new-issue-key new-key child-marker)
     (when assign-self
       (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
         (when my-name
@@ -291,75 +365,99 @@ remote field state for three-way reconciliation."
                                :marker marker
                                :data (list :new-epic pending-epic))
                          ops))
-                 ;; Rule E/F: New heading without TYPE
+                 ;; Rule E/F: New heading without TYPE.  The parent is the
+                 ;; NEAREST task ancestor: plain sections between the TODO
+                 ;; and its task do not interrupt the hierarchy.
                  (when (and todo-state
                             (not type)
                             (not (equal heading-title ejira-description-heading-name))
                             (not (equal heading-title ejira-comments-heading-name)))
-                   (let* ((parent-info
-                           (save-excursion
-                             (when (org-up-heading-safe)
-                               (list (org-entry-get nil "TYPE")
-                                     (org-entry-get nil "ID")
-                                     (org-entry-get nil "Issuetype")))))
-                          (parent-type       (nth 0 parent-info))
-                          (parent-id         (nth 1 parent-info))
-                          (parent-issuetype  (nth 2 parent-info))
-                          (project-key       (when parent-id
-                                               (car (split-string parent-id "-")))))
-                     (cond
-                      ;; Under Initiative (or other epic-parent type) → create Epic
-                      ((and (equal parent-type "ejira-issue")
-                            (member parent-issuetype ejira-epic-parent-issuetypes))
-                       (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                   (cond
+                    ;; A previous creation attempt never completed: its
+                    ;; outcome is unknown (the request may have reached
+                    ;; Jira before the response was lost).  Never re-create
+                    ;; blindly; resolve by hand.
+                    ((org-entry-get nil "Creating")
+                     (push (list :op 'blocked
+                                 :marker marker
+                                 :title heading-title
+                                 :reason "previous creation attempt has unknown outcome; check Jira, then either set the heading's ID or remove the Creating property")
+                           ops))
+                    (t
+                     (let* ((parent-info (ejira--nearest-task-ancestor))
+                            (parent-type       (nth 0 parent-info))
+                            (parent-id         (nth 1 parent-info))
+                            (parent-issuetype  (nth 2 parent-info))
+                            (project-key       (when parent-id
+                                                 (car (split-string parent-id "-")))))
+                       (cond
+                        ((null parent-info)
+                         (push (list :op 'blocked
+                                     :marker marker
+                                     :title heading-title
+                                     :reason "no project or task ancestor; cannot determine the project")
+                               ops))
+                        ;; Native hierarchy only: a subtask cannot have
+                        ;; children, so the branch is blocked rather than
+                        ;; flattened or silently skipped.
+                        ((equal parent-type "ejira-subtask")
+                         (push (list :op 'blocked
+                                     :marker marker
+                                     :title heading-title
+                                     :reason (format "%s is a subtask and Jira subtasks cannot have children; restructure the outline" parent-id))
+                               ops))
+                        ;; Under Initiative (or other epic-parent type) → create Epic
+                        ((and (equal parent-type "ejira-issue")
+                              (member parent-issuetype ejira-epic-parent-issuetypes))
+                         (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                           (push (list :op 'create
+                                       :object 'issue
+                                       :key nil
+                                       :project project-key
+                                       :parent-issue parent-id
+                                       :marker marker
+                                       :data (list :project-key project-key
+                                                   :issue-type ejira-epic-type-name
+                                                   :parent-initiative parent-id
+                                                   :children children))
+                                 ops)))
+                        ;; Under Epic → create Task (or Story) with Epic Link
+                        ((equal parent-type "ejira-epic")
+                         (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                           (push (list :op 'create
+                                       :object 'issue
+                                       :key nil
+                                       :project project-key
+                                       :parent-issue parent-id
+                                       :marker marker
+                                       :data (list :project-key project-key
+                                                   :issue-type ejira-epic-child-type-name
+                                                   :parent-epic parent-id
+                                                   :children children))
+                                 ops)))
+                        ;; Under Issue/Story → create Sub-task (Jira parent link)
+                        ((member parent-type '("ejira-issue" "ejira-story"))
                          (push (list :op 'create
-                                     :object 'issue
+                                     :object 'subtask
                                      :key nil
                                      :project project-key
                                      :parent-issue parent-id
                                      :marker marker
-                                     :data (list :project-key project-key
-                                                 :issue-type ejira-epic-type-name
-                                                 :parent-initiative parent-id
-                                                 :children children))
-                               ops)))
-                      ;; Under Epic → create Task (or Story) with Epic Link
-                      ((equal parent-type "ejira-epic")
-                       (let ((children (ejira--push-scan-issue-children marker parent-id)))
-                         (push (list :op 'create
-                                     :object 'issue
-                                     :key nil
-                                     :project project-key
-                                     :parent-issue parent-id
-                                     :marker marker
-                                     :data (list :project-key project-key
-                                                 :issue-type ejira-epic-child-type-name
-                                                 :parent-epic parent-id
-                                                 :children children))
-                               ops)))
-                      ;; Under Issue/Story → create Sub-task (Jira parent link)
-                      ((member parent-type '("ejira-issue" "ejira-story"))
-                       (push (list :op 'create
-                                   :object 'subtask
-                                   :key nil
-                                   :project project-key
-                                   :parent-issue parent-id
-                                   :marker marker
-                                   :data (list :parent-key parent-id
-                                               :project-key project-key))
-                             ops))
-                      ;; Under Project → create issue (top-level)
-                      ((equal parent-type "ejira-project")
-                       (let ((children (ejira--push-scan-issue-children marker parent-id)))
-                         (push (list :op 'create
-                                     :object 'issue
-                                     :key nil
-                                     :project parent-id
-                                     :parent-issue nil
-                                     :marker marker
-                                     :data (list :project-key parent-id
-                                                 :children children))
-                               ops))))))
+                                     :data (list :parent-key parent-id
+                                                 :project-key project-key))
+                               ops))
+                        ;; Under Project → create issue (top-level)
+                        ((equal parent-type "ejira-project")
+                         (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                           (push (list :op 'create
+                                       :object 'issue
+                                       :key nil
+                                       :project parent-id
+                                       :parent-issue nil
+                                       :marker marker
+                                       :data (list :project-key parent-id
+                                                   :children children))
+                                 ops))))))))
                  ;; Rule G: New comment draft — heading directly under Comments,
                  ;; no CommId yet.  Catches manually-added plain headings and
                  ;; org-capture stubs (TYPE=ejira-comment, no CommId).
@@ -706,8 +804,11 @@ remote field state for three-way reconciliation."
           (let* ((parent-key (plist-get data :parent-key))
                  (project-key (plist-get data :project-key))
                  (heading-title (org-with-point-at marker (ejira--jira-summary)))
+                 ;; Prepare (and therefore capture) the description at
+                 ;; plan-build time: the reviewed payload must be exactly
+                 ;; what creation sends, not a re-read of later edits.
                  (local-body (or (org-with-point-at marker
-                                   (ejira--new-issue-description))
+                                   (ejira--prepare-new-issue-description))
                                  ""))
                  (local-state (org-with-point-at marker
                                 (substring-no-properties (or (org-get-todo-state) ""))))
@@ -733,28 +834,41 @@ remote field state for three-way reconciliation."
                                          (parent-key parent-key)
                                          (summary heading-title)
                                          (subtask-type ejira-subtask-type-name)
+                                         (description (ejira-parser-org-to-jira local-body))
                                          (orig-state local-state)
                                          (todo-kws (org-with-point-at marker
                                                      (when (boundp 'org-todo-keywords-1)
                                                        org-todo-keywords-1)))
                                          (assign-self (list ejira--assign-new-issues)))
                                      (lambda ()
-                                       (let* ((description
-                                               (org-with-point-at marker
-                                                 (ejira--prepare-new-issue-description)))
-                                              (desc (ejira-parser-org-to-jira description))
-                                              (priority-id
+                                       ;; Journal the attempt before the
+                                       ;; request: if Jira accepts it and the
+                                       ;; response is lost, the :Creating:
+                                       ;; property blocks a blind duplicate
+                                       ;; on the next save.
+                                       (org-with-point-at marker
+                                         (org-set-property "Creating"
+                                                           (format-time-string "%Y-%m-%d %H:%M:%S")))
+                                       (with-current-buffer (marker-buffer marker)
+                                         (ejira--save-buffer-safe))
+                                       (let* ((priority-id
                                                (ejira--default-priority-id
                                                 project-key parent-key))
                                               (result (apply #'jiralib2-create-issue
                                                              project-key subtask-type
-                                                             summary desc
+                                                             summary description
                                                              (delq nil
                                                                    (list
                                                                     `(parent . ((key . ,parent-key)))
                                                                     (when priority-id
                                                                       `(priority . ((id . ,priority-id))))))))
                                               (new-key (ejira--alist-get result 'key)))
+                                         ;; Identity first: a failure in any
+                                         ;; later step must not make the
+                                         ;; heading look uncreated.
+                                         (ejira--record-new-issue-key new-key marker)
+                                         (org-with-point-at marker
+                                           (org-delete-property "Creating"))
                                          (when (car assign-self)
                                            (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
                                              (when my-name
@@ -772,9 +886,13 @@ remote field state for three-way reconciliation."
                  (parent-issue     (or parent-epic parent-initiative
                                        (plist-get op :parent-issue)))
                  (heading-title (org-with-point-at marker (ejira--jira-summary)))
+                 ;; Prepare (and therefore capture) the description at
+                 ;; plan-build time: the reviewed payload must be exactly
+                 ;; what creation sends, not a re-read of later edits.
                  (local-body (or (org-with-point-at marker
-                                   (ejira--new-issue-description))
+                                   (ejira--prepare-new-issue-description))
                                  ""))
+                 (desc-markup (ejira-parser-org-to-jira local-body))
                  (local-state (org-with-point-at marker
                                 (substring-no-properties (or (org-get-todo-state) ""))))
                  (fields `(("title" ,heading-title)
@@ -797,16 +915,22 @@ remote field state for three-way reconciliation."
                                        (format "issue type: %s" issue-type)
                                        (when parent-epic (format "epic link: %s" parent-epic))
                                        (when parent-initiative
-                                         (format "parent initiative: %s" parent-initiative))
+                                         (format "parent initiative: %s%s"
+                                                 parent-initiative
+                                                 (if ejira-parent-link-field
+                                                     ""
+                                                   " (preview only — ejira-parent-link-field is nil)")))
                                        "description (Jira markup):"
-                                       (ejira-parser-org-to-jira local-body))
+                                       desc-markup)
                              :assign-self (list ejira--assign-new-issues)
                              :send (let ((marker marker) (project-key project-key)
                                          (orig-state local-state)
                                          (summary heading-title)
+                                         (desc-markup desc-markup)
                                          (children children)
                                          (issue-type issue-type)
                                          (parent-epic parent-epic)
+                                         (parent-initiative parent-initiative)
                                          (is-epic is-epic)
                                          (assign-self (list ejira--assign-new-issues))
                                          (epic-field ejira-epic-field)
@@ -815,11 +939,14 @@ remote field state for three-way reconciliation."
                                                      (when (boundp 'org-todo-keywords-1)
                                                        org-todo-keywords-1))))
                                      (lambda ()
-                                       (let* ((description
-                                               (org-with-point-at marker
-                                                 (ejira--prepare-new-issue-description)))
-                                              (desc (ejira-parser-org-to-jira description))
-                                              (epic-name-arg
+                                       ;; Journal the attempt before the
+                                       ;; request; see the subtask path.
+                                       (org-with-point-at marker
+                                         (org-set-property "Creating"
+                                                           (format-time-string "%Y-%m-%d %H:%M:%S")))
+                                       (with-current-buffer (marker-buffer marker)
+                                         (ejira--save-buffer-safe))
+                                       (let* ((epic-name-arg
                                                (when (and is-epic epic-summary-field)
                                                  `(,epic-summary-field . ,summary)))
                                               (priority-id
@@ -827,25 +954,35 @@ remote field state for three-way reconciliation."
                                                 project-key parent-issue))
                                               (result (apply #'jiralib2-create-issue
                                                              project-key issue-type
-                                                             summary desc
+                                                             summary desc-markup
                                                              (delq nil
                                                                    (list epic-name-arg
+                                                                         (when (and parent-epic epic-field)
+                                                                           `(,epic-field . ,parent-epic))
+                                                                         (when (and is-epic parent-initiative
+                                                                                    ejira-parent-link-field)
+                                                                           `(,ejira-parent-link-field . ,parent-initiative))
                                                                          (when priority-id
                                                                            `(priority . ((id . ,priority-id))))))))
                                               (new-key (ejira--alist-get result 'key)))
-                                         (when (and parent-epic epic-field)
-                                           (jiralib2-update-issue
-                                            new-key `(,epic-field . ,parent-epic)))
-                                         (when (and parent-epic (not epic-field))
+                                         (when (and is-epic parent-initiative
+                                                    (not ejira-parent-link-field))
                                            (display-warning
                                             'ejira
-                                            "ejira-epic-field is nil — run `ejira-guess-epic-sprint-fields' to auto-configure.  Epic Link not set for new issue."
+                                            (format "ejira-parent-link-field is nil — new Epic %s is not linked to Initiative %s"
+                                                    summary parent-initiative)
                                             :warning))
                                          (when (and is-epic (not epic-summary-field))
                                            (display-warning
                                             'ejira
                                             "ejira-epic-summary-field is nil — run `ejira-guess-epic-sprint-fields' to auto-configure.  Epic Name not set for new Epic."
                                             :warning))
+                                         ;; Identity first: a failure in any
+                                         ;; later step must not make the
+                                         ;; heading look uncreated.
+                                         (ejira--record-new-issue-key new-key marker)
+                                         (org-with-point-at marker
+                                           (org-delete-property "Creating"))
                                          (when (car assign-self)
                                            (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
                                              (when my-name
@@ -854,13 +991,13 @@ remote field state for three-way reconciliation."
                                           new-key marker orig-state todo-kws)
                                          (dolist (child children)
                                            (condition-case err
-                                               (ejira--push-create-cascaded-subtask
-                                                new-key project-key child todo-kws
+                                               (ejira--push-create-cascaded-child
+                                                new-key issue-type project-key child todo-kws
                                                 (car assign-self))
                                              (error
                                               (display-warning
                                                'ejira
-                                               (format "cascade subtask failed for %s: %s"
+                                               (format "cascade creation failed for %s: %s"
                                                        (plist-get child :title)
                                                        (error-message-string err))
                                                :error)))))))))))
@@ -962,6 +1099,11 @@ reconciliation queue instead."
     (ejira--with-pre-scan (current-buffer)
       (let* ((ops   (ejira--push-scan-buffer (current-buffer)))
              (plans (when ops (ejira--push-build-plans ops))))
+        (dolist (op ops)
+          (when (eq (plist-get op :op) 'blocked)
+            (message "ejira: %s — %s"
+                     (or (plist-get op :title) "<heading>")
+                     (plist-get op :reason))))
         (when plans
           (ejira-confirm-show plans))))))
 

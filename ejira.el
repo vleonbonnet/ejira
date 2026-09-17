@@ -843,7 +843,18 @@ acknowledgment are held for the normal review flow."
                  ;; ── push local-only changes ──
                  (let* ((ops (ejira--with-pre-scan buf
                                (ejira--push-scan-buffer buf)))
-                        (plans (when ops (ejira--push-build-plans ops))))
+                        (blocked (cl-remove-if-not
+                                  (lambda (op) (eq (plist-get op :op) 'blocked))
+                                  ops))
+                        (actions (cl-remove-if
+                                  (lambda (op) (eq (plist-get op :op) 'blocked))
+                                  ops))
+                        (plans (when actions (ejira--push-build-plans actions))))
+                   (dolist (b blocked)
+                     (push (format "%s: %s"
+                                   (plist-get b :title)
+                                   (plist-get b :reason))
+                           conflicts))
                    (when plans
                      (ejira--auto-sync-execute file plans)))
                  (when conflicts

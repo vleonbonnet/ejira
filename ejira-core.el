@@ -67,6 +67,16 @@ Defaults to \"Task\"; set to \"Story\" if your team prefers stories under epics.
   :group 'ejira
   :type 'string)
 
+(defcustom ejira-parent-link-field nil
+  "Jira field ID implementing the Initiative → Epic relationship.
+On Jira Data Center with Portfolio this is the \"Parent Link\" field
+(e.g. customfield_10008).  When set, new Epics created under an
+Initiative send the relationship inline at creation and pulls refile
+them under the initiative; when nil, the relationship is preview-only
+and creation emits a warning."
+  :group 'ejira
+  :type '(choice (const nil) symbol))
+
 (defcustom ejira-epic-parent-issuetypes '("Initiative")
   "Jira issue types under which new TODO headings create Epics rather than subtasks.
 Defaults to (\"Initiative\").  Add other top-level planning types (e.g. \"Goal\")
@@ -328,8 +338,19 @@ Set to nil to disable assigned-tag management entirely.")
                                            'remainingEstimateSeconds)
      :sprint (ejira-get-sprint-name (ejira--alist-get item 'fields
                                                       ejira-sprint-field))
-     :parent (when (equal type ejira-subtask-type-name)
-               (ejira--alist-get item 'fields 'parent 'key))
+     :parent (or (when (equal type ejira-subtask-type-name)
+                   (ejira--alist-get item 'fields 'parent 'key))
+                 ;; An Epic's parent Initiative arrives through the
+                 ;; Portfolio "Parent Link" field when configured.
+                 (when (and (equal type ejira-epic-type-name)
+                            ejira-parent-link-field)
+                   (let ((v (ejira--alist-get item 'fields
+                                              ejira-parent-link-field)))
+                     (cond
+                      ((and (stringp v)
+                            (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" v))
+                       v)
+                      ((consp v) (ejira--alist-get v 'key))))))
      :priority (ejira--alist-get item 'fields 'priority 'name)
      :priority-id (when-let ((id (ejira--alist-get item 'fields 'priority 'id)))
                     (format "%s" id))
@@ -1668,9 +1689,11 @@ runs first."
 A conflicting file is left unsaved so the user can reconcile the two
 versions; forcing the save would silently discard the external change.
 Every save in the sync path goes through here instead of overriding
-`verify-visited-file-modtime' globally."
+`verify-visited-file-modtime' globally.  Buffers without a file (test
+buffers, scratch) are left alone."
   (cond
    ((not (buffer-modified-p)) nil)
+   ((not (buffer-file-name)) nil)
    ((verify-visited-file-modtime (current-buffer)) (save-buffer))
    (t (message "ejira: %s changed on disk; leaving local edits unsaved"
                (buffer-file-name)))))
@@ -1840,9 +1863,14 @@ The actual Jira write happens via ejira-push on next save."
 With SHALLOW update only todo state."
   (if shallow
       `("key" "status" "assignee" "resolution")
-    `("key" "priority" "assignee" "issuetype" "project" "summary" "description"
-      "reporter" "duedate" "created" "updated" "status" "resolution" "parent" "timetracking"
-      "comment" ,(symbol-name ejira-epic-field) ,(symbol-name ejira-sprint-field))))
+    (append
+     '("key" "priority" "assignee" "issuetype" "project" "summary" "description"
+       "reporter" "duedate" "created" "updated" "status" "resolution" "parent" "timetracking"
+       "comment" ,(symbol-name ejira-epic-field) ,(symbol-name ejira-sprint-field))
+     ;; The Initiative → Epic parent link is only fetched when configured;
+     ;; requesting a nil field name would corrupt the JQL field list.
+     (when ejira-parent-link-field
+       (list (symbol-name ejira-parent-link-field))))))
 
 (defvar ejira--my-fullname nil)
 (defun ejira--my-fullname ()
