@@ -104,19 +104,38 @@ project ancestor."
 The identity is written before any follow-up step (assignment,
 transition, cascade): when a later step fails, the heading must already
 look created, or a retry would duplicate the ticket.  A pre-existing
-non-key Org ID (a plain UUID) is preserved in `ORIG_ID' first, so
-existing org-id links stay recoverable."
-  (org-with-point-at marker
-    (when-let ((orig (org-entry-get nil "ID")))
-      (unless (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" orig)
-        (org-set-property "ORIG_ID" orig)))
-    (org-set-property "ID" new-key))
-  (when (buffer-file-name (marker-buffer marker))
-    (unless (hash-table-p org-id-locations)
-      (setq org-id-locations (make-hash-table :test 'equal)))
-    (puthash new-key
-             (abbreviate-file-name (buffer-file-name (marker-buffer marker)))
-             org-id-locations)))
+non-key Org ID (a plain UUID) is preserved in `ORIG_ID' first, and
+`id:' links pointing at it are rewritten to the new key so existing Org
+links keep resolving."
+  (let (orig)
+    (org-with-point-at marker
+      (when-let ((old (org-entry-get nil "ID")))
+        (unless (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" old)
+          (org-set-property "ORIG_ID" old)
+          (setq orig old)))
+      (org-set-property "ID" new-key))
+    (when (buffer-file-name (marker-buffer marker))
+      (unless (hash-table-p org-id-locations)
+        (setq org-id-locations (make-hash-table :test 'equal)))
+      (puthash new-key
+               (abbreviate-file-name (buffer-file-name (marker-buffer marker)))
+               org-id-locations))
+    (when orig
+      ;; `id:' links pointing at the old UUID would silently stop
+      ;; resolving; rewrite them in the already-visited ejira buffers.
+      (dolist (buf (seq-filter #'buffer-live-p
+                               (delq nil
+                                     (cons (current-buffer)
+                                           (mapcar #'find-buffer-visiting
+                                                   (append (ejira--project-files)
+                                                           ejira-extra-scan-files))))))
+        (with-current-buffer buf
+          (org-with-wide-buffer
+           (save-excursion
+             (goto-char (point-min))
+             (while (re-search-forward
+                     (concat "\\[\\[id:" (regexp-quote orig) "\\]") nil t)
+               (replace-match (concat "[[id:" new-key) t t)))))))))
 
 (defun ejira--finalize-new-issue (new-key marker orig-state todo-keywords)
   "Post-create housekeeping for a newly-created Jira issue NEW-KEY.
@@ -141,36 +160,68 @@ must already be recorded (via `ejira--record-new-issue-key')."
         ;; dirty and the next save will push the state transition.
         (org-with-point-at m (org-todo orig-state))))))
 
+(defun ejira--finalize-new-issue-review-safe (new-key marker orig-state todo-kws
+                                                       reviewed-summary reviewed-body)
+  "Like `ejira--finalize-new-issue', then restore post-review local edits.
+
+The reviewed payload is what creation sent; edits made while the
+confirmation was open were never sent, and the finalize pull must not
+swallow them.  Restoring them locally leaves the finalize-stamped
+baseline mismatched, so the heading stays dirty for the next reviewed
+push."
+  (ejira--finalize-new-issue new-key marker orig-state todo-kws)
+  (let ((edited-summary (org-with-point-at marker (ejira--jira-summary)))
+        (edited-body (org-with-point-at marker
+                       (or (ejira--prepare-new-issue-description) ""))))
+    (when (not (equal (ejira--push-normalize edited-summary)
+                      (ejira--push-normalize reviewed-summary)))
+      (ejira--set-summary new-key edited-summary))
+    (when (not (equal (ejira--push-normalize edited-body)
+                      (ejira--push-normalize reviewed-body)))
+      (ejira--set-jira-description-jira-markup
+       new-key (ejira-parser-org-to-jira edited-body)))))
+
 (defun ejira--push-scan-issue-children (parent-marker project-key)
-  "Return a list of child plists for the new issue heading at PARENT-MARKER.
-Each child plist has keys :marker :title :state :body.
-Only scans direct children (depth 1) — the native Jira hierarchy stops
-at subtasks, and deeper TODOs are reported as blocked instead.  The
+  "Return (CHILDREN . BLOCKED-OPS) for the new issue heading at PARENT-MARKER.
+CHILDREN are direct-child plists (:marker :title :state :body) captured
+for cascade creation.  BLOCKED-OPS are ops for TODOs deeper than the
+direct children: the native Jira hierarchy has no place for them, so
+they are reported instead of being silently flattened or lost.  The
 child bodies are prepared (moved into description position) here, at
 plan-build time, so the reviewed payload is exactly what creation sends."
   (ignore project-key)
-  (let (children)
+  (let (children blocked)
     (org-with-wide-buffer
      (save-excursion
        (goto-char parent-marker)
        (let* ((parent-level (org-current-level))
               (end (save-excursion (org-end-of-subtree t) (point))))
          (while (and (outline-next-heading) (< (point) end))
-           (when (= (org-current-level) (1+ parent-level))
-             (let* ((type       (org-entry-get nil "TYPE"))
-                    (todo-state (org-get-todo-state))
-                    (heading    (org-get-heading t t t t)))
-               (when (and todo-state
+           (let* ((lvl (org-current-level))
+                  (type (org-entry-get nil "TYPE"))
+                  (todo-state (org-get-todo-state))
+                  (heading (org-get-heading t t t t)))
+             (if (= lvl (1+ parent-level))
+                 (when (and todo-state
+                            (not type)
+                            (not (org-in-commented-heading-p))
+                            (not (equal heading ejira-description-heading-name))
+                            (not (equal heading ejira-comments-heading-name)))
+                   (push (list :marker (point-marker)
+                               :title  (ejira--jira-summary)
+                               :state  (substring-no-properties (or todo-state ""))
+                               :body   (ejira--prepare-new-issue-description))
+                         children))
+               (when (and (> lvl (1+ parent-level))
+                          todo-state
                           (not type)
-                          (not (org-in-commented-heading-p))
-                          (not (equal heading ejira-description-heading-name))
-                          (not (equal heading ejira-comments-heading-name)))
-                 (push (list :marker (point-marker)
-                             :title  (ejira--jira-summary)
-                             :state  (substring-no-properties (or todo-state ""))
-                             :body   (ejira--prepare-new-issue-description))
-                       children))))))))
-    (nreverse children)))
+                          (not (org-in-commented-heading-p)))
+                 (push (list :op 'blocked
+                             :marker (point-marker)
+                             :title heading
+                             :reason "the Jira hierarchy cannot create below a new child issue; create it in Jira after the parent exists")
+                       blocked))))))))
+    (cons (nreverse children) (nreverse blocked))))
 
 (defun ejira--push-create-cascaded-child (parent-key parent-issuetype project-key child todo-keywords assign-self)
   "Create CHILD under PARENT-KEY following the native hierarchy policy.
@@ -211,20 +262,33 @@ parent's assign-self cell."
               (list `(,ejira-epic-field . ,parent-key))))
            (t nil)))
          (priority-id (ejira--default-priority-id project-key parent-key))
-         (result (apply #'jiralib2-create-issue
-                        project-key child-type
-                        summary
-                        (ejira-parser-org-to-jira description)
-                        (delq nil
-                              (append extra-fields
-                                      (list
-                                       (when (equal child-type
-                                                    ejira-subtask-type-name)
-                                         `(parent . ((key . ,parent-key))))
-                                       (when priority-id
-                                         `(priority . ((id . ,priority-id)))))))))
+         (result (progn
+                   ;; Journal the attempt before the request, mirroring
+                   ;; the standalone create path: a cascade child whose
+                   ;; request reaches Jira but whose response is lost
+                   ;; must look created, or the next save duplicates the
+                   ;; ticket.
+                   (org-with-point-at child-marker
+                     (org-set-property "Creating"
+                                       (format-time-string "%Y-%m-%d %H:%M:%S")))
+                   (with-current-buffer (marker-buffer child-marker)
+                     (ejira--save-buffer-safe))
+                   (apply #'jiralib2-create-issue
+                          project-key child-type
+                          summary
+                          (ejira-parser-org-to-jira description)
+                          (delq nil
+                                (append extra-fields
+                                        (list
+                                         (when (equal child-type
+                                                      ejira-subtask-type-name)
+                                           `(parent . ((key . ,parent-key))))
+                                         (when priority-id
+                                           `(priority . ((id . ,priority-id))))))))))
          (new-key (ejira--alist-get result 'key)))
     (ejira--record-new-issue-key new-key child-marker)
+    (org-with-point-at child-marker
+      (org-delete-property "Creating"))
     (when assign-self
       (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
         (when my-name
@@ -271,9 +335,16 @@ remote field state for three-way reconciliation."
   (with-current-buffer buf
     (org-with-wide-buffer
      (save-excursion
-       (let ((ops nil))
+       (let ((ops nil)
+             (skip-until nil))
          (goto-char (point-min))
          (while (re-search-forward org-heading-regexp nil t)
+           (when (and skip-until (< (point) skip-until))
+             ;; Inside a captured new-issue subtree: the cascade owns it,
+             ;; and deeper TODOs were collected as blocked ops.  Scanning
+             ;; it again would create the children twice - once standalone
+             ;; under the grandparent and once through the parent's cascade.
+             (goto-char skip-until))
            (let* ((type (org-entry-get nil "TYPE"))
                   (id (org-entry-get nil "ID"))
                   (pending-delete (org-entry-get nil "PendingDelete"))
@@ -406,49 +477,90 @@ remote field state for three-way reconciliation."
                                      :title heading-title
                                      :reason (format "%s is a subtask and Jira subtasks cannot have children; restructure the outline" parent-id))
                                ops))
-                        ;; Under Initiative (or other epic-parent type) → create Epic
+                        ;; Under Initiative (or other epic-parent type) →
+                        ;; create Epic.  The hierarchy fields must be
+                        ;; configured: creating without the link would
+                        ;; orphan the issue instead of blocking loudly.
                         ((and (equal parent-type "ejira-issue")
                               (member parent-issuetype ejira-epic-parent-issuetypes))
-                         (let ((children (ejira--push-scan-issue-children marker parent-id)))
-                           (push (list :op 'create
-                                       :object 'issue
-                                       :key nil
-                                       :project project-key
-                                       :parent-issue parent-id
-                                       :marker marker
-                                       :data (list :project-key project-key
-                                                   :issue-type ejira-epic-type-name
-                                                   :parent-initiative parent-id
-                                                   :children children))
-                                 ops)))
+                         (if (not ejira-parent-link-field)
+                             (push (list :op 'blocked
+                                         :marker marker
+                                         :title heading-title
+                                         :reason (format "cannot create an Epic under %s: ejira-parent-link-field is not configured; set it to the Portfolio Parent Link field id" parent-id))
+                                   ops)
+                           (let ((kids (ejira--push-scan-issue-children marker parent-id)))
+                             (push (list :op 'create
+                                         :object 'issue
+                                         :key nil
+                                         :project project-key
+                                         :parent-issue parent-id
+                                         :marker marker
+                                         :data (list :project-key project-key
+                                                     :issue-type ejira-epic-type-name
+                                                     :parent-initiative parent-id
+                                                     :children (car kids)))
+                                   ops)
+                             (setq ops (append (cdr kids) ops))
+                             (setq skip-until
+                                   (max (or skip-until 0)
+                                        (save-excursion (ejira--true-subtree-end)))))))
                         ;; Under Epic → create Task (or Story) with Epic Link
                         ((equal parent-type "ejira-epic")
-                         (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                         (if (not ejira-epic-field)
+                             (push (list :op 'blocked
+                                         :marker marker
+                                         :title heading-title
+                                         :reason (format "cannot create an issue under Epic %s: ejira-epic-field is not configured; set it to the Epic Link field id" parent-id))
+                                   ops)
+                           (let ((kids (ejira--push-scan-issue-children marker parent-id)))
+                             (push (list :op 'create
+                                         :object 'issue
+                                         :key nil
+                                         :project project-key
+                                         :parent-issue parent-id
+                                         :marker marker
+                                         :data (list :project-key project-key
+                                                     :issue-type ejira-epic-child-type-name
+                                                     :parent-epic parent-id
+                                                     :children (car kids)))
+                                   ops)
+                             (setq ops (append (cdr kids) ops))
+                             (setq skip-until
+                                   (max (or skip-until 0)
+                                        (save-excursion (ejira--true-subtree-end)))))))
+                        ;; Under Issue/Story → create Sub-task (Jira parent
+                        ;; link).  A new subtask cannot own children:
+                        ;; capture the subtree, block every TODO in it,
+                        ;; and skip past it.
+                        ((member parent-type '("ejira-issue" "ejira-story"))
+                         (let ((kids (ejira--push-scan-issue-children marker parent-id)))
                            (push (list :op 'create
-                                       :object 'issue
+                                       :object 'subtask
                                        :key nil
                                        :project project-key
                                        :parent-issue parent-id
                                        :marker marker
-                                       :data (list :project-key project-key
-                                                   :issue-type ejira-epic-child-type-name
-                                                   :parent-epic parent-id
-                                                   :children children))
-                                 ops)))
-                        ;; Under Issue/Story → create Sub-task (Jira parent link)
-                        ((member parent-type '("ejira-issue" "ejira-story"))
-                         (push (list :op 'create
-                                     :object 'subtask
-                                     :key nil
-                                     :project project-key
-                                     :parent-issue parent-id
-                                     :marker marker
-                                     :data (list :parent-key parent-id
-                                                 :project-key project-key))
-                               ops))
+                                       :data (list :parent-key parent-id
+                                                   :project-key project-key))
+                                 ops)
+                           (setq ops
+                                 (append
+                                  (cdr kids)
+                                  (mapcar
+                                   (lambda (child)
+                                     (list :op 'blocked
+                                           :marker (plist-get child :marker)
+                                           :title (plist-get child :title)
+                                           :reason (format "%s becomes a subtask and Jira subtasks cannot have children; restructure the outline" parent-id)))
+                                   (car kids))
+                                  ops))
+                           (setq skip-until
+                                 (max (or skip-until 0)
+                                      (save-excursion (ejira--true-subtree-end))))))
                         ;; Under Project → create issue (top-level)
                         ((equal parent-type "ejira-project")
-                         (let ((children (ejira--push-scan-issue-children marker parent-id)))
+                         (let ((kids (ejira--push-scan-issue-children marker parent-id)))
                            (push (list :op 'create
                                        :object 'issue
                                        :key nil
@@ -456,8 +568,12 @@ remote field state for three-way reconciliation."
                                        :parent-issue nil
                                        :marker marker
                                        :data (list :project-key parent-id
-                                                   :children children))
-                                 ops))))))))
+                                                   :children (car kids)))
+                                 ops)
+                           (setq ops (append (cdr kids) ops))
+                           (setq skip-until
+                                 (max (or skip-until 0)
+                                      (save-excursion (ejira--true-subtree-end)))))))))))
                  ;; Rule G: New comment draft — heading directly under Comments,
                  ;; no CommId yet.  Catches manually-added plain headings and
                  ;; org-capture stubs (TYPE=ejira-comment, no CommId).
@@ -814,7 +930,11 @@ remote field state for three-way reconciliation."
                                 (substring-no-properties (or (org-get-todo-state) ""))))
                  (fields `(("title" ,heading-title)
                            ("state" ,local-state)
-                           ("description" ,(or local-body "")))))
+                           ("description" ,(or local-body ""))))
+                 ;; One shared cell for the plan and the send: the review
+                 ;; toggles the plan's list, and the send must read the
+                 ;; same object or the toggle is silently ignored.
+                 (assign-self-cell (list ejira--assign-new-issues)))
             (setq plan (list :op 'create
                              :object 'subtask
                              :project project-key
@@ -829,17 +949,19 @@ remote field state for three-way reconciliation."
                                        (format "parent: %s" parent-key)
                                        "description (Jira markup):"
                                        (ejira-parser-org-to-jira local-body))
-                             :assign-self (list ejira--assign-new-issues)
+                             :assign-self assign-self-cell
                              :send (let ((marker marker) (project-key project-key)
                                          (parent-key parent-key)
                                          (summary heading-title)
+                                         (reviewed-summary heading-title)
+                                         (reviewed-body local-body)
                                          (subtask-type ejira-subtask-type-name)
                                          (description (ejira-parser-org-to-jira local-body))
                                          (orig-state local-state)
                                          (todo-kws (org-with-point-at marker
                                                      (when (boundp 'org-todo-keywords-1)
                                                        org-todo-keywords-1)))
-                                         (assign-self (list ejira--assign-new-issues)))
+                                         (assign-self assign-self-cell))
                                      (lambda ()
                                        ;; Journal the attempt before the
                                        ;; request: if Jira accepts it and the
@@ -873,8 +995,10 @@ remote field state for three-way reconciliation."
                                            (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
                                              (when my-name
                                                (jiralib2-assign-issue new-key my-name))))
-                                         (ejira--finalize-new-issue
-                                          new-key marker orig-state todo-kws))))))))
+                                         (ejira--finalize-new-issue-review-safe
+                                          new-key marker orig-state todo-kws
+                                          reviewed-summary reviewed-body)
+                                         )))))))
 
          ((and (eq op-type 'create) (eq object 'issue))
           (let* ((project-key      (plist-get data :project-key))
@@ -987,8 +1111,9 @@ remote field state for three-way reconciliation."
                                            (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
                                              (when my-name
                                                (jiralib2-assign-issue new-key my-name))))
-                                         (ejira--finalize-new-issue
-                                          new-key marker orig-state todo-kws)
+                                         (ejira--finalize-new-issue-review-safe
+                                          new-key marker orig-state todo-kws
+                                          reviewed-summary reviewed-body)
                                          (dolist (child children)
                                            (condition-case err
                                                (ejira--push-create-cascaded-child
@@ -1087,12 +1212,16 @@ reconciliation queue instead."
   (when (and ejira-push-on-save
              (not ejira--pushing)
              (not ejira--syncing)
+             ;; A save landing mid-reconciliation must not start a
+             ;; competing scan: the cycle already owns this file.
+             (not ejira--sync-in-progress)
              (derived-mode-p 'org-mode)
              (ejira--auto-sync-file-p))
     (ejira--auto-sync-enqueue (buffer-file-name)))
   (when (and ejira-push-on-save
              (not ejira--pushing)
              (not ejira--syncing)
+             (not ejira--sync-in-progress)
              (derived-mode-p 'org-mode)
              (not (ejira--auto-sync-file-p))
              (ejira--buffer-has-pushable-p))

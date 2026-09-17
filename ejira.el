@@ -616,10 +616,14 @@ Guards auto-pull against re-entrancy.")
              (buffer-list))))
 
 (defun ejira--auto-pull ()
-  "Pull from Jira if not already syncing.
+  "Pull from Jira if not already syncing or pushing.
 Calls `ejira-update-my-projects' with `ejira-auto-pull-shallow'."
   (when (and ejira-auto-pull-interval
              (not ejira--sync-in-progress)
+             ;; A pull racing a push applies a fetched response over
+             ;; newer pushed state; serialize the paths.
+             (not (and (boundp 'ejira--pushing) ejira--pushing))
+             (not (and (boundp 'ejira--syncing) ejira--syncing))
              ejira-projects)
     (setq ejira--last-pull-time (current-time))
     (message "ejira: auto-pull started")
@@ -697,6 +701,14 @@ pending transitions still push automatically."
 (defvar ejira--auto-sync-timer nil)
 (defvar ejira--auto-sync-mtimes (make-hash-table :test 'equal)
   "Last seen modification times of `ejira-auto-sync-files'.")
+(defvar ejira--auto-sync-attempts (make-hash-table :test 'equal)
+  "Consecutive failed reconcile attempts per file, for retry capping.")
+(defcustom ejira-auto-sync-retry-limit 3
+  "Consecutive failed attempts per file before auto-sync gives up and
+reports, instead of retrying on every idle cycle.  The next successful
+save or external change resets the counter."
+  :type 'integer
+  :group 'ejira)
 
 (defun ejira--auto-sync-enqueue (file)
   "Schedule FILE for an automatic reconciliation cycle."
@@ -747,33 +759,40 @@ The log buffer is never displayed automatically."
   "Execute conflict-free PLANs for FILE without confirmation.
 Comment edits/deletions and plans whose remote changed since the last
 acknowledgment are held for the normal review flow."
-  (dolist (plan plans)
-    (let* ((op (plist-get plan :op))
-           (object (plist-get plan :object))
-           (send (plist-get plan :send))
-           (title (plist-get plan :title)))
-      (cond
-       ((plist-get plan :remote-changed)
+  (let ((buf (get-file-buffer file)))
+    (if (and buf (buffer-live-p buf) (not (verify-visited-file-modtime buf)))
+        ;; The file changed on disk mid-cycle (another editor, git): the
+        ;; plans were built from stale in-memory content.  Hold everything.
         (ejira--auto-sync-log
-         file (list (format "%s: changed remotely since last sync; held for review" title))))
-       ((and (eq op 'update) (eq object 'comment))
-        (ejira--auto-sync-log
-         file (list (format "%s: comment edit held for review" title))))
-       ((and (eq op 'delete) (eq object 'comment))
-        (ejira--auto-sync-log
-         file (list (format "%s: comment deletion held for review" title))))
-       ((and (eq op 'create)
-             (not (eq object 'comment))
-             (not ejira-auto-sync-create))
-        (ejira--auto-sync-log
-         file (list (format "%s: creation held (ejira-auto-sync-create is nil)" title))))
-       (send
-        (condition-case err
-            (funcall send)
-          (error (ejira--auto-sync-log
-                  file
-                  (list (format "%s: push failed: %s"
-                                title (error-message-string err)))))))))))
+         file
+         (list "file changed on disk mid-cycle; all pushes held for review")))
+    (dolist (plan plans)
+      (let* ((op (plist-get plan :op))
+             (object (plist-get plan :object))
+             (send (plist-get plan :send))
+             (title (plist-get plan :title)))
+        (cond
+         ((plist-get plan :remote-changed)
+          (ejira--auto-sync-log
+           file (list (format "%s: changed remotely since last sync; held for review" title))))
+         ((and (eq op 'update) (eq object 'comment))
+          (ejira--auto-sync-log
+           file (list (format "%s: comment edit held for review" title))))
+         ((and (eq op 'delete) (eq object 'comment))
+          (ejira--auto-sync-log
+           file (list (format "%s: comment deletion held for review" title))))
+         ((and (eq op 'create)
+               (not (eq object 'comment))
+               (not ejira-auto-sync-create))
+          (ejira--auto-sync-log
+           file (list (format "%s: creation held (ejira-auto-sync-create is nil)" title))))
+         (send
+          (condition-case err
+              (funcall send)
+            (error (ejira--auto-sync-log
+                    file
+                    (list (format "%s: push failed: %s"
+                                  title (error-message-string err))))))))))))
 
 (defun ejira--auto-sync-reconcile (file)
   "Run one pull-then-push reconciliation cycle for FILE."
@@ -786,7 +805,8 @@ acknowledgment are held for the normal review flow."
            (ejira--pushing t)
            (ejira--heading-cache (make-hash-table :test 'equal))
            (pulls nil)
-           (conflicts nil))
+           (conflicts nil)
+           (held-keys nil))
       (with-current-buffer buf
         ;; Revert an unmodified buffer whose file changed externally; a
         ;; buffer with unsaved edits is a moving target — wait for its
@@ -818,7 +838,11 @@ acknowledgment are held for the normal review flow."
                           (dirty (and m (org-with-point-at m
                                           (ejira--locally-modified-p)))))
                      (cond
-                      ((and dirty (not remote-changed-p))) ; push candidate
+                      ;; Push candidate only when a remote baseline exists
+                      ;; and has not moved: with no baseline, "not changed
+                      ;; remotely" is UNKNOWN, and an automatic push could
+                      ;; overwrite unseen remote work.  Fail closed.
+                      ((and dirty (not remote-unknown-p) (not remote-changed-p))) ; push candidate
                       ;; Remote-only change, or no baseline yet: a pull
                       ;; applies the remote state and establishes the
                       ;; baseline (a no-op fetch for unchanged issues).
@@ -826,15 +850,23 @@ acknowledgment are held for the normal review flow."
                             (or remote-changed-p remote-unknown-p))
                        (push item pulls))
                       ((and remote-changed-p dirty)
+                       (push key held-keys)
                        (push (format "%s: changed locally and remotely" key)
+                             conflicts))
+                      ;; Dirty with no baseline: the remote side is
+                      ;; unknown; never push blind.
+                      ((and dirty remote-unknown-p)
+                       (push key held-keys)
+                       (push (format "%s: changed locally with no remote baseline" key)
                              conflicts)))))
                  ;; ── pull remote-only changes ──
                  (dolist (item (nreverse pulls))
                    (let ((key (ejira--alist-get item 'key)))
                      (if (ejira--issue-comments-dirty-p key)
-                         (push (format "%s: locally edited comments; pull deferred"
-                                       key)
-                               conflicts)
+                         (progn (push key held-keys)
+                                (push (format "%s: locally edited comments; pull deferred"
+                                              key)
+                                      conflicts))
                        (ejira--update-task (ejira--parse-item item))
                        ;; The heading may have been refiled; re-find it.
                        (when-let ((m (ejira--find-heading key)))
@@ -855,6 +887,15 @@ acknowledgment are held for the normal review flow."
                                    (plist-get b :title)
                                    (plist-get b :reason))
                            conflicts))
+                   ;; Issue-wide holds: an issue classified as conflicted
+                   ;; keeps its staged transitions, type changes and
+                   ;; cascade creations out of the cycle too — a plan
+                   ;; whose parent-issue is held runs unattended anyway.
+                   (setq plans
+                         (cl-remove-if
+                          (lambda (plan)
+                            (member (plist-get plan :parent-issue) held-keys))
+                          plans))
                    (when plans
                      (ejira--auto-sync-execute file plans)))
                  (when conflicts
@@ -886,11 +927,27 @@ acknowledgment are held for the normal review flow."
                     (and mtime
                          (not (equal mtime
                                      (gethash file ejira--auto-sync-mtimes)))))
-            (puthash file mtime ejira--auto-sync-mtimes)
+            ;; Record the mtime only after a successful cycle: a transient
+            ;; failure leaves the recorded time stale, so the next worker
+            ;; pass retries the file instead of silently dropping it.
             (condition-case err
-                (ejira--auto-sync-reconcile file)
-              (error (message "ejira auto-sync: %s failed: %s"
-                              file (error-message-string err))))))))))
+                (progn
+                  (ejira--auto-sync-reconcile file)
+                  (puthash file mtime ejira--auto-sync-mtimes)
+                  (remhash file ejira--auto-sync-attempts))
+              (error
+               (let ((n (1+ (gethash file ejira--auto-sync-attempts 0))))
+                 (puthash file n ejira--auto-sync-attempts)
+                 (if (>= n ejira-auto-sync-retry-limit)
+                     (progn
+                       ;; Stop retrying: pin the mtime and report once.
+                       (puthash file mtime ejira--auto-sync-mtimes)
+                       (remhash file ejira--auto-sync-attempts)
+                       (message "ejira auto-sync: giving up on %s after %d attempts: %s"
+                                file n (error-message-string err)))
+                   (message "ejira auto-sync: %s failed (attempt %d/%d): %s"
+                            file n ejira-auto-sync-retry-limit
+                            (error-message-string err))))))))))))
 
 (defun ejira--start-auto-sync ()
   "Start the automatic reconciliation timer for `ejira-auto-sync-files'."

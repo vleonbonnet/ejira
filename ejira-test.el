@@ -875,7 +875,8 @@ Body for Jira.
 (ert-deftest ejira-push--rule-e/new-task-under-epic ()
   "TODO heading without TYPE directly under ejira-epic → create-issue op with
 :parent-epic set and :issue-type from `ejira-epic-child-type-name'."
-  (let ((ops (ejira-test--scan
+  (let* ((ejira-epic-field 'customfield_10857)
+         (ops (ejira-test--scan
               "* PROJ-1 My Epic
 :PROPERTIES:
 :TYPE:     ejira-epic
@@ -896,7 +897,8 @@ Body for Jira.
 (ert-deftest ejira-push--rule-e/new-epic-under-initiative ()
   "TODO heading without TYPE under ejira-issue with Issuetype=Initiative
 → create-issue op with :parent-initiative set and :issue-type \"Epic\"."
-  (let ((ops (ejira-test--scan
+  (let* ((ejira-parent-link-field 'customfield_14051)
+         (ops (ejira-test--scan
               "* PROJ-1 My Initiative
 :PROPERTIES:
 :TYPE:     ejira-issue
@@ -2078,6 +2080,158 @@ parent and a later refile has to repair the placement."
                                                        (save-excursion
                                                          (outline-up-heading 1 t)
                                                          (org-entry-get (point) "ID"))))))))))
+
+;;; ── Comment-list completeness gate (regressions) ─────────────────────────────
+;;
+;; `jiralib2-get-issue' embeds ONE PAGE of comments (`fields.comment.comments')
+;; alongside `total'/`startAt'.  Deleting local comments absent from that list
+;; is only safe when the page is provably complete; a truncated page used to
+;; delete live comments wholesale.
+
+(defconst ejira-test--comments-task-content
+  "* TEST\n:PROPERTIES:\n:ID: TEST\n:TYPE: ejira-project\n:END:\n\
+* TODO Issue\n:PROPERTIES:\n:ID: TEST-1\n:TYPE: ejira-issue\n:Modified: 2026-09-01 00:00:00\n:END:\n\
+** Comments\n\
+*** [c1]\n:PROPERTIES:\n:CommId: 111\n:TYPE: ejira-comment\n:END:\n\
+body1\n\
+*** [c2]\n:PROPERTIES:\n:CommId: 222\n:TYPE: ejira-comment\n:END:\n\
+body2\n")
+
+(defun ejira-test--run-update-with-comments (comments complete)
+  "Run `ejira--update-task' on the comments fixture with COMMENTS/COMPLETE."
+  (let ((ejira--heading-cache (make-hash-table :test #'equal))
+        (ejira-assigned-tagname nil))
+    (ejira-test--with-org-buf ejira-test--comments-task-content
+                              (goto-char (point-min))
+                              (re-search-forward org-heading-regexp)
+                              (puthash "TEST" (point-marker) ejira--heading-cache)
+                              (re-search-forward org-heading-regexp)
+                              (puthash "TEST-1" (point-marker) ejira--heading-cache)
+                              (ejira--update-task
+                               (make-ejira-task
+                                :key "TEST-1" :type "Task" :status "Open"
+                                :project "TEST"
+                                ;; Newer than the fixture's Modified so the
+                                ;; comment path runs (it is skipped for an
+                                ;; unmodified issue).
+                                :updated (date-to-time "2026-09-02 00:00:00 +0000")
+                                :created (date-to-time "2026-09-01 00:00:00 +0000")
+                                :deadline "2026-09-24"
+                                :summary "Issue"
+                                :comments comments
+                                :comments-complete complete))
+                              (list :c1 (count-matches ":CommId: +111" (point-min) (point-max))
+                                    :c2 (count-matches ":CommId: +222" (point-min) (point-max))))))
+
+(ert-deftest ejira-update-task/preserves-comments-on-incomplete-list ()
+  "A truncated embedded comment page must not delete local comments."
+  (should (equal '(:c1 1 :c2 1)
+                 (ejira-test--run-update-with-comments
+                  (list (make-ejira-comment :id "111" :author "A"
+                                            :created (date-to-time "2026-09-01")
+                                            :updated (date-to-time "2026-09-01")
+                                            :body "b"))
+                  nil))))
+
+(ert-deftest ejira-update-task/complete-list-may-delete ()
+  "When the comment page is provably complete, deletions proceed."
+  (should (equal '(:c1 1 :c2 0)
+                 (ejira-test--run-update-with-comments
+                  (list (make-ejira-comment :id "111" :author "A"
+                                            :created (date-to-time "2026-09-01")
+                                            :updated (date-to-time "2026-09-01")
+                                            :body "b"))
+                  t))))
+
+(ert-deftest ejira-parse-item/comment-completeness-flag ()
+  "`ejira--parse-item' derives the completeness flag from the embedded page."
+  (let ((json-object-type 'alist)
+        (json-array-type 'list))
+    (should (eq t (ejira-task-comments-complete
+                   (ejira--parse-item
+                    (json-read-from-string "{\"key\": \"TEST-1\", \"fields\": {\"issuetype\": {\"name\": \"Task\"}, \"comment\": {\"startAt\": 0, \"total\": 2, \"comments\": [{\"id\": \"1\", \"author\": {\"displayName\": \"A\"}, \"fields\": {\"created\": \"2026-09-01T10:00:00.000+0000\", \"updated\": \"2026-09-01T10:00:00.000+0000\", \"body\": \"x\"}}, {\"id\": \"2\", \"author\": {\"displayName\": \"A\"}, \"fields\": {\"created\": \"2026-09-02T10:00:00.000+0000\", \"updated\": \"2026-09-02T10:00:00.000+0000\", \"body\": \"y\"}}]}}}")))))
+    (should (null (ejira-task-comments-complete
+                   (ejira--parse-item
+                    (json-read-from-string "{\"key\": \"TEST-1\", \"fields\": {\"issuetype\": {\"name\": \"Task\"}, \"comment\": {\"startAt\": 0, \"total\": 12, \"maxResults\": 5, \"comments\": [{\"id\": \"1\", \"author\": {\"displayName\": \"A\"}, \"fields\": {\"created\": \"2026-09-01T10:00:00.000+0000\", \"updated\": \"2026-09-01T10:00:00.000+0000\", \"body\": \"x\"}}]}}}")))))
+    ;; No embedded comment object at all: the empty list is complete.
+    (should (eq t (ejira-task-comments-complete
+                   (ejira--parse-item
+                    (json-read-from-string "{\"key\": \"TEST-1\", \"fields\": {\"issuetype\": {\"name\": \"Task\"}}}")))))))
+;;; ── Scan dedupe + cookie dirtiness (regressions) ─────────────────────────────
+
+(ert-deftest ejira-push--rule-f/new-parent-and-child-not-double-scanned ()
+  "A new parent and its new child produce ONE create op (with children).
+Scanning the child independently — its new-parent ancestor has no ID
+yet — created the ticket twice: once via the parent's cascade and once
+standalone under the grandparent."
+  (ejira-test--with-org-buf
+      "* PROJ
+:PROPERTIES:
+:TYPE:     ejira-project
+:ID:       PROJ
+:END:
+** TODO New parent
+
+Parent body.
+
+*** TODO New child
+
+Child body.
+"
+    (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+           (create-ops (cl-remove-if-not
+                        (lambda (op) (eq (plist-get op :op) 'create))
+                        ops))
+           (blocked-ops (cl-remove-if-not
+                         (lambda (op) (eq (plist-get op :op) 'blocked))
+                         ops)))
+      (should (= 1 (length create-ops)))
+      (should (= 1 (length (plist-get (plist-get (car create-ops) :data) :children))))
+      ;; the grandchild-level TODO under the captured child is reported,
+      ;; not silently dropped
+      (should (null blocked-ops)))))
+
+(ert-deftest ejira-push--rule-e/todo-below-new-child-is-blocked ()
+  "A TODO deeper than a new parent's direct children is blocked, not
+flattened under the grandparent."
+  (ejira-test--with-org-buf
+      "* PROJ
+:PROPERTIES:
+:TYPE:     ejira-project
+:ID:       PROJ
+:END:
+** TODO New parent
+
+*** TODO Middle child
+
+**** TODO Deeper grandchild
+"
+    (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+           (blocked-ops (cl-remove-if-not
+                         (lambda (op) (eq (plist-get op :op) 'blocked))
+                         ops)))
+      (should (= 1 (length blocked-ops)))
+      (should (string-match-p "cannot create below a new child"
+                              (plist-get (car blocked-ops) :reason))))))
+
+(ert-deftest ejira-state/priority-cookie-edit-dirties-state ()
+  "A direct `[#A]' cookie edit is caught even when no hashed field moved."
+  (let ((org-priority-highest 1)
+        (org-priority-lowest 5)
+        (ejira--heading-cache (make-hash-table :test #'equal)))
+    (ejira-test--with-org-buf
+        "* TODO [#3] TEST-1 Issue
+:PROPERTIES:
+:ID: TEST-1
+:TYPE: ejira-issue
+:Statehash: dummy
+:JiraPriorityRank: 2
+:END:
+"
+      (goto-char (point-min))
+      (re-search-forward org-heading-regexp)
+      ;; stored rank 2 (=[#2]); the cookie says 3 → modified
+      (should (ejira--priority-cookie-modified-p)))))
 
 (provide (quote ejira-test))
 ;;; ejira-test.el ends here

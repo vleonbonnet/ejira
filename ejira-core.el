@@ -219,7 +219,8 @@ Set to nil to disable assigned-tag management entirely.")
   summary
   parent
   description
-  comments)
+  comments
+  comments-complete)
 
 (defconst ejira-priority-id-property "JiraPriorityId"
   "Org property storing the exact Jira priority ID for a heading.")
@@ -357,7 +358,16 @@ Set to nil to disable assigned-tag management entirely.")
      :summary (ejira--parse-body (ejira--alist-get item 'fields 'summary))
      :description (ejira--alist-get item 'fields 'description)
      :comments (mapcar #'ejira--parse-comment
-                       (ejira--alist-get item 'fields 'comment 'comments)))))
+                       (ejira--alist-get item 'fields 'comment 'comments))
+     ;; The embedded comment object is one page of the full list.  Deletions
+     ;; of local comments absent from it are only safe when the page is
+     ;; provably the whole list: first page (startAt 0) and no truncation.
+     :comments-complete (let ((co (ejira--alist-get item 'fields 'comment)))
+                          (or (null co)
+                              (and (equal 0 (ejira--alist-get co 'startAt))
+                                   (equal (ejira--alist-get co 'total)
+                                          (length (ejira--alist-get
+                                                   co 'comments)))))))))
 
 (defun ejira--priority-id-string (id)
   "Return ID as a string, or nil when ID is absent."
@@ -819,8 +829,13 @@ something a background auto-pull should ever do."
           ;; Update existing, and insert missing comments
           (mapc (-partial #'ejira--update-comment key) comments)
 
-          ;; Delete removed comments
-          (ejira--kill-deleted-comments key (mapcar 'ejira-comment-id comments))
+          ;; Delete removed comments -- but only when the embedded comment
+          ;; list is provably complete: a truncated page (Jira serves one
+          ;; page inside the issue response) must never delete local
+          ;; comments that merely fell outside it.
+          (if comments-complete
+              (ejira--kill-deleted-comments key (mapcar 'ejira-comment-id comments))
+            (message "ejira: %s comment list incomplete; skipping comment deletion" key))
 
           ;; Ensure comments are ordered by creation
           (ejira--sort-comments key)
@@ -832,9 +847,13 @@ something a background auto-pull should ever do."
           (let* ((target (cond (parent) (epic) (t project)))
                  (heading-file (buffer-file-name
                                 (marker-buffer (ejira--find-heading key))))
-                 (in-ejira-dir (string-prefix-p
-                                (file-truename (expand-file-name ejira-org-directory))
-                                (file-truename heading-file))))
+                 ;; `heading-file' is nil for non-file-backed buffers
+                 ;; (tests, capture targets); treat them as outside the
+                 ;; ejira directory.
+                 (in-ejira-dir (and heading-file
+                                    (string-prefix-p
+                                     (file-truename (expand-file-name ejira-org-directory))
+                                     (file-truename heading-file)))))
             (when (or parent epic in-ejira-dir)
               (ejira--refile key target)))
           (message "Updated %s: %s" key summary)
@@ -1296,7 +1315,11 @@ pull reconciles and a push sends.  A shallow pull never fetches them."
 
 (defun ejira--heading-state-fields ()
   "Return the state fields of the ejira task at point.
-Todo state, assignee and status: the fields a shallow pull fetches."
+Todo state, assignee and status: the fields a shallow pull fetches.
+The priority cookie is deliberately NOT hashed here: changing its
+composition would invalidate every stored Statehash at once.  A direct
+cookie edit is caught live by `ejira--priority-cookie-modified-p'
+instead."
   (concat (substring-no-properties (or (org-get-todo-state) ""))
           "\0"
           (ejira--push-normalize (or (org-entry-get nil "Assignee") ""))
@@ -1316,11 +1339,28 @@ A missing content baseline is treated as unmodified."
                 (concat ejira-pushhash-v2-prefix
                         (md5 (ejira--heading-content-fields)))))))
 
+(defun ejira--priority-cookie-modified-p ()
+  "Return non-nil when the org priority cookie disagrees with the stored rank.
+A direct `[#A]' cookie edit changes the derived rank without touching
+any hashed state field; comparing the live rank against the stored
+`JiraPriorityRank' property catches it.  A priority sync writes both,
+so they agree whenever ejira last touched them."
+  (and (org-entry-get nil ejira-priority-rank-property)
+       (save-excursion
+         (org-back-to-heading t)
+         (looking-at org-priority-regexp))
+       (let* ((rank (ejira--org-priority-rank (match-string 2)))
+              (stored (org-entry-get nil ejira-priority-rank-property)))
+         (and rank
+              (not (equal (and stored (number-to-string rank))
+                          stored))))))
+
 (defun ejira--state-modified-p ()
   "Return non-nil when the task at point's state fields differ from baseline.
 A missing state baseline is treated as unmodified."
   (when-let ((baseline (org-entry-get nil ejira-state-hash-property)))
-    (not (equal baseline (md5 (ejira--heading-state-fields))))))
+    (or (not (equal baseline (md5 (ejira--heading-state-fields))))
+        (ejira--priority-cookie-modified-p))))
 
 (defun ejira--update-push-baseline ()
   "Store the push baselines of the heading at point.
