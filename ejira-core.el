@@ -1881,7 +1881,7 @@ With SHALLOW update only todo state."
   (if shallow
       `("key" "status" "assignee" "resolution")
     (append
-     '("key" "priority" "assignee" "issuetype" "project" "summary" "description"
+     `("key" "priority" "assignee" "issuetype" "project" "summary" "description"
        "reporter" "duedate" "created" "updated" "status" "resolution" "parent" "timetracking"
        "comment" ,(symbol-name ejira-epic-field) ,(symbol-name ejira-sprint-field))
      ;; The Initiative → Epic parent link is only fetched when configured;
