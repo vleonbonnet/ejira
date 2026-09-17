@@ -443,6 +443,7 @@ thousands of issues, and remote-only issues have nothing to repair."
          (apply-p (and apply t))
          (local-count (length keys))
          (repaired nil) (dirty nil) (unchanged 0) (missing-keys nil) (fetched 0)
+         (body-mode-count 0)
          (buffers nil)
          (ejira-auto-pull-interval nil)
          (ejira--syncing t)
@@ -460,6 +461,11 @@ thousands of issues, and remote-only issues have nothing to repair."
                  (m (ejira--find-heading key)))
             (cond
              ((not m) (push key missing-keys))
+             ;; Body-as-description headings have no stored description
+             ;; child to re-render; their layout is owned by the new
+             ;; reconcile flow, not this legacy repair path.
+             ((org-with-point-at m (ejira--description-in-body-p))
+              (cl-incf body-mode-count))
              ((org-with-point-at m (ejira--locally-modified-p))
               (push key dirty))
              (t
@@ -486,10 +492,14 @@ thousands of issues, and remote-only issues have nothing to repair."
       (dolist (buf buffers)
         (with-current-buffer buf (ejira--save-buffer-safe))))
     (setq repaired (nreverse repaired) dirty (nreverse dirty))
-    (message "ejira repair%s: %d re-rendered, %d unchanged, %d with local edits (skipped); %d/%d local keys resolved"
+    (message "ejira repair%s: %d re-rendered, %d unchanged, %d with local edits (skipped); %d/%d local keys resolved%s"
              (if apply-p " applied" " preview")
              (length repaired) unchanged (length dirty)
-             fetched local-count)
+             fetched local-count
+             (if (> body-mode-count 0)
+                 (format "; %d body-as-description headings skipped"
+                         body-mode-count)
+               ""))
     (when dirty
       (message "ejira repair: skipped pending local push: %s"
                (s-join ", " (seq-take dirty 10))))

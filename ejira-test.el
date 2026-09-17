@@ -30,9 +30,9 @@
 (defun ejira-test--scan (content)
   "Return scan ops for org CONTENT with `ejira--get-project' mocked."
   (ejira-test--with-org-buf content
-    (cl-letf (((symbol-function 'ejira--get-project)
-               (lambda (key) (car (split-string key "-")))))
-      (ejira--push-scan-buffer (current-buffer)))))
+                            (cl-letf (((symbol-function 'ejira--get-project)
+                                       (lambda (key) (car (split-string key "-")))))
+                              (ejira--push-scan-buffer (current-buffer)))))
 
 ;;; ── ejira-confirm helpers ─────────────────────────────────────────────────────
 
@@ -197,7 +197,7 @@
 (ert-deftest ejira-projection--uses-jira-title-and-description-only ()
   "A Jira projection never exports the detailed local task body."
   (ejira-test--with-org-buf
-      "* TODO Local implementation title
+   "* TODO Local implementation title
 :PROPERTIES:
 :TYPE:       ejira-issue
 :ID:         TEST-1
@@ -214,21 +214,21 @@ Private local description.
 
 Concise external description.
 "
-    (goto-char (point-min))
-    (should (ejira--jira-projection-p))
-    (should (equal "Concise external title" (ejira--jira-summary)))
-    (should (equal "Concise external description."
-                   (string-trim (ejira--jira-description))))
-    (let ((hash (md5 (ejira--heading-pushable-content))))
-      (search-forward "Private implementation notes.")
-      (replace-match "Changed private implementation notes.")
-      (goto-char (point-min))
-      (should (equal hash (md5 (ejira--heading-pushable-content)))))))
+   (goto-char (point-min))
+   (should (ejira--jira-projection-p))
+   (should (equal "Concise external title" (ejira--jira-summary)))
+   (should (equal "Concise external description."
+                  (string-trim (ejira--jira-description))))
+   (let ((hash (md5 (ejira--heading-pushable-content))))
+     (search-forward "Private implementation notes.")
+     (replace-match "Changed private implementation notes.")
+     (goto-char (point-min))
+     (should (equal hash (md5 (ejira--heading-pushable-content)))))))
 
 (ert-deftest ejira-projection--pull-preserves-local-title-and-description ()
   "A Jira pull updates projection fields without replacing local content."
   (ejira-test--with-org-buf
-      "* TODO Local implementation title
+   "* TODO Local implementation title
 :PROPERTIES:
 :TYPE:       ejira-issue
 :ID:         TEST-1
@@ -241,50 +241,50 @@ Private implementation notes.
 
 Private local description.
 "
-    (let ((marker (point-min)))
-      (cl-letf (((symbol-function 'ejira--find-heading)
-                 (lambda (_id) marker)))
-        (ejira--set-summary "TEST-1" "Updated external title")
-        (ejira--set-jira-description-jira-markup "TEST-1" "Updated external description."))
-      (goto-char (point-min))
-      (should (equal "Local implementation title" (org-get-heading t t t t)))
-      (should (equal "Updated external title" (org-entry-get nil "JIRA_TITLE")))
-      (should (equal "Private local description."
-                     (string-trim
-                      (org-with-point-at
-                          (ejira--find-child-heading "Description")
-                        (ejira--get-heading-body (point-marker))))))
-      (should (equal "Updated external description."
-                     (string-trim
-                      (org-with-point-at
-                          (ejira--find-child-heading "JIRA_DESCRIPTION")
-                        (ejira--get-heading-body (point-marker)))))))))
+   (let ((marker (point-min)))
+     (cl-letf (((symbol-function 'ejira--find-heading)
+                (lambda (_id) marker)))
+       (ejira--set-summary "TEST-1" "Updated external title")
+       (ejira--set-jira-description-jira-markup "TEST-1" "Updated external description."))
+     (goto-char (point-min))
+     (should (equal "Local implementation title" (org-get-heading t t t t)))
+     (should (equal "Updated external title" (org-entry-get nil "JIRA_TITLE")))
+     (should (equal "Private local description."
+                    (string-trim
+                     (org-with-point-at
+                         (ejira--find-child-heading "Description")
+                       (ejira--get-heading-body (point-marker))))))
+     (should (equal "Updated external description."
+                    (string-trim
+                     (org-with-point-at
+                         (ejira--find-child-heading "JIRA_DESCRIPTION")
+                       (ejira--get-heading-body (point-marker)))))))))
 
 (ert-deftest ejira-new-issue-description--migrates-plain-body ()
   "A plain new heading moves its direct body into Description before creation."
   (ejira-test--with-org-buf
-      "* TODO Local task
+   "* TODO Local task
 :PROPERTIES:
 :END:
 
 Content intended for Jira.
 "
-    (goto-char (point-min))
-    (should (equal "Content intended for Jira.\n"
-                   (ejira--new-issue-description)))
-    (should-not (ejira--find-child-heading "Description"))
-    (should (equal "Content intended for Jira.\n"
-                   (ejira--prepare-new-issue-description)))
-    (goto-char (point-min))
-    (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
-    (org-with-point-at (ejira--find-child-heading "Description")
-      (should (equal "Content intended for Jira."
-                     (string-trim (ejira--get-heading-body (point-marker))))))))
+   (goto-char (point-min))
+   (should (equal "Content intended for Jira.\n"
+                  (ejira--new-issue-description)))
+   (should-not (ejira--find-child-heading "Description"))
+   (should (equal "Content intended for Jira.\n"
+                  (ejira--prepare-new-issue-description)))
+   (goto-char (point-min))
+   (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
+   (org-with-point-at (ejira--find-child-heading "Description")
+     (should (equal "Content intended for Jira."
+                    (string-trim (ejira--get-heading-body (point-marker))))))))
 
 (ert-deftest ejira-new-issue-description--projection-keeps-local-body-private ()
   "Preparing a projected heading never moves local content into Description."
   (ejira-test--with-org-buf
-      "* TODO Local task
+   "* TODO Local task
 :PROPERTIES:
 :JIRA_TITLE: External task
 :END:
@@ -295,13 +295,13 @@ Private implementation notes.
 
 External task description.
 "
-    (goto-char (point-min))
-    (should (equal "External task description."
-                   (string-trim (ejira--prepare-new-issue-description))))
-    (goto-char (point-min))
-    (should (equal "Private implementation notes."
-                   (string-trim (ejira--get-heading-own-body))))
-    (should-not (ejira--find-child-heading "Description"))))
+   (goto-char (point-min))
+   (should (equal "External task description."
+                  (string-trim (ejira--prepare-new-issue-description))))
+   (goto-char (point-min))
+   (should (equal "Private implementation notes."
+                  (string-trim (ejira--get-heading-own-body))))
+   (should-not (ejira--find-child-heading "Description"))))
 
 (ert-deftest ejira-priority--policy/filters-and-falls-back ()
   "Hidden Jira priorities share the configured lowest visible rank."
@@ -365,24 +365,24 @@ External task description.
         (org-priority-lowest 5)
         (org-lowest-priority 5))
     (ejira-test--with-org-buf
-        "* TODO TEST-1 Issue\n:PROPERTIES:\n:ID: TEST-1\n:END:\n"
-      (goto-char (point-min))
-      (re-search-forward org-heading-regexp)
-      (let ((marker (point-marker)))
-        (ejira--set-task-priority marker "hidden-default" "Hidden default"
-                                  ejira-test--priority-scheme)
-        (should (equal "hidden-default"
-                       (org-with-point-at marker
-                         (org-entry-get (point-marker) ejira-priority-id-property))))
-        (should (equal "Hidden default"
-                       (org-with-point-at marker
-                         (org-entry-get (point-marker) ejira-priority-name-property))))
-        (should (equal "8"
-                       (org-with-point-at marker
-                         (save-excursion
-                           (org-back-to-heading t)
-                           (looking-at org-priority-regexp)
-                           (match-string 2)))))))))
+     "* TODO TEST-1 Issue\n:PROPERTIES:\n:ID: TEST-1\n:END:\n"
+     (goto-char (point-min))
+     (re-search-forward org-heading-regexp)
+     (let ((marker (point-marker)))
+       (ejira--set-task-priority marker "hidden-default" "Hidden default"
+                                 ejira-test--priority-scheme)
+       (should (equal "hidden-default"
+                      (org-with-point-at marker
+                        (org-entry-get (point-marker) ejira-priority-id-property))))
+       (should (equal "Hidden default"
+                      (org-with-point-at marker
+                        (org-entry-get (point-marker) ejira-priority-name-property))))
+       (should (equal "8"
+                      (org-with-point-at marker
+                        (save-excursion
+                          (org-back-to-heading t)
+                          (looking-at org-priority-regexp)
+                          (match-string 2)))))))))
 
 (ert-deftest ejira-priority--local-entry/legacy-heading-is-not-inferred ()
   "A legacy Org cookie without Jira metadata is not pushed as a priority."
@@ -390,11 +390,11 @@ External task description.
         (org-priority-lowest 5)
         (org-lowest-priority 5))
     (ejira-test--with-org-buf
-        "* TODO [#3] TEST-1 Issue\n:PROPERTIES:\n:ID: TEST-1\n:END:\n"
-      (goto-char (point-min))
-      (re-search-forward org-heading-regexp)
-      (should-not (ejira--local-priority-entry (point-marker)
-                                               ejira-test--priority-scheme)))))
+     "* TODO [#3] TEST-1 Issue\n:PROPERTIES:\n:ID: TEST-1\n:END:\n"
+     (goto-char (point-min))
+     (re-search-forward org-heading-regexp)
+     (should-not (ejira--local-priority-entry (point-marker)
+                                              ejira-test--priority-scheme)))))
 
 (ert-deftest ejira-priority--update-task/migrates-clean-legacy-heading ()
   "A clean legacy heading is remapped and receives an exact Jira ID."
@@ -405,40 +405,40 @@ External task description.
         (ejira--heading-cache (make-hash-table :test #'equal))
         (updated (date-to-time "2026-07-09 23:18:09 +0000")))
     (ejira-test--with-org-buf
-        "* TEST\n:PROPERTIES:\n:ID: TEST\n:TYPE: ejira-project\n:END:\n* TODO [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:Modified: 2026-07-09 23:18:09\n:END:\n"
-      (goto-char (point-min))
-      (re-search-forward org-heading-regexp)
-      (let ((project-marker (point-marker)))
-        (re-search-forward org-heading-regexp)
-        (let ((issue-marker (point-marker)))
-          (puthash "TEST" project-marker ejira--heading-cache)
-          (puthash "TEST-1" issue-marker ejira--heading-cache)
-          (cl-letf (((symbol-function 'ejira--get-priority-scheme)
-                     (lambda (&rest _args) ejira-test--priority-scheme)))
-            (ejira--update-task
-             (make-ejira-task :key "TEST-1"
-                              :type "Task"
-                              :status "Open"
-                              :project "TEST"
-                              :priority "Hidden default"
-                              :priority-id "hidden-default"
-                              :updated updated))
-            (should (equal "3"
-                           (org-with-point-at issue-marker
-                             (save-excursion
-                               (org-back-to-heading t)
-                               (looking-at org-priority-regexp)
-                               (match-string 2)))))
-            (should (equal "3"
-                           (org-with-point-at issue-marker
-                             (org-entry-get (point-marker)
-                                            ejira-priority-rank-property))))
-            (should (equal "hidden-default"
-                           (org-with-point-at issue-marker
-                             (org-entry-get (point-marker)
-                                            ejira-priority-id-property))))
-            (should (org-with-point-at issue-marker
-                      (org-entry-get (point-marker) "Pushhash")))))))))
+     "* TEST\n:PROPERTIES:\n:ID: TEST\n:TYPE: ejira-project\n:END:\n* TODO [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:Modified: 2026-07-09 23:18:09\n:END:\n"
+     (goto-char (point-min))
+     (re-search-forward org-heading-regexp)
+     (let ((project-marker (point-marker)))
+       (re-search-forward org-heading-regexp)
+       (let ((issue-marker (point-marker)))
+         (puthash "TEST" project-marker ejira--heading-cache)
+         (puthash "TEST-1" issue-marker ejira--heading-cache)
+         (cl-letf (((symbol-function 'ejira--get-priority-scheme)
+                    (lambda (&rest _args) ejira-test--priority-scheme)))
+           (ejira--update-task
+            (make-ejira-task :key "TEST-1"
+                             :type "Task"
+                             :status "Open"
+                             :project "TEST"
+                             :priority "Hidden default"
+                             :priority-id "hidden-default"
+                             :updated updated))
+           (should (equal "3"
+                          (org-with-point-at issue-marker
+                            (save-excursion
+                              (org-back-to-heading t)
+                              (looking-at org-priority-regexp)
+                              (match-string 2)))))
+           (should (equal "3"
+                          (org-with-point-at issue-marker
+                            (org-entry-get (point-marker)
+                                           ejira-priority-rank-property))))
+           (should (equal "hidden-default"
+                          (org-with-point-at issue-marker
+                            (org-entry-get (point-marker)
+                                           ejira-priority-id-property))))
+           (should (org-with-point-at issue-marker
+                     (org-entry-get (point-marker) "Pushhash")))))))))
 
 (ert-deftest ejira-priority--update-task/preserves-dirty-legacy-heading ()
   "A dirty legacy heading is left untouched until its current push succeeds."
@@ -448,33 +448,33 @@ External task description.
         (ejira--heading-cache (make-hash-table :test #'equal))
         (updated (date-to-time "2026-07-09 23:18:09 +0000")))
     (ejira-test--with-org-buf
-        "* TEST\n:PROPERTIES:\n:ID: TEST\n:TYPE: ejira-project\n:END:\n* DONE [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:Modified: 2026-07-09 23:18:09\n:Pushhash: WRONG\n:END:\n"
-      (goto-char (point-min))
-      (re-search-forward org-heading-regexp)
-      (let ((project-marker (point-marker)))
-        (re-search-forward org-heading-regexp)
-        (let ((issue-marker (point-marker)))
-          (puthash "TEST" project-marker ejira--heading-cache)
-          (puthash "TEST-1" issue-marker ejira--heading-cache)
-          (cl-letf (((symbol-function 'ejira--get-priority-scheme)
-                     (lambda (&rest _args) ejira-test--priority-scheme)))
-            (ejira--update-task
-             (make-ejira-task :key "TEST-1"
-                              :type "Task"
-                              :status "In Progress"
-                              :project "TEST"
-                              :priority "Hidden default"
-                              :priority-id "hidden-default"
-                              :updated updated))
-            (should (equal "3"
-                           (org-with-point-at issue-marker
-                             (save-excursion
-                               (org-back-to-heading t)
-                               (looking-at org-priority-regexp)
-                               (match-string 2)))))
-            (should-not (org-with-point-at issue-marker
-                          (org-entry-get (point-marker)
-                                         ejira-priority-id-property)))))))))
+     "* TEST\n:PROPERTIES:\n:ID: TEST\n:TYPE: ejira-project\n:END:\n* DONE [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:Modified: 2026-07-09 23:18:09\n:Pushhash: WRONG\n:END:\n"
+     (goto-char (point-min))
+     (re-search-forward org-heading-regexp)
+     (let ((project-marker (point-marker)))
+       (re-search-forward org-heading-regexp)
+       (let ((issue-marker (point-marker)))
+         (puthash "TEST" project-marker ejira--heading-cache)
+         (puthash "TEST-1" issue-marker ejira--heading-cache)
+         (cl-letf (((symbol-function 'ejira--get-priority-scheme)
+                    (lambda (&rest _args) ejira-test--priority-scheme)))
+           (ejira--update-task
+            (make-ejira-task :key "TEST-1"
+                             :type "Task"
+                             :status "In Progress"
+                             :project "TEST"
+                             :priority "Hidden default"
+                             :priority-id "hidden-default"
+                             :updated updated))
+           (should (equal "3"
+                          (org-with-point-at issue-marker
+                            (save-excursion
+                              (org-back-to-heading t)
+                              (looking-at org-priority-regexp)
+                              (match-string 2)))))
+           (should-not (org-with-point-at issue-marker
+                         (org-entry-get (point-marker)
+                                        ejira-priority-id-property)))))))))
 
 (ert-deftest ejira-core--push-normalize/nil ()
   "nil maps to empty string."
@@ -578,30 +578,30 @@ Comment body.
                       (duedate . nil)
                       (status . ((name . "Open"))))))))
     (ejira-test--with-org-buf
-        "* TODO [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:JiraPriorityId: hidden-default\n:JiraPriorityName: Hidden default\n:Pushhash: WRONG\n:END:\n** Description\n"
-      (let ((marker (progn (goto-char (point-min))
-                           (re-search-forward org-heading-regexp)
-                           (point-marker))))
-        (cl-letf (((symbol-function 'jiralib2-jql-search)
-                   (lambda (&rest _args) (list remote-item)))
-                  ((symbol-function 'ejira--get-priority-scheme)
-                   (lambda (&rest _args) ejira-test--priority-scheme))
-                  ((symbol-function 'ejira--push-finalize)
-                   (lambda (&rest _args) nil))
-                  ((symbol-function 'jiralib2-update-issue)
-                   (lambda (key &rest args)
-                     (setq update-args (cons key args)))))
-          (let* ((ops (list (list :op 'update :object 'issue :key "TEST-1"
-                                  :project "TEST" :parent-issue "TEST-1"
-                                  :marker marker :data nil)))
-                 (plans (ejira--push-build-plans ops))
-                 (plan (car plans)))
-            (should (= 1 (length plans)))
-            (should (equal "Low" (nth 2 (assoc "priority"
-                                               (plist-get plan :changes)))))
-            (funcall (plist-get plan :send))
-            (should (equal '("TEST-1" (priority . ((id . "p3"))))
-                           update-args))))))))
+     "* TODO [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:JiraPriorityId: hidden-default\n:JiraPriorityName: Hidden default\n:Pushhash: WRONG\n:END:\n** Description\n"
+     (let ((marker (progn (goto-char (point-min))
+                          (re-search-forward org-heading-regexp)
+                          (point-marker))))
+       (cl-letf (((symbol-function 'jiralib2-jql-search)
+                  (lambda (&rest _args) (list remote-item)))
+                 ((symbol-function 'ejira--get-priority-scheme)
+                  (lambda (&rest _args) ejira-test--priority-scheme))
+                 ((symbol-function 'ejira--push-finalize)
+                  (lambda (&rest _args) nil))
+                 ((symbol-function 'jiralib2-update-issue)
+                  (lambda (key &rest args)
+                    (setq update-args (cons key args)))))
+         (let* ((ops (list (list :op 'update :object 'issue :key "TEST-1"
+                                 :project "TEST" :parent-issue "TEST-1"
+                                 :marker marker :data nil)))
+                (plans (ejira--push-build-plans ops))
+                (plan (car plans)))
+           (should (= 1 (length plans)))
+           (should (equal "Low" (nth 2 (assoc "priority"
+                                              (plist-get plan :changes)))))
+           (funcall (plist-get plan :send))
+           (should (equal '("TEST-1" (priority . ((id . "p3"))))
+                          update-args))))))))
 
 (ert-deftest ejira-push--priority/legacy-cookie-is-not-inferred ()
   "A dirty legacy heading can still push state without an inferred priority."
@@ -618,59 +618,59 @@ Comment body.
                       (duedate . nil)
                       (status . ((name . "In Progress"))))))))
     (ejira-test--with-org-buf
-        "* DONE [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:Pushhash: WRONG\n:END:\n** Description\n"
-      (let ((marker (progn (goto-char (point-min))
-                           (re-search-forward org-heading-regexp)
-                           (point-marker))))
-        (cl-letf (((symbol-function 'jiralib2-jql-search)
-                   (lambda (&rest _args) (list remote-item)))
-                  ((symbol-function 'ejira--get-priority-scheme)
-                   (lambda (&rest _args) ejira-test--priority-scheme)))
-          (let* ((ops (list (list :op 'update :object 'issue :key "TEST-1"
-                                  :project "TEST" :parent-issue "TEST-1"
-                                  :marker marker :data nil)))
-                 (plans (ejira--push-build-plans ops))
-                 (changes (plist-get (car plans) :changes)))
-            (should (= 1 (length plans)))
-            (should (assoc "state" changes))
-            (should-not (assoc "priority" changes))))))))
+     "* DONE [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:Pushhash: WRONG\n:END:\n** Description\n"
+     (let ((marker (progn (goto-char (point-min))
+                          (re-search-forward org-heading-regexp)
+                          (point-marker))))
+       (cl-letf (((symbol-function 'jiralib2-jql-search)
+                  (lambda (&rest _args) (list remote-item)))
+                 ((symbol-function 'ejira--get-priority-scheme)
+                  (lambda (&rest _args) ejira-test--priority-scheme)))
+         (let* ((ops (list (list :op 'update :object 'issue :key "TEST-1"
+                                 :project "TEST" :parent-issue "TEST-1"
+                                 :marker marker :data nil)))
+                (plans (ejira--push-build-plans ops))
+                (changes (plist-get (car plans) :changes)))
+           (should (= 1 (length plans)))
+           (should (assoc "state" changes))
+           (should-not (assoc "priority" changes))))))))
 
 (ert-deftest ejira-push--priority/new-subtask-uses-policy-default ()
   "New TEST subtasks explicitly receive the visible default priority."
   (let ((ejira-priority-policies ejira-test--priority-policies)
         (create-call nil))
     (ejira-test--with-org-buf "* TODO New subtask\n\nCascaded body.\n"
-      (goto-char (point-min))
-      (re-search-forward org-heading-regexp)
-      (let ((child (list :marker (point-marker)
-                         :title "New subtask"
-                         :state "TODO"
-                         :body "")))
-        (cl-letf (((symbol-function 'jiralib2-create-issue)
-                   (lambda (project type summary description &rest args)
-                     (setq create-call
-                           (list project type summary description args))
-                     '((key . "TEST-2"))))
-                  ((symbol-function 'ejira--finalize-new-issue)
-                   (lambda (&rest _args) nil)))
-          (ejira--push-create-cascaded-subtask
-           "TEST-1" "TEST" child nil nil)
-          (should (equal "Cascaded body.\n" (nth 3 create-call)))
-          (goto-char (point-min))
-          (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
-          (should (equal "p1"
-                         (cdr (assoc 'id
-                                     (cdr (assoc 'priority (nth 4 create-call))))))))))))
+                              (goto-char (point-min))
+                              (re-search-forward org-heading-regexp)
+                              (let ((child (list :marker (point-marker)
+                                                 :title "New subtask"
+                                                 :state "TODO"
+                                                 :body "")))
+                                (cl-letf (((symbol-function 'jiralib2-create-issue)
+                                           (lambda (project type summary description &rest args)
+                                             (setq create-call
+                                                   (list project type summary description args))
+                                             '((key . "TEST-2"))))
+                                          ((symbol-function 'ejira--finalize-new-issue)
+                                           (lambda (&rest _args) nil)))
+                                  (ejira--push-create-cascaded-subtask
+                                   "TEST-1" "TEST" child nil nil)
+                                  (should (equal "Cascaded body.\n" (nth 3 create-call)))
+                                  (goto-char (point-min))
+                                  (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
+                                  (should (equal "p1"
+                                                 (cdr (assoc 'id
+                                                             (cdr (assoc 'priority (nth 4 create-call))))))))))))
 
 (ert-deftest ejira-push--rule-a/clean-issue-no-op ()
   "Current Pushhash on ejira-issue produces no update op."
   ;; Compute the real hash for a heading with no children/properties.
   (let (real-hash)
     (ejira-test--with-org-buf
-        "* TODO PROJ-1 Clean Issue\n:PROPERTIES:\n:TYPE:     ejira-issue\n:ID:       PROJ-1\n:END:\n"
-      (goto-char (point-min))
-      (re-search-forward org-heading-regexp nil t)
-      (setq real-hash (md5 (ejira--heading-pushable-content))))
+     "* TODO PROJ-1 Clean Issue\n:PROPERTIES:\n:TYPE:     ejira-issue\n:ID:       PROJ-1\n:END:\n"
+     (goto-char (point-min))
+     (re-search-forward org-heading-regexp nil t)
+     (setq real-hash (md5 (ejira--heading-pushable-content))))
     (let ((ops (ejira-test--scan
                 (concat "* TODO PROJ-1 Clean Issue\n:PROPERTIES:\n"
                         ":TYPE:     ejira-issue\n:ID:       PROJ-1\n"
@@ -791,7 +791,7 @@ Draft body.
 (ert-deftest ejira-push--rule-e/new-subtask-under-issue ()
   "TODO heading without TYPE directly under ejira-issue → create-subtask op."
   (ejira-test--with-org-buf
-      "* PROJ-1 Parent Issue
+   "* PROJ-1 Parent Issue
 :PROPERTIES:
 :TYPE:     ejira-issue
 :ID:       PROJ-1
@@ -801,24 +801,24 @@ Draft body.
 
 Body for Jira.
 "
-    (let* ((ops (ejira--push-scan-buffer (current-buffer)))
-           (subtask-ops (cl-remove-if-not
-                         (lambda (op) (and (eq 'create (plist-get op :op))
-                                           (eq 'subtask (plist-get op :object))))
-                         ops)))
-      (should (= 1 (length subtask-ops)))
-      (should (equal "PROJ-1"
-                     (plist-get (plist-get (car subtask-ops) :data) :parent-key)))
-      (let* ((plan (car (ejira--push-build-plans subtask-ops)))
-             (description (cadr (assoc "description" (plist-get plan :fields)))))
-        (should (equal "Body for Jira.\n" description))))))
+   (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+          (subtask-ops (cl-remove-if-not
+                        (lambda (op) (and (eq 'create (plist-get op :op))
+                                          (eq 'subtask (plist-get op :object))))
+                        ops)))
+     (should (= 1 (length subtask-ops)))
+     (should (equal "PROJ-1"
+                    (plist-get (plist-get (car subtask-ops) :data) :parent-key)))
+     (let* ((plan (car (ejira--push-build-plans subtask-ops)))
+            (description (cadr (assoc "description" (plist-get plan :fields)))))
+       (should (equal "Body for Jira.\n" description))))))
 
 (ert-deftest ejira-push--new-subtask/migrates-body-before-create ()
   "Creating a subtask retains its direct body in the managed description."
   (let ((ejira--assign-new-issues nil)
         created-description)
     (ejira-test--with-org-buf
-        "* PROJ-1 Parent Issue
+     "* PROJ-1 Parent Issue
 :PROPERTIES:
 :TYPE:     ejira-issue
 :ID:       PROJ-1
@@ -828,24 +828,24 @@ Body for Jira.
 
 Body for Jira.
 "
-      (let* ((ops (ejira--push-scan-buffer (current-buffer)))
-             (subtask-op (cl-find-if (lambda (op) (eq 'subtask (plist-get op :object)))
-                                     ops))
-             (plan (car (ejira--push-build-plans (list subtask-op))))
-             (marker (plist-get subtask-op :marker)))
-        (cl-letf (((symbol-function 'ejira--default-priority-id) (lambda (&rest _) nil))
-                  ((symbol-function 'jiralib2-create-issue)
-                   (lambda (_project _type _summary description &rest _args)
-                     (setq created-description description)
-                     '((key . "PROJ-2"))))
-                  ((symbol-function 'ejira--finalize-new-issue) (lambda (&rest _) nil)))
-          (funcall (plist-get plan :send)))
-        (should (equal "Body for Jira.\n" created-description))
-        (org-with-point-at marker
-          (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
-          (org-with-point-at (ejira--find-child-heading "Description")
-            (should (equal "Body for Jira."
-                           (string-trim (ejira--get-heading-body (point-marker)))))))))))
+     (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+            (subtask-op (cl-find-if (lambda (op) (eq 'subtask (plist-get op :object)))
+                                    ops))
+            (plan (car (ejira--push-build-plans (list subtask-op))))
+            (marker (plist-get subtask-op :marker)))
+       (cl-letf (((symbol-function 'ejira--default-priority-id) (lambda (&rest _) nil))
+                 ((symbol-function 'jiralib2-create-issue)
+                  (lambda (_project _type _summary description &rest _args)
+                    (setq created-description description)
+                    '((key . "PROJ-2"))))
+                 ((symbol-function 'ejira--finalize-new-issue) (lambda (&rest _) nil)))
+         (funcall (plist-get plan :send)))
+       (should (equal "Body for Jira.\n" created-description))
+       (org-with-point-at marker
+         (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
+         (org-with-point-at (ejira--find-child-heading "Description")
+           (should (equal "Body for Jira."
+                          (string-trim (ejira--get-heading-body (point-marker)))))))))))
 
 (ert-deftest ejira-push--rule-e/plain-heading-under-issue-ignored ()
   "Heading without TODO under ejira-issue is NOT detected as a new subtask."
@@ -907,7 +907,7 @@ Body for Jira.
 (ert-deftest ejira-push--rule-f/new-issue-under-project ()
   "TODO heading without TYPE directly under ejira-project → create-issue op."
   (ejira-test--with-org-buf
-      "* PROJ
+   "* PROJ
 :PROPERTIES:
 :TYPE:     ejira-project
 :ID:       PROJ
@@ -916,17 +916,17 @@ Body for Jira.
 
 Body for Jira.
 "
-    (let* ((ops (ejira--push-scan-buffer (current-buffer)))
-           (issue-ops (cl-remove-if-not
-                       (lambda (op) (and (eq 'create (plist-get op :op))
-                                         (eq 'issue (plist-get op :object))))
-                       ops)))
-      (should (= 1 (length issue-ops)))
-      (should (equal "PROJ"
-                     (plist-get (plist-get (car issue-ops) :data) :project-key)))
-      (let* ((plan (car (ejira--push-build-plans issue-ops)))
-             (description (cadr (assoc "description" (plist-get plan :fields)))))
-        (should (equal "Body for Jira.\n" description))))))
+   (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+          (issue-ops (cl-remove-if-not
+                      (lambda (op) (and (eq 'create (plist-get op :op))
+                                        (eq 'issue (plist-get op :object))))
+                      ops)))
+     (should (= 1 (length issue-ops)))
+     (should (equal "PROJ"
+                    (plist-get (plist-get (car issue-ops) :data) :project-key)))
+     (let* ((plan (car (ejira--push-build-plans issue-ops)))
+            (description (cadr (assoc "description" (plist-get plan :fields)))))
+       (should (equal "Body for Jira.\n" description))))))
 
 ;;; ── ejira-push scan: Rule G (comment drafts) ─────────────────────────────────
 
@@ -1060,15 +1060,15 @@ Already on Jira.
 (ert-deftest ejira-find-heading-by-scan/finds-existing-id ()
   "Scanning locates an ID that `org-id-locations' does not know about."
   (ejira-test--with-project-dir ejira-test--project-content
-    (let ((m (ejira--find-heading-by-scan "TEST-1")))
-      (should (markerp m))
-      (org-with-point-at m
-        (should (equal "TEST-1" (org-entry-get (point) "ID")))))))
+                                (let ((m (ejira--find-heading-by-scan "TEST-1")))
+                                  (should (markerp m))
+                                  (org-with-point-at m
+                                    (should (equal "TEST-1" (org-entry-get (point) "ID")))))))
 
 (ert-deftest ejira-find-heading-by-scan/returns-nil-when-absent ()
   "Scanning returns nil for an ID that really is not there."
   (ejira-test--with-project-dir ejira-test--project-content
-    (should (null (ejira--find-heading-by-scan "TEST-999")))))
+                                (should (null (ejira--find-heading-by-scan "TEST-999")))))
 
 (ert-deftest ejira-find-heading-by-scan/searches-extra-files ()
   "A refiled issue is found through `ejira-extra-scan-files'.
@@ -1076,70 +1076,70 @@ Refiled headings live outside the project directory; when the ID
 index has been rebuilt without them, the scan must still find them or
 a sync would create a duplicate heading."
   (ejira-test--with-project-dir ejira-test--project-content
-    (let* ((extra (make-temp-file "ejira-refile-" nil ".org"))
-           (ejira-extra-scan-files (list extra)))
-      (unwind-protect
-          (progn
-            (with-temp-file extra
-              (insert "* Refiled\n:PROPERTIES:\n:ID:       TEST-EXTRA\n:TYPE:     ejira-issue\n:END:\n"))
-            (let ((m (ejira--find-heading-by-scan "TEST-EXTRA")))
-              (should (markerp m))
-              (should (equal (file-truename extra)
-                             (file-truename (buffer-file-name (marker-buffer m)))))))
-        (when-let ((b (find-buffer-visiting extra)))
-          (with-current-buffer b (set-buffer-modified-p nil))
-          (kill-buffer b))
-        (delete-file extra)))))
+                                (let* ((extra (make-temp-file "ejira-refile-" nil ".org"))
+                                       (ejira-extra-scan-files (list extra)))
+                                  (unwind-protect
+                                      (progn
+                                        (with-temp-file extra
+                                          (insert "* Refiled\n:PROPERTIES:\n:ID:       TEST-EXTRA\n:TYPE:     ejira-issue\n:END:\n"))
+                                        (let ((m (ejira--find-heading-by-scan "TEST-EXTRA")))
+                                          (should (markerp m))
+                                          (should (equal (file-truename extra)
+                                                         (file-truename (buffer-file-name (marker-buffer m)))))))
+                                    (when-let ((b (find-buffer-visiting extra)))
+                                      (with-current-buffer b (set-buffer-modified-p nil))
+                                      (kill-buffer b))
+                                    (delete-file extra)))))
 
 (ert-deftest ejira-find-heading-by-scan/repairs-org-id-locations ()
   "A successful scan re-registers the ID so the fast path works next time."
   (ejira-test--with-project-dir ejira-test--project-content
-    (should (null (gethash "TEST-1" org-id-locations)))
-    (ejira--find-heading-by-scan "TEST-1")
-    (should (gethash "TEST-1" org-id-locations))))
+                                (should (null (gethash "TEST-1" org-id-locations)))
+                                (ejira--find-heading-by-scan "TEST-1")
+                                (should (gethash "TEST-1" org-id-locations))))
 
 (ert-deftest ejira-find-heading/recovers-from-stale-org-id-locations ()
   "`ejira--find-heading' finds the item even with an empty id index.
 This is the exact condition that used to duplicate project trees."
   (ejira-test--with-project-dir ejira-test--project-content
-    (should (markerp (ejira--find-heading "TEST-1")))
-    (should (markerp (ejira--find-heading "TEST")))))
+                                (should (markerp (ejira--find-heading "TEST-1")))
+                                (should (markerp (ejira--find-heading "TEST")))))
 
 (ert-deftest ejira-new-heading/refuses-to-duplicate-existing-id ()
   "Creating a heading for an ID already in the file returns the existing one."
   (ejira-test--with-project-dir ejira-test--project-content
-    (let* ((buf (find-file-noselect (expand-file-name "TEST.org" ejira-org-directory) t))
-           (before (with-current-buffer buf (buffer-string)))
-           (m (ejira--new-heading buf nil "TEST-1")))
-      (should (markerp m))
-      (org-with-point-at m
-        (should (equal "TEST-1" (org-entry-get (point) "ID"))))
-      ;; buffer untouched: no second copy written
-      (should (equal before (with-current-buffer buf (buffer-string))))
-      (should (= 1 (with-current-buffer buf
-                     (count-matches "^:ID: +TEST-1 *$" (point-min) (point-max))))))))
+                                (let* ((buf (find-file-noselect (expand-file-name "TEST.org" ejira-org-directory) t))
+                                       (before (with-current-buffer buf (buffer-string)))
+                                       (m (ejira--new-heading buf nil "TEST-1")))
+                                  (should (markerp m))
+                                  (org-with-point-at m
+                                    (should (equal "TEST-1" (org-entry-get (point) "ID"))))
+                                  ;; buffer untouched: no second copy written
+                                  (should (equal before (with-current-buffer buf (buffer-string))))
+                                  (should (= 1 (with-current-buffer buf
+                                                 (count-matches "^:ID: +TEST-1 *$" (point-min) (point-max))))))))
 
 (ert-deftest ejira-update-task-light/defers-instead-of-escalating ()
   "A shallow sync records unknown keys rather than firing a full update."
   (ejira-test--with-project-dir ejira-test--project-content
-    (let ((ejira--shallow-only t)
-          (ejira--deferred-keys nil))
-      (cl-letf (((symbol-function 'ejira--update-task)
-                 (lambda (&rest _) (error "must not escalate during shallow sync"))))
-        (should (null (ejira--update-task-light "TEST-404" "Open" nil)))
-        (should (equal '("TEST-404") ejira--deferred-keys))))))
+                                (let ((ejira--shallow-only t)
+                                      (ejira--deferred-keys nil))
+                                  (cl-letf (((symbol-function 'ejira--update-task)
+                                             (lambda (&rest _) (error "must not escalate during shallow sync"))))
+                                    (should (null (ejira--update-task-light "TEST-404" "Open" nil)))
+                                    (should (equal '("TEST-404") ejira--deferred-keys))))))
 
 (ert-deftest ejira-update-task-light/escalates-when-not-shallow ()
   "A full sync still falls back to `ejira--update-task' for unknown keys."
   (ejira-test--with-project-dir ejira-test--project-content
-    (let ((ejira--shallow-only nil)
-          (ejira--deferred-keys nil)
-          (called nil))
-      (cl-letf (((symbol-function 'ejira--update-task)
-                 (lambda (k) (setq called k))))
-        (ejira--update-task-light "TEST-404" "Open" nil)
-        (should (equal "TEST-404" called))
-        (should (null ejira--deferred-keys))))))
+                                (let ((ejira--shallow-only nil)
+                                      (ejira--deferred-keys nil)
+                                      (called nil))
+                                  (cl-letf (((symbol-function 'ejira--update-task)
+                                             (lambda (k) (setq called k))))
+                                    (ejira--update-task-light "TEST-404" "Open" nil)
+                                    (should (equal "TEST-404" called))
+                                    (should (null ejira--deferred-keys))))))
 
 ;;; ── JIRA -> Org conversion (regressions) ─────────────────────────────────────
 
@@ -1321,18 +1321,18 @@ heading level to h1 and the original levels are lost on push."
 (ert-deftest ejira-heading-body-level/uses-outline-depth ()
   "The shift level is the heading's outline depth, not match data."
   (ejira-test--with-org-buf "* One\n** Two\n*** Three\n******* Seven\n"
-    (dolist (level '(1 2 3 7))
-      (should (= level (ejira--heading-body-level (point-marker))))
-      (forward-line))))
+                            (dolist (level '(1 2 3 7))
+                              (should (= level (ejira--heading-body-level (point-marker))))
+                              (forward-line))))
 
 (ert-deftest ejira-narrow-to-body/ignores-child-drawers ()
   "A drawer on a child must not hide the parent's body before it."
   (ejira-test--with-org-buf
-      "** Description\n\nIntro.\n*** Section\n:PROPERTIES:\n:CUSTOM_ID: section\n:END:\n\nSection body.\n"
-    (let ((body (ejira--get-heading-body (point-marker))))
-      (should (string-match-p "Intro\\." body))
-      (should (string-match-p "Section body\\." body))
-      (should (string-match-p "\\*\\*\\* Section" body)))))
+   "** Description\n\nIntro.\n*** Section\n:PROPERTIES:\n:CUSTOM_ID: section\n:END:\n\nSection body.\n"
+   (let ((body (ejira--get-heading-body (point-marker))))
+     (should (string-match-p "Intro\\." body))
+     (should (string-match-p "Section body\\." body))
+     (should (string-match-p "\\*\\*\\* Section" body)))))
 
 (ert-deftest ejira-narrow-to-body/blank-body-keeps-following-headings ()
   "A body of only blank lines must not swallow the next heading.
@@ -1340,19 +1340,19 @@ heading level to h1 and the original levels are lost on push."
 heading; computing the subtree end from there used to delete a
 sibling -- an issue subtree in the generated project files."
   (ejira-test--with-org-buf
-      "* Issue\n** Description\n\n** TODO Child\n:PROPERTIES:\n:ID: X-1\n:END:\n\nKeep me.\n"
-    (let ((d (progn (goto-char (point-min))
-                    (re-search-forward "^\\*\\* Description")
-                    (org-back-to-heading t)
-                    (point-marker))))
-      (ejira--set-heading-body d "*** New body")
-      (should (string-match-p "\\*\\* TODO Child" (buffer-string)))
-      (should (string-match-p "Keep me\\." (buffer-string)))
-      (should (string-match-p "New body" (buffer-string)))
-      (org-with-point-at d
-        (save-excursion
-          (should (org-goto-first-child))
-          (should (equal "New body" (org-get-heading t t t t))))))))
+   "* Issue\n** Description\n\n** TODO Child\n:PROPERTIES:\n:ID: X-1\n:END:\n\nKeep me.\n"
+   (let ((d (progn (goto-char (point-min))
+                   (re-search-forward "^\\*\\* Description")
+                   (org-back-to-heading t)
+                   (point-marker))))
+     (ejira--set-heading-body d "*** New body")
+     (should (string-match-p "\\*\\* TODO Child" (buffer-string)))
+     (should (string-match-p "Keep me\\." (buffer-string)))
+     (should (string-match-p "New body" (buffer-string)))
+     (org-with-point-at d
+       (save-excursion
+         (should (org-goto-first-child))
+         (should (equal "New body" (org-get-heading t t t t))))))))
 
 (ert-deftest ejira-description/pull-keeps-headings-contained ()
   "Repeated description pulls are idempotent, keep siblings and deep levels.
@@ -1360,26 +1360,26 @@ Reproduces the corrupted epics: newlines collapsed, the body became
 one long paragraph, and later pulls saw an empty description."
   (dolist (level '(2 7))
     (ejira-test--with-org-buf
-        (format "%s TODO Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:END:\n%s Description\n\nOld body.\n%s TODO Child\n:PROPERTIES:\n:ID: TEST-2\n:END:\nKeep me.\n"
-                (make-string (1- level) ?*) (make-string level ?*)
-                (make-string level ?*))
-      (let* ((issue (point-marker))
-             (description (ejira--find-child-heading "Description"))
-             (jira "h1. Outcome\nText.\n\nh2. Details\n* First\n* Second\n")
-             (expected (ejira--expected-org-body description jira)))
-        (dotimes (_ 2)
-          (ejira--set-heading-body-jira-markup description jira)
-          (should (equal expected (string-trim (ejira--get-heading-body description))))
-          (should (equal expected (ejira--expected-jira-description issue jira)))
-          (org-with-point-at issue (ejira--update-push-baseline))
-          (should-not (org-with-point-at issue (ejira--locally-modified-p)))
-          (org-with-point-at issue
-            (should (ejira--find-child-heading "Child")))
-          (goto-char description)
-          (should (org-goto-first-child))
-          (should (= (1+ level) (org-current-level)))
-          (should (equal "Outcome" (org-get-heading t t t t))))
-        (should (string-suffix-p "Keep me.\n" (buffer-string)))))))
+     (format "%s TODO Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:END:\n%s Description\n\nOld body.\n%s TODO Child\n:PROPERTIES:\n:ID: TEST-2\n:END:\nKeep me.\n"
+             (make-string (1- level) ?*) (make-string level ?*)
+             (make-string level ?*))
+     (let* ((issue (point-marker))
+            (description (ejira--find-child-heading "Description"))
+            (jira "h1. Outcome\nText.\n\nh2. Details\n* First\n* Second\n")
+            (expected (ejira--expected-org-body description jira)))
+       (dotimes (_ 2)
+         (ejira--set-heading-body-jira-markup description jira)
+         (should (equal expected (string-trim (ejira--get-heading-body description))))
+         (should (equal expected (ejira--expected-jira-description issue jira)))
+         (org-with-point-at issue (ejira--update-push-baseline))
+         (should-not (org-with-point-at issue (ejira--locally-modified-p)))
+         (org-with-point-at issue
+           (should (ejira--find-child-heading "Child")))
+         (goto-char description)
+         (should (org-goto-first-child))
+         (should (= (1+ level) (org-current-level)))
+         (should (equal "Outcome" (org-get-heading t t t t))))
+       (should (string-suffix-p "Keep me.\n" (buffer-string)))))))
 
 (ert-deftest ejira-parser/heading-spacing-canonical ()
   "Converted headings are separated from surrounding content.
@@ -1421,28 +1421,28 @@ blank on every pull.  `ejira--get-heading-body' strips one leading
 newline (the region's first line break), so the three blank lines
 of the fixture come back as two."
   (ejira-test--with-org-buf
-      "** Issue\n:PROPERTIES:\n:ID: X-1\n:END:\n** Description\n\n\n\nStaging.\n"
-    (let ((d (progn (goto-char (point-min))
-                    (re-search-forward "^\\*\\* Description")
-                    (org-back-to-heading t)
-                    (point-marker))))
-      (should (equal "\n\nStaging.\n"
-                     (ejira--get-heading-body d))))))
+   "** Issue\n:PROPERTIES:\n:ID: X-1\n:END:\n** Description\n\n\n\nStaging.\n"
+   (let ((d (progn (goto-char (point-min))
+                   (re-search-forward "^\\*\\* Description")
+                   (org-back-to-heading t)
+                   (point-marker))))
+     (should (equal "\n\nStaging.\n"
+                    (ejira--get-heading-body d))))))
 
 (ert-deftest ejira-set-heading-body/canonical-boundaries-idempotent ()
   "A rewrite replaces the whole old body, blanks included, and is stable."
   (ejira-test--with-org-buf
-      "** Description\n\n\n\nOld body.\n** Comments\n:PROPERTIES:\n:ID: X-2\n:END:\n"
-    (let ((d (progn (goto-char (point-min))
-                    (re-search-forward "^\\*\\* Description")
-                    (org-back-to-heading t)
-                    (point-marker))))
-      (ejira--set-heading-body d "New body.")
-      (should (equal (buffer-string)
-                     "** Description\n\nNew body.\n\n** Comments\n:PROPERTIES:\n:ID: X-2\n:END:\n"))
-      (ejira--set-heading-body d "New body.")
-      (should (equal (buffer-string)
-                     "** Description\n\nNew body.\n\n** Comments\n:PROPERTIES:\n:ID: X-2\n:END:\n")))))
+   "** Description\n\n\n\nOld body.\n** Comments\n:PROPERTIES:\n:ID: X-2\n:END:\n"
+   (let ((d (progn (goto-char (point-min))
+                   (re-search-forward "^\\*\\* Description")
+                   (org-back-to-heading t)
+                   (point-marker))))
+     (ejira--set-heading-body d "New body.")
+     (should (equal (buffer-string)
+                    "** Description\n\nNew body.\n\n** Comments\n:PROPERTIES:\n:ID: X-2\n:END:\n"))
+     (ejira--set-heading-body d "New body.")
+     (should (equal (buffer-string)
+                    "** Description\n\nNew body.\n\n** Comments\n:PROPERTIES:\n:ID: X-2\n:END:\n")))))
 
 (ert-deftest ejira-body-shape/canonical-p ()
   "Boundary shape: exactly one blank line each side; empty bodies pass."
@@ -1452,6 +1452,272 @@ of the fixture come back as two."
   (should-not (ejira--body-shape-canonical-p "\n\nBody.\n\n\n"))
   (should (ejira--body-shape-canonical-p "\n"))
   (should (ejira--body-shape-canonical-p "")))
+
+;;; ── Body-as-description ownership ────────────────────────────────────────────
+
+(defconst ejira-test--body-desc-content
+  "* STARTED Parent task
+:PROPERTIES:
+:ID:       TEST-1
+:TYPE:     ejira-issue
+:END:
+
+Parent prose.
+
+** Section one
+
+Section prose.
+
+*** Deep section
+
+Deep prose.
+
+** TODO Child task
+:PROPERTIES:
+:ID:       TEST-2
+:END:
+
+Child body.
+
+** Comments
+
+*** [2026-09-17 Thu 10:00] Author
+
+Comment body.
+")
+
+(defmacro ejira-test--with-body-desc (&rest body)
+  "Run BODY in `ejira-test--body-desc-content' with body-as-description on."
+  `(ejira-test--with-org-buf ejira-test--body-desc-content
+                             (let ((ejira-description-in-body t)
+                                   (marker (point-min-marker)))
+                               (cl-letf (((symbol-function 'ejira--find-heading)
+                                          (lambda (_id) marker)))
+                                 (goto-char (point-min))
+                                 ,@body))))
+
+(ert-deftest ejira-body-desc/extraction-stops-at-child-task-and-comments ()
+  "The owned description is the prose plus ordinary subheadings only."
+  (ejira-test--with-body-desc
+   (let ((desc (ejira--get-task-description)))
+     (should (string-prefix-p "Parent prose." desc))
+     (should (string-match-p "^\\*\\* Section one$" desc))
+     (should (string-match-p "^\\*\\*\\* Deep section$" desc))
+     (should (string-match-p "Deep prose." desc))
+     (should-not (string-match-p "Child body." desc))
+     (should-not (string-match-p "Comment body." desc)))))
+
+(ert-deftest ejira-body-desc/extraction-ends-at-first-boundary ()
+  "Content after a nested task's subtree stays local-only (first-segment rule)."
+  (ejira-test--with-org-buf
+   "* TODO Parent
+:PROPERTIES:
+:ID:       TEST-1
+:END:
+
+Before prose.
+
+** Impl section
+
+Impl prose.
+
+*** TODO Nested
+:PROPERTIES:
+:ID:       TEST-2
+:END:
+
+Nested body.
+
+Trailing section prose.
+"
+   (let ((ejira-description-in-body t))
+     (goto-char (point-min))
+     (let ((desc (ejira--get-task-description)))
+       (should (string-match-p "Before prose." desc))
+       (should (string-match-p "Impl prose." desc))
+       (should-not (string-match-p "Nested body." desc))
+       (should-not (string-match-p "Trailing section prose." desc)))
+     ;; Rewriting the owned region must not touch the nested task or the
+     ;; trailing content.
+     (ejira--set-task-description "New prose.")
+     (let ((full (buffer-string)))
+       (should (string-match-p "^\\*\\*\\* TODO Nested$" full))
+       (should (string-match-p "Nested body." full))
+       (should (string-match-p "Trailing section prose." full))
+       (should-not (string-match-p "Before prose." full))))))
+
+(ert-deftest ejira-body-desc/setter-preserves-tasks-and-comments ()
+  "A description rewrite keeps child tasks and Comments, with canonical
+blank-line boundaries, and is idempotent."
+  (ejira-test--with-body-desc
+   (ejira--set-task-description "Replaced prose.\n\n** New section")
+   (let ((full (buffer-string)))
+     (should (string-match-p "Replaced prose." full))
+     (should (string-match-p "^\\*\\* New section$" full))
+     (should (string-match-p "Child body." full))
+     (should (string-match-p "Comment body." full))
+     (should-not (string-match-p "Parent prose." full))
+     ;; Canonical boundaries: no doubled blank lines.
+     (should-not (string-match-p "\n\n\n" full)))
+   (goto-char (point-min))
+   (let ((before (buffer-string)))
+     (ejira--set-task-description "Replaced prose.\n\n** New section")
+     (should (equal before (buffer-string))))))
+
+(ert-deftest ejira-body-desc/import-round-trips-through-jira-markup ()
+  "Jira markup imports into the owned region with headings shifted
+below the task; child tasks and Comments survive the import."
+  (ejira-test--with-body-desc
+   (ejira--set-jira-description-jira-markup
+    "TEST-1" "h1. Imported intro\n\nh2. Imported section\n\nBody of section.")
+   (let ((full (buffer-string)))
+     (should (string-match-p "^\\*\\* Imported intro$" full))
+     (should (string-match-p "^\\*\\*\\* Imported section$" full))
+     (should (string-match-p "Body of section." full))
+     (should (string-match-p "Child body." full))
+     (should (string-match-p "Comment body." full))
+     (should-not (string-match-p "Parent prose." full)))
+   ;; The accessor reads back what was imported, and the pushable
+   ;; fingerprint covers the imported content without any child content.
+   (goto-char (point-min))
+   (should (string-match-p "Imported intro" (ejira--jira-description)))
+   (should (string-match-p "Imported intro"
+                           (ejira--heading-content-fields)))
+   (should-not (string-match-p "Child body."
+                               (ejira--heading-content-fields)))))
+
+(ert-deftest ejira-body-desc/new-issue-uses-body-without-moving-it ()
+  "Creation under body mode exports the owned body and creates no
+Description child."
+  (ejira-test--with-org-buf
+   "* TODO Fresh task\n:PROPERTIES:\n:ID:       TEST-9\n:END:\n\nFresh body.\n"
+   (let ((ejira-description-in-body t))
+     (goto-char (point-min))
+     (should (equal "Fresh body.\n" (ejira--new-issue-description)))
+     (ejira--prepare-new-issue-description)
+     (should-not (string-match-p "^\\*\\* Description$" (buffer-string)))
+     (should (string-match-p "Fresh body." (buffer-string))))))
+
+(ert-deftest ejira-body-desc/property-opt-in ()
+  "The inherited EJIRA_DESCRIPTION_IN_BODY property enables body mode
+without the global variable."
+  (ejira-test--with-org-buf
+   "* TODO Task\n:PROPERTIES:\n:ID:       TEST-1\n:EJIRA_DESCRIPTION_IN_BODY: t\n:END:\n\nBody prose.\n"
+   (should (ejira--description-in-body-p))
+   (goto-char (point-min))
+   (should (equal "Body prose.\n" (ejira--jira-description)))))
+
+(ert-deftest ejira-body-desc/legacy-mode-still-uses-description-child ()
+  "Without body mode the legacy Description child is read and created."
+  (ejira-test--with-org-buf
+   "* TODO Task\n:PROPERTIES:\n:ID:       TEST-1\n:END:\n\nLegacy body.\n"
+   (let ((marker (point-min-marker)))
+     (cl-letf (((symbol-function 'ejira--find-heading)
+                (lambda (_id) marker)))
+       (should-not (ejira--description-in-body-p))
+       (goto-char (point-min))
+       (should (equal "Legacy body.\n" (ejira--new-issue-description)))
+       ;; Legacy prepare moves the body into a Description child.
+       (ejira--prepare-new-issue-description)
+       (should (string-match-p "^\\*\\* Description$" (buffer-string)))
+       (goto-char (point-min))
+       (should (equal "Legacy body."
+                      (string-trim (ejira--jira-description))))))))
+
+;;; ── v2 split baselines ───────────────────────────────────────────────────────
+
+(ert-deftest ejira-v2-baseline/light-pull-acks-state-only ()
+  "A shallow pull acknowledges the state fields it fetched, and must
+not acknowledge unpushed local content edits."
+  (ejira-test--with-project-dir ejira-test--project-content
+                                (let ((buf (find-file-noselect
+                                            (expand-file-name "TEST.org" ejira-org-directory) t)))
+                                  (with-current-buffer buf
+                                    ;; Establish v2 baselines, then make a local summary edit (the
+                                    ;; summary is a content field; in legacy mode body text is not
+                                    ;; pushable, so a body edit would not register at all).
+                                    (goto-char (point-min))
+                                    (re-search-forward "^\\*\\* TODO An issue")
+                                    (ejira--migrate-push-baseline)
+                                    (should (ejira--v2-baseline-p))
+                                    (beginning-of-line)
+                                    (org-with-point-at (point-marker)
+                                      (replace-regexp "TODO An issue" "TODO An issue edited" nil
+                                                      (point) (line-end-position)))
+                                    (should (ejira--content-modified-p))
+                                    (should-not (ejira--state-modified-p))
+                                    ;; Shallow pull: status/assignee from Jira.  The tag branch calls
+                                    ;; `ejira--my-fullname', which would hit the network in batch.
+                                    (cl-letf (((symbol-function 'ejira--my-fullname)
+                                               (lambda () "Test User")))
+                                      (ejira--update-task-light "TEST-1" "Done" "someone"))
+                                    ;; State fields were acknowledged...
+                                    (should-not (ejira--state-modified-p))
+                                    (should (equal "Done" (org-entry-get nil "Status")))
+                                    ;; ...but the content edit is still pending and detectable.
+                                    (should (ejira--content-modified-p))
+                                    (should (ejira--locally-modified-p))))))
+
+(ert-deftest ejira-v2-baseline/legacy-light-pull-acks-everything ()
+  "Legacy headings keep their historical single-hash behavior: a
+shallow pull re-baselines the whole content, edits included."
+  (ejira-test--with-project-dir ejira-test--project-content
+                                (let ((buf (find-file-noselect
+                                            (expand-file-name "TEST.org" ejira-org-directory) t)))
+                                  (with-current-buffer buf
+                                    (goto-char (point-min))
+                                    (re-search-forward "^\\*\\* TODO An issue")
+                                    (ejira--update-push-baseline)
+                                    (should-not (ejira--v2-baseline-p))
+                                    (beginning-of-line)
+                                    (org-with-point-at (point-marker)
+                                      (replace-regexp "TODO An issue" "TODO An issue edited" nil
+                                                      (point) (line-end-position)))
+                                    (should (ejira--locally-modified-p))
+                                    (cl-letf (((symbol-function 'ejira--my-fullname)
+                                               (lambda () "Test User")))
+                                      (ejira--update-task-light "TEST-1" "Done" "someone"))
+                                    (should-not (ejira--locally-modified-p))))))
+
+(ert-deftest ejira-v2-baseline/state-edits-are-detected ()
+  "A local todo-state edit dirties the state baseline, not the
+content baseline."
+  (ejira-test--with-project-dir ejira-test--project-content
+                                (let ((buf (find-file-noselect
+                                            (expand-file-name "TEST.org" ejira-org-directory) t)))
+                                  (with-current-buffer buf
+                                    (goto-char (point-min))
+                                    (re-search-forward "^\\*\\* TODO An issue")
+                                    (ejira--migrate-push-baseline)
+                                    (should-not (ejira--locally-modified-p))
+                                    (org-todo "DONE")
+                                    (should (ejira--state-modified-p))
+                                    (should (ejira--locally-modified-p))
+                                    (should-not (ejira--content-modified-p))))))
+
+(ert-deftest ejira-push-finalize/acks-only-reviewed-content ()
+  "Finalization re-baselines only when the heading still matches the
+reviewed snapshot; later edits stay dirty."
+  (ejira-test--with-project-dir ejira-test--project-content
+                                (let ((buf (find-file-noselect
+                                            (expand-file-name "TEST.org" ejira-org-directory) t)))
+                                  (with-current-buffer buf
+                                    (goto-char (point-min))
+                                    (re-search-forward "^\\*\\* TODO An issue")
+                                    (ejira--migrate-push-baseline)
+                                    (beginning-of-line)
+                                    (let ((marker (point-marker))
+                                          (reviewed (md5 (ejira--heading-reviewed-hash))))
+                                      ;; An edit made after the review: never sent.
+                                      (org-with-point-at marker
+                                        (replace-regexp "TODO An issue" "TODO An issue edited" nil
+                                                        (point) (line-end-position)))
+                                      (ejira--push-finalize marker reviewed)
+                                      (should (ejira--locally-modified-p))
+                                      ;; A reviewed snapshot matching the current content re-baselines.
+                                      (setq reviewed (md5 (ejira--heading-reviewed-hash)))
+                                      (ejira--push-finalize marker reviewed)
+                                      (should-not (ejira--locally-modified-p)))))))
 
 (provide 'ejira-test)
 ;;; ejira-test.el ends here

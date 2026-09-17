@@ -157,9 +157,20 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
   (let ((parts (delq nil parts)))
     (when parts (string-join parts "\n"))))
 
-(defun ejira--push-finalize (marker)
-  "Refresh MARKER's push baseline after a successful push and save its buffer."
-  (org-with-point-at marker (ejira--update-push-baseline))
+(defun ejira--push-finalize (marker &optional reviewed-hash)
+  "Refresh MARKER's push baseline after a successful push and save its buffer.
+
+With REVIEWED-HASH, re-baseline only when the heading still matches the
+state that was reviewed and sent; content edited while the confirmation
+was open was never sent, and keeps the heading dirty so the next save
+re-reviews it."
+  (org-with-point-at marker
+    (if (and reviewed-hash
+             (not (equal reviewed-hash
+                         (md5 (ejira--heading-reviewed-hash)))))
+        (message "ejira: %s changed since review; keeping it dirty"
+                 (or (org-entry-get nil "ID") "<heading>"))
+      (ejira--update-push-baseline)))
   (let ((ejira--pushing t))
     (with-current-buffer (marker-buffer marker)
       (ejira--save-buffer-safe))))
@@ -409,12 +420,16 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  ;; Outline level of the heading holding the Jira-facing
                  ;; description.  Exporting relative to it keeps the original
                  ;; h1/h2/... levels when an edited description is pushed back.
+                 ;; In body-as-description mode the task heading itself is
+                 ;; the container.
                  (desc-level (org-with-point-at marker
-                               (when-let ((d (ejira--find-child-heading
-                                              (if (ejira--jira-projection-p)
-                                                  ejira-jira-description-heading-name
-                                                ejira-description-heading-name))))
-                                 (ejira--heading-body-level d))))
+                               (if (ejira--description-in-body-p)
+                                   (org-current-level)
+                                 (when-let ((d (ejira--find-child-heading
+                                                (if (ejira--jira-projection-p)
+                                                    ejira-jira-description-heading-name
+                                                  ejira-description-heading-name))))
+                                   (ejira--heading-body-level d)))))
                  (local-assignee (or (org-entry-get marker "Assignee") ""))
                  (priority-scheme (when item (ejira--get-priority-scheme key)))
                  (local-priority-entry
@@ -474,7 +489,13 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  (desc-changed (assoc "description" changes))
                  (assignee-changed (assoc "assignee" changes))
                  (deadline-changed (assoc "deadline" changes))
-                 (state-changed (assoc "state" changes)))
+                 (state-changed (assoc "state" changes))
+                 ;; Hash of the reviewed local state.  Finalization
+                 ;; re-baselines only when the heading still matches: edits
+                 ;; made while the confirmation was open were never sent and
+                 ;; must stay dirty for the next save.
+                 (reviewed-hash (org-with-point-at marker
+                                  (md5 (ejira--heading-reviewed-hash)))))
             (if changes
                 (push (list :op 'update
                             :object 'issue
@@ -505,6 +526,7 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                         (local-deadline local-deadline)
                                         (local-state local-state)
                                         (todo-kws todo-kws)
+                                        (reviewed-hash reviewed-hash)
                                         (summary-changed summary-changed)
                                         (desc-changed desc-changed)
                                         (assignee-changed assignee-changed)
@@ -529,11 +551,11 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                          key `(duedate . ,(or local-deadline ""))))
                                       (when state-changed
                                         (ejira--transition-to-org-state key local-state todo-kws))
-                                      (ejira--push-finalize marker))))
+                                      (ejira--push-finalize marker reviewed-hash))))
                       plans)
               ;; No changes vs remote — re-baseline to clear the dirty hash.
               (when item
-                (org-with-point-at marker (ejira--update-push-baseline))))))))
+                (org-with-point-at marker (ejira--migrate-push-baseline))))))))
     (dolist (op (nreverse other-ops))
       (let* ((op-type (plist-get op :op))
              (object (plist-get op :object))
@@ -555,6 +577,8 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                  ;; comments round-trip their heading levels.
                  (comment-level (ejira--heading-body-level marker))
                  (local-body (ejira--get-heading-body marker))
+                 (reviewed-hash (org-with-point-at marker
+                                  (md5 (ejira--heading-reviewed-hash))))
                  (changes (ejira-confirm-field-changes
                            `(("body" ,(or remote-org "") ,local-body)))))
             (when changes
@@ -568,12 +592,13 @@ ASSIGN-SELF is the value (t/nil) of the parent's assign-self cell."
                                :send (let ((issue-key issue-key) (commid commid)
                                            (marker marker)
                                            (comment-level comment-level)
-                                           (body local-body))
+                                           (body local-body)
+                                           (reviewed-hash reviewed-hash))
                                        (lambda ()
                                          (jiralib2-edit-comment
                                           issue-key commid
                                           (ejira-parser-org-to-jira body comment-level))
-                                         (ejira--push-finalize marker))))))))
+                                         (ejira--push-finalize marker reviewed-hash))))))))
          ((and (eq op-type 'update) (eq object 'status))
           (let ((action-name (plist-get data :action-name)))
             (setq plan (list :op 'update
