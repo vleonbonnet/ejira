@@ -1894,5 +1894,190 @@ holds as conflict, clean+unchanged does nothing."
                                       (re-search-forward "^\\*\\* TODO An issue edited")
                                       (should (ejira--locally-modified-p)))))))
 
+;;; ── Refile / cache invalidation (regressions) ────────────────────────────────
+;;
+;; A refile invalidates only the moved heading's own cache entry.  Cached
+;; markers for its descendants kept pointing into the source buffer at the
+;; removal site, and later updates rewrote whatever heading now lived there.
+;; Observed live: a refiled epic's comments and subtasks were rewritten onto
+;; an unrelated heading, leaving duplicate identities behind.
+
+(defmacro ejira-test--with-two-files (content-a content-b &rest body)
+  "Run BODY with two file-backed org buffers holding CONTENT-A and CONTENT-B.
+Binds FILE-A, BUF-A, FILE-B and BUF-B.  All ejira lookups are pointed at
+exactly these two files; the heading cache and `org-id-locations' are
+fresh."
+  (declare (indent 1))
+  `(let* ((dir (make-temp-file "ejira-test-" t))
+          (file-a (expand-file-name "a.org" dir))
+          (file-b (expand-file-name "b.org" dir))
+          (ejira-projects nil)
+          (ejira-extra-scan-files (list file-a file-b))
+          (ejira--heading-cache (make-hash-table :test #'equal))
+          (org-id-locations (make-hash-table :test 'equal)))
+     (unwind-protect
+         (let ((buf-a (progn (with-temp-file file-a (insert ,content-a))
+                             (find-file-noselect file-a t)))
+               (buf-b (progn (with-temp-file file-b (insert ,content-b))
+                             (find-file-noselect file-b t))))
+           ,@body)
+       (dolist (b (buffer-list))
+         (when (and (buffer-file-name b)
+                    (string-prefix-p dir (buffer-file-name b)))
+           (with-current-buffer b (set-buffer-modified-p nil))
+           (kill-buffer b)))
+       (delete-directory dir t))))
+
+(ert-deftest ejira-refile/evicts-cached-descendant-markers ()
+  "After a cross-file refile, a cached descendant marker must not be trusted.
+The refile moves the whole subtree; markers of cached descendants stay in
+the source buffer at the removal site.  `ejira--find-heading' must re-scan
+and return the descendant's new location."
+  (ejira-test--with-two-files
+   "* Parent\n:PROPERTIES:\n:ID: T-1\n:END:\n** Child\n:PROPERTIES:\n:ID: T-2\n:END:\n"
+   "* Target\n:PROPERTIES:\n:ID: T-3\n:END:\n"
+   ;; Populate the cache for the parent and its descendant.
+   (should (markerp (ejira--find-heading "T-1")))
+   (should (markerp (ejira--find-heading "T-2")))
+   (ejira--refile "T-1" "T-3")
+   ;; T-2 moved into file B with its parent: the stale marker in A must
+   ;; not be returned.
+   (let ((m (ejira--find-heading "T-2")))
+     (should (markerp m))
+     (should (eq buf-b (marker-buffer m)))
+     (should (equal "T-2" (with-current-buffer buf-b
+                            (org-entry-get (marker-position m) "ID")))))
+   ;; The moved parent itself resolves to file B as well.
+   (let ((m (ejira--find-heading "T-1")))
+     (should (markerp m))
+     (should (eq buf-b (marker-buffer m))))))
+
+(ert-deftest ejira-find-heading/does-not-trust-stale-cache-hit ()
+  "A cache entry whose marker no longer sits on the owning ID is evicted."
+  (ejira-test--with-two-files
+   "* Real\n:PROPERTIES:\n:ID: T-9\n:END:\n"
+   "* Impostor\n:PROPERTIES:\n:ID: T-OTHER\n:END:\n"
+   (should (markerp (ejira--find-heading "T-9")))
+   ;; Simulate a marker left behind by a refile: it points into buffer B
+   ;; (at T-OTHER) while still being cached for T-9.
+   (with-current-buffer buf-b
+     (goto-char (point-min)))
+   (puthash "T-9" (with-current-buffer buf-b (point-marker))
+            ejira--heading-cache)
+   (let ((m (ejira--find-heading "T-9")))
+     (should (markerp m))
+     (should (eq buf-a (marker-buffer m)))
+     (should (equal "T-9" (with-current-buffer buf-a
+                            (org-entry-get (marker-position m) "ID")))))))
+
+;;; ── Body-as-description boundary (regressions) ───────────────────────────────
+;;
+;; With an empty own body, `org-end-of-meta-data' lands directly on the
+;; first descendant heading.  A boundary scan that only tests headings
+;; *after* advancing skipped that first child, so a leading Comments
+;; container or child task was swallowed by the description-owned region
+;; -- and the next description rewrite deleted it.
+
+(defconst ejira-test--empty-body-comments-task
+  "* TODO TEST-1 Task\n:PROPERTIES:\n:ID: TEST-1\n:TYPE: ejira-issue\n:END:\n\
+** Comments\n\
+*** [2026-09-01 Mon 10:00] Someone\n:PROPERTIES:\n:CommId: 123\n:END:\n\
+Comment body.\n\
+** Some plain section\n\
+Plain owned prose.\n")
+
+(defconst ejira-test--empty-body-plain-before-comments-task
+  "* TODO TEST-1 Task\n:PROPERTIES:\n:ID: TEST-1\n:TYPE: ejira-issue\n:END:\n\
+** Some plain section\n\
+Plain owned prose.\n\
+** Comments\n\
+*** [2026-09-01 Mon 10:00] Someone\n:PROPERTIES:\n:CommId: 123\n:END:\n\
+Comment body.\n")
+
+(ert-deftest ejira-description-boundary/empty-body-never-swallows-comments ()
+  "An empty own body followed by Comments yields an empty owned region."
+  (let ((ejira-description-in-body t))
+    (ejira-test--with-org-buf ejira-test--empty-body-comments-task
+                              (goto-char (point-min))
+                              (let ((region (ejira--task-description-region)))
+                                (should (= (car region) (cdr region)))))))
+
+(ert-deftest ejira-description-boundary/empty-body-never-swallows-child-task ()
+  "An empty own body followed by a child task yields an empty owned region."
+  (let ((ejira-description-in-body t))
+    (ejira-test--with-org-buf
+     "* TODO TEST-1 Task\n:PROPERTIES:\n:ID: TEST-1\n:TYPE: ejira-issue\n:END:\n\
+** TODO TEST-2 Child\n:PROPERTIES:\n:ID: TEST-2\n:TYPE: ejira-issue\n:END:\n\
+Child body.\n"
+     (goto-char (point-min))
+     (let ((region (ejira--task-description-region)))
+       (should (= (car region) (cdr region)))))))
+
+(ert-deftest ejira-description-boundary/plain-section-before-comments-is-owned ()
+  "A plain section before the Comments container stays in the owned region."
+  (let ((ejira-description-in-body t))
+    (ejira-test--with-org-buf
+     ejira-test--empty-body-plain-before-comments-task
+     (goto-char (point-min))
+     (let* ((region (ejira--task-description-region))
+            (comments-line (progn (goto-char (point-min))
+                                  (re-search-forward "^\\*\\* Comments")
+                                  (line-beginning-position))))
+       ;; The region ends exactly at the Comments container: it owns the
+       ;; plain section but never the comment entries below.
+       (should (<= (car region) comments-line))
+       (should (= (cdr region) comments-line))
+       (should (string-match-p
+                "Plain owned prose"
+                (buffer-substring-no-properties
+                 (car region) (cdr region))))
+       (should-not (string-match-p
+                    "Comment body"
+                    (buffer-substring-no-properties
+                     (car region) (cdr region))))))))
+
+(ert-deftest ejira-description-set/empty-body-preserves-comments ()
+  "Rewriting the description of an empty-body task keeps the Comments container."
+  (let ((ejira-description-in-body t))
+    (ejira-test--with-org-buf ejira-test--empty-body-comments-task
+                              (goto-char (point-min))
+                              (ejira--set-task-description "Fresh description")
+                              ;; The accessor contract is point on the task
+                              ;; heading; the setter leaves point at the
+                              ;; insertion site, so go back explicitly.
+                              (goto-char (point-min))
+                              (should (equal "Fresh description"
+                                             (string-trim (ejira--get-task-description))))
+                              (should (= 1 (count-matches "^\\*\\* Comments" (point-min) (point-max))))
+                              (should (= 1 (count-matches ":CommId: +123" (point-min) (point-max)))))))
+
+;;; ── Creation placement (regressions) ─────────────────────────────────────────
+
+(ert-deftest ejira-new-heading/lands-inside-parent-subtree ()
+  "A heading created under a parent is the parent's last child.
+`ejira--true-subtree-end' returns a position without moving point; the
+insertion must jump there explicitly, or the heading lands above the
+parent and a later refile has to repair the placement."
+  (ejira-test--with-project-dir ejira-test--project-content
+                                (let* ((buf (find-file-noselect
+                                             (expand-file-name "TEST.org" ejira-org-directory) t)))
+                                  ;; Give TEST-1 a child and a following sibling
+                                  ;; (inserted after its metadata so the drawer
+                                  ;; stays the heading's first drawer).
+                                  (with-current-buffer buf
+                                    (org-with-point-at (ejira--find-heading "TEST-1")
+                                      (org-end-of-meta-data t)
+                                      (insert "*** Existing kid\n:PROPERTIES:\n:ID: TEST-KID\n:END:\n"))
+                                    (set-buffer-modified-p nil))
+                                  (let ((m (ejira--new-heading buf "TEST-1" "TEST-NEW")))
+                                    (should (markerp m))
+                                    (with-current-buffer buf
+                                      (org-with-point-at m
+                                        ;; The new heading is inside TEST-1's subtree.
+                                        (should (equal "TEST-1"
+                                                       (save-excursion
+                                                         (outline-up-heading 1 t)
+                                                         (org-entry-get (point) "ID"))))))))))
+
 (provide (quote ejira-test))
 ;;; ejira-test.el ends here

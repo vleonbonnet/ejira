@@ -1134,18 +1134,28 @@ section, is not part of the owned region and stays local-only."
       (catch 'boundary
         (save-excursion
           (org-end-of-meta-data t)
-          (while (outline-next-heading)
-            (cond
-             ((<= (org-current-level) level)
-              (throw 'boundary (line-beginning-position)))
-             ((or (ejira--task-heading-p)
-                  (equal (org-get-heading t t t t)
-                         ejira-comments-heading-name))
-              (throw 'boundary (line-beginning-position)))))
-          ;; No boundary found: the owned region extends to the end of
-          ;; the task's subtree (never past it, or sibling sections would
-          ;; be swallowed).
-          (ejira--true-subtree-end))))))
+          (let ((scan (lambda ()
+                        (cond
+                         ((<= (org-current-level) level)
+                          (throw 'boundary (line-beginning-position)))
+                         ((or (ejira--task-heading-p)
+                              (equal (org-get-heading t t t t)
+                                     ejira-comments-heading-name))
+                          (throw 'boundary (line-beginning-position)))))))
+            ;; `org-end-of-meta-data' lands directly on the first heading
+            ;; when the task has no own body.  Test that heading before
+            ;; advancing, or the first child (a task or the reserved
+            ;; Comments container) would be skipped and swallowed by the
+            ;; owned region -- and the next description rewrite deleted it.
+            (when (org-at-heading-p)
+              (funcall scan))
+            (while (outline-next-heading)
+              (funcall scan))
+            ;; No boundary found: the owned region extends to the end of
+            ;; the task's subtree (never past it, or sibling sections
+            ;; would be swallowed).
+            (org-back-to-heading t)
+            (ejira--true-subtree-end)))))))
 
 (defun ejira--task-description-region ()
   "Return (BEGIN . END) of the description-owned region of the task at point.
@@ -1155,15 +1165,26 @@ lines so a rewrite replaces rather than accumulates them; END is
   (save-excursion
     (org-back-to-heading t)
     (let* ((limit (line-beginning-position 2))
-           (end (ejira--description-boundary)))
-      (org-end-of-meta-data t)
-      (while (and (> (point) limit)
-                  (< (point) end)
-                  (save-excursion
-                    (forward-line -1)
-                    (looking-at-p "^[ \t]*$")))
-        (forward-line -1))
-      (cons (point) end))))
+           (end (ejira--description-boundary))
+           (begin (progn
+                    (org-end-of-meta-data t)
+                    (if (org-at-heading-p)
+                        ;; Empty own body: `org-end-of-meta-data' has
+                        ;; landed on the first heading.  The owned region
+                        ;; must not start there -- a protected first child
+                        ;; (a task or the Comments container) would be
+                        ;; swallowed by the next rewrite.  Skip the
+                        ;; blank-line backoff: it could creep above the
+                        ;; heading into the metadata.
+                        (line-beginning-position)
+                      (while (and (> (point) limit)
+                                  (< (point) end)
+                                  (save-excursion
+                                    (forward-line -1)
+                                    (looking-at-p "^[ \t]*$")))
+                        (forward-line -1))
+                      (point)))))
+      (cons (min begin end) end))))
 
 (defun ejira--get-task-description ()
   "Return the description-owned region text of the task at point."
@@ -1610,17 +1631,21 @@ returns the existing one instead.  Callers reach here after a failed
              (goto-char (point-min))
 
              (if parent
-                 ;; Jump to end of parent's subtree and insert one level deeper.
-                 ;; Walking to the true subtree end avoids inserting between the
-                 ;; parent heading and its :PROPERTIES: drawer, which would
-                 ;; displace the drawer and break org-id lookup on the parent
-                 ;; (and, with recent org, org-end-of-subtree's second argument
-                 ;; would insert before the parent's first child instead).
+                 ;; Insert at the end of the parent's subtree, one level
+                 ;; deeper.  `ejira--true-subtree-end' returns the
+                 ;; position without moving point: jump there explicitly.
+                 ;; With point past the parent's own subtree,
+                 ;; `org-insert-heading' would insert relative to whatever
+                 ;; heading now starts there, so build the heading by hand
+                 ;; at the parent's child level.  (Trusting the helper to
+                 ;; move point left the new heading above the parent, and
+                 ;; a later refile had to repair the placement -- or not.)
                  (progn
                    (goto-char (ejira--find-heading parent))
-                   (ejira--true-subtree-end)
-                   (org-insert-heading t)
-                   (org-demote))
+                   (let ((new-level (1+ (org-current-level))))
+                     (goto-char (save-excursion (ejira--true-subtree-end)))
+                     (unless (bolp) (insert "\n"))
+                     (insert (make-string new-level ?*) " ")))
                ;; No parent: insert after the first line (startup keyword).
                (forward-line)
                (org-insert-heading-respect-content t))
@@ -1678,7 +1703,21 @@ runs first."
 (defun ejira--find-heading (id)
   "Find the item ID from agenda files, or return nil."
   (when id
-    (or (and ejira--heading-cache (gethash id ejira--heading-cache))
+    (or (and ejira--heading-cache
+             (let ((m (gethash id ejira--heading-cache)))
+               ;; A cache hit is only valid while the marker still sits
+               ;; on the heading owning ID.  Markers survive refiles and
+               ;; deletions they were not told about, and trusting a
+               ;; stale one rewrote an unrelated heading (observed live:
+               ;; a refiled epic's comments landed on another task).
+               ;; Evict a stale hit and fall through to a fresh lookup.
+               (if (and (markerp m) (marker-buffer m)
+                        (buffer-live-p (marker-buffer m))
+                        (equal id (with-current-buffer (marker-buffer m)
+                                    (org-entry-get (marker-position m) "ID"))))
+                   m
+                 (remhash id ejira--heading-cache)
+                 nil)))
         (let ((m (or (org-id-find-id-in-file id (org-id-find-id-file id) t)
                      (ejira--find-heading-by-scan id))))
           (when (and m ejira--heading-cache)
@@ -1690,15 +1729,36 @@ runs first."
   "Refile item SOURCE-ID to be a child of TARGET-ID."
   (unless (ejira--is-parent-p source-id target-id)
     (let ((target-m (or (ejira--find-heading target-id)
-                        (error "Target %s not found" target-id))))
+                        (error "Target %s not found" target-id)))
+          (stale-ids nil))
+      (ejira--with-point-on source-id
+        ;; Collect every cached marker inside the moved subtree: the
+        ;; refile invalidates only the source heading itself, while the
+        ;; descendants' markers stay behind in the source buffer at the
+        ;; removal site -- where a later update rewrote whatever heading
+        ;; ended up there (observed live: a refiled epic's comments were
+        ;; written onto an unrelated task, duplicating identities).
+        (when ejira--heading-cache
+          (let ((start (point))
+                (end (save-excursion (ejira--true-subtree-end))))
+            (maphash (lambda (id m)
+                       (when (and (markerp m)
+                                  (eq (marker-buffer m) (current-buffer))
+                                  (>= (marker-position m) start)
+                                  (< (marker-position m) end))
+                         (push id stale-ids)))
+                     ejira--heading-cache))))
       (ejira--with-point-on source-id
         (let ((org-log-refile nil))
           (org-refile nil nil
                       `(nil ,(buffer-file-name (marker-buffer target-m)) nil
                             ,(marker-position target-m)))))
-      ;; The heading moved; evict from cache so the next lookup re-scans.
+      ;; The subtree moved; evict it and its cached descendants so the
+      ;; next lookups re-scan instead of trusting stale markers.
       (when ejira--heading-cache
-        (remhash source-id ejira--heading-cache)))))
+        (remhash source-id ejira--heading-cache)
+        (dolist (id stale-ids)
+          (remhash id ejira--heading-cache))))))
 
 (defun ejira--save-buffer-safe ()
   "Save the current buffer unless the file changed on disk since it was visited.
