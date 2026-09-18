@@ -168,18 +168,29 @@ The reviewed payload is what creation sent; edits made while the
 confirmation was open were never sent, and the finalize pull must not
 swallow them.  Restoring them locally leaves the finalize-stamped
 baseline mismatched, so the heading stays dirty for the next reviewed
-push."
-  (ejira--finalize-new-issue new-key marker orig-state todo-kws)
-  (let ((edited-summary (org-with-point-at marker (ejira--jira-summary)))
-        (edited-body (org-with-point-at marker
-                       (or (ejira--prepare-new-issue-description) ""))))
-    (when (not (equal (ejira--push-normalize edited-summary)
-                      (ejira--push-normalize reviewed-summary)))
-      (ejira--set-summary new-key edited-summary))
-    (when (not (equal (ejira--push-normalize edited-body)
-                      (ejira--push-normalize reviewed-body)))
-      (ejira--set-jira-description-jira-markup
-       new-key (ejira-parser-org-to-jira edited-body)))))
+push.
+
+The capture happens BEFORE finalizing and is guarded: finalize can
+move the heading (refile enforces the Jira hierarchy), leaving MARKER
+on an unrelated position.  A marker no longer sitting on the heading
+carrying NEW-KEY is stale; the restore is skipped rather than copying
+a neighbor's content onto the issue.  The restore itself resolves the
+heading by NEW-KEY."
+  (let (edited-summary edited-body)
+    (org-with-point-at marker
+      (if (equal (org-entry-get nil "ID") new-key)
+          (setq edited-summary (ejira--jira-summary)
+                edited-body (or (ejira--prepare-new-issue-description) ""))
+        (message "ejira: %s — creation marker went stale; skipping post-review edit restore" new-key)))
+    (ejira--finalize-new-issue new-key marker orig-state todo-kws)
+    (when edited-summary
+      (when (not (equal (ejira--push-normalize edited-summary)
+                        (ejira--push-normalize reviewed-summary)))
+        (ejira--set-summary new-key edited-summary))
+      (when (not (equal (ejira--push-normalize edited-body)
+                        (ejira--push-normalize reviewed-body)))
+        (ejira--set-jira-description-jira-markup
+         new-key (ejira-parser-org-to-jira edited-body))))))
 
 (defun ejira--push-scan-issue-children (parent-marker project-key)
   "Return (CHILDREN . BLOCKED-OPS) for the new issue heading at PARENT-MARKER.
@@ -1113,7 +1124,7 @@ remote field state for three-way reconciliation."
                                                (jiralib2-assign-issue new-key my-name))))
                                          (ejira--finalize-new-issue-review-safe
                                           new-key marker orig-state todo-kws
-                                          reviewed-summary reviewed-body)
+                                          summary local-body)
                                          (dolist (child children)
                                            (condition-case err
                                                (ejira--push-create-cascaded-child
