@@ -2473,6 +2473,25 @@ parent and a later refile has to repair the placement."
                                                          (outline-up-heading 1 t)
                                                          (org-entry-get (point) "ID"))))))))))
 
+(ert-deftest ejira-new-heading/does-not-merge-into-next-heading ()
+  "A heading created under a parent that has a following heading stays separate.
+Regression: the new heading's line was not terminated when the parent's
+subtree ended at the next heading, so its title was glued onto that
+heading and the new ID replaced the neighbour's."
+  (ejira-test--with-project-dir
+      (concat ejira-test--project-content
+              "** TODO Next issue\n:PROPERTIES:\n:ID:       TEST-2\n:TYPE:     ejira-issue\n:END:\n")
+    (let* ((buf (find-file-noselect (expand-file-name "TEST.org" ejira-org-directory) t))
+           (m (ejira--new-heading buf "TEST-1" "TEST-NEW")))
+      (with-current-buffer buf
+        (org-with-point-at m
+          (should (equal "TEST-NEW" (org-entry-get nil "ID")))
+          (should (equal "<ejira new heading>" (org-get-heading t t t t)))
+          (should (= 3 (org-current-level))))
+        (goto-char (point-min))
+        (should (re-search-forward "^\\*\\* TODO Next issue$" nil t))
+        (should (equal "TEST-2" (org-entry-get nil "ID")))))))
+
 ;;; ── Comment-list completeness gate (regressions) ─────────────────────────────
 ;;
 ;; `jiralib2-get-issue' embeds ONE PAGE of comments (`fields.comment.comments')

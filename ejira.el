@@ -933,12 +933,10 @@ ways rather than by index alone."
          (local nil))
     (ejira--with-point-on key
       (when-let ((cm (ejira--find-child-heading ejira-comments-heading-name)))
-        (org-with-point-at cm
-          (org-map-entries
-           (lambda ()
-             (when-let ((id (org-entry-get (point) "CommId")))
-               (push (list id (point-marker) (ejira--locally-modified-p)) local)))
-           nil 'tree))))
+        (dolist (m (ejira--comment-heading-markers cm))
+          (org-with-point-at m
+            (push (list (org-entry-get (point) "CommId") m (ejira--locally-modified-p))
+                  local)))))
     (dolist (c remote)
       (let* ((id (format "%s" (ejira--alist-get c 'id)))
              (l (assoc id local)))

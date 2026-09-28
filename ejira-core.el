@@ -1020,33 +1020,48 @@ converted to Org; callers hold the issue and report it."
            (org-set-property "TYPE" "ejira-comment")
            (point-marker))))))
 
+(defun ejira--comment-heading-markers (comments)
+  "Return markers on the comment headings (with a CommId) under COMMENTS.
+COMMENTS is a marker on an issue's Comments heading.  Walks the outline
+instead of using `org-map-entries', whose org-element cache scan can
+wedge into an uninterruptible loop after many edits to a large buffer
+(observed during a long reconcile cycle)."
+  (org-with-point-at comments
+    (let ((end (save-excursion (ejira--true-subtree-end)))
+          markers)
+      (save-excursion
+        (while (and (outline-next-heading) (< (point) end))
+          (when (org-entry-get (point) "CommId")
+            (push (point-marker) markers))))
+      (nreverse markers))))
+
 (defun ejira--sort-comments (key)
   "Sort comments of item KEY by creation time.
-Skipped unless there are at least two comments: `org-sort-entries' on an
-empty or single-entry subtree is pointless and, with a live org-element
-cache in a displayed buffer, can wedge into an uninterruptible loop."
+Skipped unless the comments are out of order: `org-sort-entries' on an
+already-sorted subtree is pointless and, with a live org-element cache,
+can wedge into an uninterruptible loop."
   (org-with-point-at (ejira--get-subheading (ejira--find-heading key)
                                             ejira-comments-heading-name)
-    (when (> (length (org-map-entries t "TYPE=\"ejira-comment\"" 'tree)) 1)
-      (condition-case nil
-          (org-sort-entries nil ?r nil #'time-less-p "Created" nil)
-        (user-error nil)))))  ;; User error thrown if no subheadings
+    (let ((times (mapcar (lambda (m)
+                           (or (org-entry-get m "Created") ""))
+                         (ejira--comment-heading-markers (point-marker)))))
+      (unless (equal times (sort (copy-sequence times) #'string<))
+        (condition-case nil
+            (org-sort-entries nil ?r nil #'time-less-p "Created" nil)
+          (user-error nil))))))  ;; User error thrown if no subheadings
 
 (defun ejira--kill-deleted-comments (key ids)
   "Kill all comments of item KEY whoes ids are not found from IDS."
   (ejira--with-point-on key
     (mapc
-     (lambda (m) (when m (org-with-point-at m
-                           (ejira--with-expand-all
-                             (org-cut-subtree)))))
-     (org-with-point-at (ejira--get-subheading (ejira--find-heading key)
-                                               ejira-comments-heading-name)
-       (org-map-entries
-        `(let ((cid (org-entry-get (point-marker) "CommId")))
-           (when (and cid (not (member cid ',ids)))
-             (point-marker)))
-        "TYPE=\"ejira-comment\""
-        'tree)))))
+     (lambda (m) (org-with-point-at m
+                   (ejira--with-expand-all
+                     (delete-region (point) (ejira--true-subtree-end)))))
+     (cl-remove-if
+      (lambda (m) (member (org-entry-get m "CommId") ids))
+      (ejira--comment-heading-markers
+       (ejira--get-subheading (ejira--find-heading key)
+                              ejira-comments-heading-name))))))
 
 (defun ejira--get-comment-capture-target (key)
   "Get an `org-capture'-target for adding a comment to task KEY."
@@ -1608,15 +1623,8 @@ full pull."
   (ejira--with-point-on key
     (when-let ((comments (ejira--find-child-heading
                           ejira-comments-heading-name)))
-      (org-with-point-at comments
-        ;; `org-map-entries' returns one element per visited entry, nil
-        ;; included: the list itself is non-nil for any Comments heading.
-        (cl-some #'identity
-                 (org-map-entries
-                  (lambda ()
-                    (and (org-entry-get (point-marker) "CommId")
-                         (ejira--locally-modified-p)))
-                  nil 'tree))))))
+      (cl-some (lambda (m) (org-with-point-at m (ejira--locally-modified-p)))
+               (ejira--comment-heading-markers comments)))))
 
 (defun ejira--normalize-end-spacing ()
   "Ensure exactly one blank line after every :END: drawer closer in the current buffer."
@@ -1818,7 +1826,13 @@ returns the existing one instead.  Callers reach here after a failed
                    (let ((new-level (1+ (org-current-level))))
                      (goto-char (save-excursion (ejira--true-subtree-end)))
                      (unless (bolp) (insert "\n"))
-                     (insert (make-string new-level ?*) " ")))
+                     ;; The subtree end is the start of the next heading's
+                     ;; line when one follows: end the new heading's line,
+                     ;; or its title is glued onto that heading and the ID
+                     ;; below lands on it (observed live: an imported issue
+                     ;; took over its neighbour's heading).
+                     (insert (make-string new-level ?*) " \n")
+                     (backward-char)))
                ;; No parent: insert after the first line (startup keyword).
                (forward-line)
                (org-insert-heading-respect-content t))
