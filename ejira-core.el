@@ -636,6 +636,14 @@ The slots are parsed from struct TYPE."
        ,@body)))
 (function-put #'ejira--with-bind-struct 'lisp-indent-function 'defun)
 
+(defvar ejira--force-full-update nil
+  "When non-nil, `ejira--update-task' applies the remote content even if
+the heading's `Modified' timestamp already matches Jira's.
+Bound by the reconcile cycle when it (re)establishes a remote baseline:
+the baseline asserts the heading reflects Jira, so a stale shortcut --
+comments never imported, a pushed text never re-rendered -- must not
+be acknowledged as synced.")
+
 (defvar ejira--shallow-only nil
   "When non-nil, `ejira--update-task-light' must not escalate to a full update.
 Bound by `ejira--apply-sync' for shallow (auto-pull) syncs.")
@@ -819,9 +827,10 @@ converted to Org; callers hold the issue and report it."
                             key))
       (let* ((key-m (ejira--find-heading key))
              (modified-p
-              (not (equal (org-entry-get key-m "Modified")
-                          (format-time-string "%Y-%m-%d %H:%M:%S"
-                                              updated "UTC"))))
+              (or ejira--force-full-update
+                  (not (equal (org-entry-get key-m "Modified")
+                              (format-time-string "%Y-%m-%d %H:%M:%S"
+                                                  updated "UTC")))))
              ;; A legacy heading can already contain a real local edit.  Do
              ;; not reinterpret its old Org cookie as an outbound Jira
              ;; priority while migrating it.  For a v2 heading only the

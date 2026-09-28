@@ -1208,7 +1208,8 @@ acknowledgment are held for the normal review flow."
                                 (push (format "%s: locally edited comments; pull deferred"
                                               key)
                                       conflicts))
-                       (when (ejira--update-task-or-hold item on-hold)
+                       (when (let ((ejira--force-full-update t))
+                               (ejira--update-task-or-hold item on-hold))
                          ;; The heading may have been refiled; re-find it.
                          (when-let ((m (ejira--find-heading key)))
                            (org-with-point-at m

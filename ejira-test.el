@@ -2632,6 +2632,37 @@ pulls deferred as \"locally edited comments\"."
                               (replace-match "body2 edited")
                               (should (ejira--issue-comments-dirty-p "TEST-1")))))
 
+(ert-deftest ejira-update-task/forced-update-ignores-modified-shortcut ()
+  "A forced update imports comments even when `Modified' matches Jira.
+Regression: the reconcile cycle baselined issues whose earlier pulls had
+never imported their comments, because the unchanged timestamp skipped
+the content update; the baseline then hid the gap for good."
+  (let ((ejira--heading-cache (make-hash-table :test #'equal))
+        (ejira-assigned-tagname nil)
+        (task (make-ejira-task
+               :key "TEST-1" :type "Task" :status "Open" :project "TEST"
+               ;; Same instant as the fixture's Modified.
+               :updated (date-to-time "2026-09-01 00:00:00 +0000")
+               :created (date-to-time "2026-08-01 00:00:00 +0000")
+               :summary "Issue"
+               :comments (list (make-ejira-comment
+                                :id "333" :author "A"
+                                :created (date-to-time "2026-09-01")
+                                :updated (date-to-time "2026-09-01")
+                                :body "new"))
+               :comments-complete nil)))
+    (ejira-test--with-org-buf ejira-test--comments-task-content
+      (goto-char (point-min))
+      (re-search-forward org-heading-regexp)
+      (puthash "TEST" (point-marker) ejira--heading-cache)
+      (re-search-forward org-heading-regexp)
+      (puthash "TEST-1" (point-marker) ejira--heading-cache)
+      (ejira--update-task task)
+      (should (= 0 (count-matches ":CommId: +333" (point-min) (point-max))))
+      (let ((ejira--force-full-update t))
+        (ejira--update-task task))
+      (should (= 1 (count-matches ":CommId: +333" (point-min) (point-max)))))))
+
 (ert-deftest ejira-update-task/preserves-comments-on-incomplete-list ()
   "A truncated embedded comment page must not delete local comments."
   (should (equal '(:c1 1 :c2 1)
