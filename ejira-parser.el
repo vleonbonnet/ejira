@@ -58,24 +58,39 @@ list line such as `* (x) item' becomes an Org heading.")
 (define-error 'ejira-parser-error "JIRA markup could not be converted to Org")
 
 (defvar ejira-parser-browse-links-as-id nil
-  "When non-nil, import issue browse links as `id:' links.
+  "Whether to import issue browse links as `id:' links.
 A JIRA link whose URL is `<jiralib2-url>/browse/KEY' becomes
 `[[id:KEY][label]]', so an Org file that references issues by their
 ejira heading IDs keeps doing so across a pull.  Enable it together
-with an exporter that writes `id:' issue links back as browse URLs.")
+with an exporter that writes `id:' issue links back as browse URLs.
+  nil    keep browse URLs;
+  t      convert every issue key;
+  known  convert only keys that have a local heading (in
+         `org-id-locations'), so no dead `id:' link is created for an
+         issue the Org files do not hold.")
+
+(defun ejira-parser--issue-known-p (key)
+  "Return non-nil when issue KEY has a heading known to `org-id'."
+  (and (boundp 'org-id-locations)
+       (hash-table-p org-id-locations)
+       (gethash key org-id-locations)
+       t))
 
 (defun ejira-parser--browse-url-issue-id (url)
   "Return `id:KEY' when URL browses issue KEY on this server, else nil.
-Only active when `ejira-parser-browse-links-as-id' is non-nil.  Match
-data is preserved: replacement functions run between the pattern
-search and its `replace-match'."
+Governed by `ejira-parser-browse-links-as-id'.  Match data is
+preserved: replacement functions run between the pattern search and
+its `replace-match'."
   (when (and ejira-parser-browse-links-as-id
              (boundp 'jiralib2-url) jiralib2-url)
     (save-match-data
       (when (string-match (concat "\\`" (regexp-quote jiralib2-url)
                                   "/browse/\\([A-Z][A-Z0-9]+-[0-9]+\\)\\'")
                           url)
-        (concat "id:" (match-string 1 url))))))
+        (let ((key (match-string 1 url)))
+          (when (or (not (eq ejira-parser-browse-links-as-id 'known))
+                    (ejira-parser--issue-known-p key))
+            (concat "id:" key)))))))
 
 (defvar ejira-parser--list-token nil
   "Random per-conversion token marking ordered-list placeholders.

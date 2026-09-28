@@ -1315,6 +1315,17 @@ became Org headings and `{{code}}' stayed literal."
     (should (equal "[[https://jira.example.com/browse/ABC-12][t]]"
                    (ejira-test--parse "[t|https://jira.example.com/browse/ABC-12]")))))
 
+(ert-deftest ejira-parser/browse-links-as-id-known-only ()
+  "With `known', only keys with a local heading become `id:' links.
+Converting a key the Org files do not hold would create a dead link."
+  (let ((jiralib2-url "https://jira.example.com")
+        (ejira-parser-browse-links-as-id 'known)
+        (org-id-locations (make-hash-table :test 'equal)))
+    (puthash "ABC-1" "/tmp/x.org" org-id-locations)
+    (should (equal "[[id:ABC-1][a]] and [[https://jira.example.com/browse/ABC-2][b]]"
+                   (ejira-test--parse (concat "[a|https://jira.example.com/browse/ABC-1] and "
+                                              "[b|https://jira.example.com/browse/ABC-2]"))))))
+
 (ert-deftest ejira-parser/replacement-cannot-clobber-match-data ()
   "A replacement function that matches strings does not break conversion.
 The parser preserves the pattern's match data around every
