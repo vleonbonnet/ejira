@@ -2062,6 +2062,62 @@ an issue created in Jira under a synced epic never reached the file."
                                   (clrhash ejira--auto-sync-held)
                                   (should-not (ejira--auto-sync-mode-line)))))
 
+(ert-deftest ejira-sync-audit/classifies-without-writing ()
+  "The audit classifies each heading and never modifies the file."
+  (ejira-test--with-project-dir
+   (concat ejira-test--discover-content
+           "*** TODO Same\n:PROPERTIES:\n:ID:       TEST-2\n:TYPE:     ejira-issue\n:END:\n\nSame body.\n"
+           "*** TODO Edited\n:PROPERTIES:\n:ID:       TEST-3\n:TYPE:     ejira-issue\n:END:\n\nLocal body.\n"
+           "*** TODO Stale\n:PROPERTIES:\n:ID:       TEST-4\n:TYPE:     ejira-issue\n:END:\n\nOld body.\n"
+           "*** TODO Not in Jira yet\n")
+   (let* ((file (expand-file-name "TEST.org" ejira-org-directory))
+          (buf (find-file-noselect file t))
+          (ejira-epic-field 'customfield_10857)
+          (ejira-push-on-save nil)
+          (item (lambda (key summary desc)
+                  `((key . ,key)
+                    (fields . ((summary . ,summary) (description . ,desc)
+                               (status . ((name . "Open")))
+                               (issuetype . ((name . "Task")))))))))
+     (with-current-buffer buf
+       ;; TEST-3: baseline on the remote text, then edit locally.
+       (goto-char (point-min))
+       (re-search-forward "^\\*\\*\\* TODO Edited")
+       (ejira--migrate-push-baseline)
+       (ejira--store-remote-baseline (funcall item "TEST-3" "Edited" "Remote body."))
+       (re-search-forward "^Local body")
+       (goto-char (point-min))
+       (re-search-forward "^\\*\\*\\* TODO Edited")
+       (org-set-property "Pushhash" "v2:stale")
+       ;; TEST-4: clean, with a baseline Jira has since moved past.
+       (re-search-forward "^\\*\\*\\* TODO Stale")
+       (ejira--migrate-push-baseline)
+       (ejira--store-remote-baseline (funcall item "TEST-4" "Stale" "Old body."))
+       (save-buffer))
+     (let ((before (with-current-buffer buf (buffer-string))))
+       (cl-letf (((symbol-function 'ejira--auto-sync-fetch)
+                  (lambda (_keys)
+                    (list `((key . "TEST-1")
+                            (fields . ((summary . "The epic") (description . "Epic body.")
+                                       (status . ((name . "Open")))
+                                       (issuetype . ((name . "Epic"))))))
+                          (funcall item "TEST-2" "Same" "Same body.")
+                          (funcall item "TEST-3" "Edited" "Remote body.")
+                          (funcall item "TEST-4" "Stale" "New remote body."))))
+                 ((symbol-function 'jiralib2-jql-search)
+                  (lambda (&rest _) (list (ejira-test--child-item "TEST-9" "x")))))
+         (let* ((audit (ejira-sync-audit-file file))
+                (class (lambda (k) (plist-get (cdr (assoc k (plist-get audit :rows))) :class))))
+           (should (eq 'identical (funcall class "TEST-1")))
+           (should (eq 'identical (funcall class "TEST-2")))
+           (should (eq 'local-newer (funcall class "TEST-3")))
+           (should (eq 'remote-newer (funcall class "TEST-4")))
+           (should (equal '("TEST-9") (plist-get audit :missing)))
+           (should (equal '("Not in Jira yet") (plist-get audit :local-only)))))
+       (with-current-buffer buf
+         (should (equal before (buffer-string)))
+         (should-not (buffer-modified-p)))))))
+
 (ert-deftest ejira-auto-sync/reconcile-classification ()
   "One reconcile cycle: clean+remote-changed pulls, dirty+remote-changed
 holds as conflict, clean+unchanged does nothing."

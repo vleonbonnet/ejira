@@ -898,6 +898,192 @@ here.  A conversion failure is reported through ON-HOLD (see
             (when ejira--heading-cache (remhash key ejira--heading-cache)))
           nil)))))
 
+;;; Read-only audit
+
+(defun ejira--audit-state-match-p (local-state status resolution)
+  "Return non-nil when Org LOCAL-STATE corresponds to Jira STATUS/RESOLUTION.
+Several Org keywords can map to one Jira status (and one status to
+several keywords), so compare through `ejira-todo-states-alist' both
+ways rather than by index alone."
+  (let* ((remote-index (funcall ejira-todo-state-fn status resolution))
+         (local-index (1+ (or (cl-position local-state org-todo-keywords-1
+                                            :test #'equal)
+                              -2))))
+    (or (= remote-index local-index)
+        (and (not (equal status "Closed"))
+             (member status
+                     (mapcar #'car
+                             (cl-remove-if-not
+                              (lambda (e) (= (cdr e) local-index))
+                              ejira-todo-states-alist)))))))
+
+(defun ejira--audit-convert (markup level)
+  "Convert JIRA MARKUP at LEVEL, or return `:unconvertible'."
+  (condition-case nil
+      (let ((ejira-parser-signal-failures t))
+        (ejira--parse-body markup level))
+    (ejira-parser-error :unconvertible)))
+
+(defun ejira--audit-comments (key item)
+  "Return a list of comment differences for issue KEY against REST ITEM."
+  (let* ((remote (ejira--alist-get item 'fields 'comment 'comments))
+         (remote-ids (mapcar (lambda (c) (format "%s" (ejira--alist-get c 'id)))
+                             remote))
+         (diffs nil)
+         (local nil))
+    (ejira--with-point-on key
+      (when-let ((cm (ejira--find-child-heading ejira-comments-heading-name)))
+        (org-with-point-at cm
+          (org-map-entries
+           (lambda ()
+             (when-let ((id (org-entry-get (point) "CommId")))
+               (push (list id (point-marker) (ejira--locally-modified-p)) local)))
+           nil 'tree))))
+    (dolist (c remote)
+      (let* ((id (format "%s" (ejira--alist-get c 'id)))
+             (l (assoc id local)))
+        (if (not l)
+            (push (format "comment %s missing locally" id) diffs)
+          (let ((expected (ejira--audit-convert (ejira--alist-get c 'body)
+                                                (org-with-point-at (nth 1 l)
+                                                  (org-current-level)))))
+            (cond
+             ((eq expected :unconvertible)
+              (push (format "comment %s unconvertible" id) diffs))
+             ((not (equal (ejira--push-normalize expected)
+                          (ejira--push-normalize
+                           (ejira--get-heading-body (nth 1 l)))))
+              (push (format "comment %s differs%s" id
+                            (if (nth 2 l) " (edited locally)" ""))
+                    diffs)))))))
+    (dolist (l local)
+      (unless (member (car l) remote-ids)
+        (push (format "comment %s missing in Jira" (car l)) diffs)))
+    (nreverse diffs)))
+
+(defun ejira-sync-audit-file (file)
+  "Compare every ejira heading of FILE with Jira, without changing anything.
+Return a plist:
+  :rows      one (KEY :class CLASS :diffs DIFFS :dirty D :baseline B)
+             per issue heading, CLASS being `identical', `local-newer'
+             (differs, edited locally, remote unchanged since the
+             baseline), `unknown-baseline' (differs, edited locally, no
+             remote baseline), `remote-newer' (differs, no local edit),
+             `both-changed', `unconvertible' or `missing-in-jira';
+  :missing   REST keys of unresolved Jira children absent from FILE;
+  :local-only titles of TODO headings with no Jira identity;
+  :summary   counts per class."
+  (let* ((buf (find-file-noselect file t))
+         (ejira--heading-cache (make-hash-table :test 'equal))
+         rows missing local-only)
+    (with-current-buffer buf
+      (org-with-wide-buffer
+       (let* ((keys (ejira--buffer-issue-keys))
+              (items (ejira--auto-sync-fetch keys))
+              (by-key (mapcar (lambda (i) (cons (ejira--alist-get i 'key) i)) items)))
+         (dolist (key keys)
+           (let ((item (cdr (assoc key by-key)))
+                 (m (ejira--find-heading key)))
+             (if (not item)
+                 (push (list key :class 'missing-in-jira :diffs nil) rows)
+               (org-with-point-at m
+                 (let* ((dirty (ejira--locally-modified-p))
+                        (stored (org-entry-get nil ejira-remote-hash-property))
+                        (baseline (cond ((not stored) 'none)
+                                        ((equal stored (md5 (ejira--remote-fields-identity item)))
+                                         'match)
+                                        (t 'moved)))
+                        (rsum (ejira--audit-convert
+                               (ejira--alist-get item 'fields 'summary) nil))
+                        (rdesc (condition-case nil
+                                   (let ((ejira-parser-signal-failures t))
+                                     (ejira--expected-jira-description
+                                      m (ejira--alist-get item 'fields 'description)))
+                                 (ejira-parser-error :unconvertible)))
+                        (status (ejira--alist-get item 'fields 'status 'name))
+                        (resolution (ejira--alist-get item 'fields 'resolution 'name))
+                        (rprio (ejira--priority-id-string
+                                (ejira--alist-get item 'fields 'priority 'id)))
+                        (lprio (org-entry-get nil ejira-priority-id-property))
+                        (diffs
+                         (append
+                          (delq nil
+                                (list
+                                 (cond ((eq rsum :unconvertible) "summary unconvertible")
+                                       ((not (equal (ejira--push-normalize rsum)
+                                                    (ejira--push-normalize (ejira--jira-summary))))
+                                        "summary"))
+                                 (cond ((eq rdesc :unconvertible) "description unconvertible")
+                                       ((not (equal (ejira--push-normalize rdesc)
+                                                    (ejira--push-normalize
+                                                     (ejira--jira-description))))
+                                        "description"))
+                                 (unless (ejira--audit-state-match-p
+                                          (substring-no-properties (or (org-get-todo-state) ""))
+                                          status resolution)
+                                   (format "state %s vs %s" (org-get-todo-state) status))
+                                 (when (and lprio rprio (not (equal lprio rprio)))
+                                   (format "priority %s vs %s" lprio rprio))))
+                          (ejira--audit-comments key item)))
+                        (class
+                         (cond
+                          ((cl-some (lambda (d) (string-match-p "unconvertible" d)) diffs)
+                           'unconvertible)
+                          ((null diffs) 'identical)
+                          ((and dirty (eq baseline 'moved)) 'both-changed)
+                          ((and dirty (eq baseline 'none)) 'unknown-baseline)
+                          (dirty 'local-newer)
+                          (t 'remote-newer))))
+                   (push (list key :class class :diffs diffs
+                               :dirty (and dirty t) :baseline baseline)
+                         rows))))))
+         (let ((ejira-auto-sync-discover 'unresolved))
+           (setq missing (mapcar (lambda (i) (ejira--alist-get i 'key))
+                                 (ejira--auto-sync-discover-items buf))))
+         (goto-char (point-min))
+         (while (re-search-forward org-heading-regexp nil t)
+           (when (and (org-get-todo-state)
+                      (not (org-entry-get nil "TYPE"))
+                      (not (org-in-commented-heading-p)))
+             (push (org-get-heading t t t t) local-only))))))
+    (setq rows (nreverse rows))
+    (let (summary)
+      (dolist (r rows)
+        (let ((c (plist-get (cdr r) :class)))
+          (setf (alist-get c summary) (1+ (alist-get c summary 0)))))
+      (list :rows rows :missing missing :local-only (nreverse local-only)
+            :summary summary))))
+
+(defun ejira-sync-audit (&optional file)
+  "Audit FILE (default: each of `ejira-auto-sync-files') against Jira.
+Read-only: nothing is pulled, pushed or baselined.  Show the report in
+the `*ejira sync audit*' buffer and return the audit plists."
+  (interactive)
+  (let* ((files (if file (list file) (mapcar #'expand-file-name ejira-auto-sync-files)))
+         (audits (mapcar (lambda (f) (cons f (ejira-sync-audit-file f))) files)))
+    (when (called-interactively-p 'any)
+      (with-current-buffer (get-buffer-create "*ejira sync audit*")
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (dolist (a audits)
+            (let ((r (cdr a)))
+              (insert (format "* %s
+" (car a)))
+              (insert (format "  summary: %S\n" (plist-get r :summary)))
+              (dolist (row (plist-get r :rows))
+                (unless (eq (plist-get (cdr row) :class) 'identical)
+                  (insert (format "  %-12s %-16s %s\n" (car row)
+                                  (plist-get (cdr row) :class)
+                                  (s-join "; " (plist-get (cdr row) :diffs))))))
+              (dolist (k (plist-get r :missing))
+                (insert (format "  %-12s %-16s\n" k 'missing-locally)))
+              (dolist (h (plist-get r :local-only))
+                (insert (format "  %-12s %-16s %s\n" "-" 'local-only h))))))
+        (goto-char (point-min))
+        (special-mode))
+      (pop-to-buffer "*ejira sync audit*"))
+    audits))
+
 (defun ejira--auto-sync-execute (file plans)
   "Execute conflict-free PLANs for FILE without confirmation.
 Comment edits/deletions and plans whose remote changed since the last
