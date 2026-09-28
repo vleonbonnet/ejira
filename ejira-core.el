@@ -1898,6 +1898,14 @@ runs first."
           m))))
 
 
+(defun ejira--issue-known-p (key)
+  "Return non-nil when issue KEY has a local heading.
+Unlike an `org-id-locations' lookup this also finds headings that a
+stale index misses, through `ejira--find-heading'."
+  (and (ignore-errors (ejira--find-heading key)) t))
+
+(setq ejira-parser-issue-known-function #'ejira--issue-known-p)
+
 (defun ejira--refile (source-id target-id)
   "Refile item SOURCE-ID to be a child of TARGET-ID."
   (unless (ejira--is-parent-p source-id target-id)

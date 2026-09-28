@@ -76,6 +76,12 @@ with an exporter that writes `id:' issue links back as browse URLs.
        (gethash key org-id-locations)
        t))
 
+(defvar ejira-parser-issue-known-function #'ejira-parser--issue-known-p
+  "Predicate deciding whether an issue key has a local heading.
+Used by `ejira-parser-browse-links-as-id' set to `known'.  ejira-core
+replaces the default with its own lookup, which also finds headings
+that a stale `org-id-locations' misses.")
+
 (defun ejira-parser--browse-url-issue-id (url)
   "Return `id:KEY' when URL browses issue KEY on this server, else nil.
 Governed by `ejira-parser-browse-links-as-id'.  Match data is
@@ -89,7 +95,7 @@ its `replace-match'."
                           url)
         (let ((key (match-string 1 url)))
           (when (or (not (eq ejira-parser-browse-links-as-id 'known))
-                    (ejira-parser--issue-known-p key))
+                    (funcall ejira-parser-issue-known-function key))
             (concat "id:" key)))))))
 
 (defvar ejira-parser--list-token nil

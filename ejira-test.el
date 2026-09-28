@@ -1320,11 +1320,20 @@ became Org headings and `{{code}}' stayed literal."
 Converting a key the Org files do not hold would create a dead link."
   (let ((jiralib2-url "https://jira.example.com")
         (ejira-parser-browse-links-as-id 'known)
+        (ejira-parser-issue-known-function #'ejira-parser--issue-known-p)
         (org-id-locations (make-hash-table :test 'equal)))
     (puthash "ABC-1" "/tmp/x.org" org-id-locations)
     (should (equal "[[id:ABC-1][a]] and [[https://jira.example.com/browse/ABC-2][b]]"
                    (ejira-test--parse (concat "[a|https://jira.example.com/browse/ABC-1] and "
                                               "[b|https://jira.example.com/browse/ABC-2]"))))))
+
+(ert-deftest ejira-parser/known-issue-uses-ejira-lookup ()
+  "ejira-core's predicate finds a heading a stale org-id index misses."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let ((org-id-locations (make-hash-table :test 'equal)))
+      (should (eq ejira-parser-issue-known-function #'ejira--issue-known-p))
+      (should (ejira--issue-known-p "TEST-1"))
+      (should-not (ejira--issue-known-p "TEST-404")))))
 
 (ert-deftest ejira-parser/replacement-cannot-clobber-match-data ()
   "A replacement function that matches strings does not break conversion.
