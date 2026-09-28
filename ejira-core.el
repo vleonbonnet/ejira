@@ -1547,12 +1547,14 @@ full pull."
     (when-let ((comments (ejira--find-child-heading
                           ejira-comments-heading-name)))
       (org-with-point-at comments
-        (org-map-entries
-         (lambda ()
-           (when (and (org-entry-get (point-marker) "CommId")
-                      (ejira--locally-modified-p))
-             (point)))
-         nil 'tree)))))
+        ;; `org-map-entries' returns one element per visited entry, nil
+        ;; included: the list itself is non-nil for any Comments heading.
+        (cl-some #'identity
+                 (org-map-entries
+                  (lambda ()
+                    (and (org-entry-get (point-marker) "CommId")
+                         (ejira--locally-modified-p)))
+                  nil 'tree))))))
 
 (defun ejira--normalize-end-spacing ()
   "Ensure exactly one blank line after every :END: drawer closer in the current buffer."

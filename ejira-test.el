@@ -2223,6 +2223,27 @@ headings and left `{{code}}' literal in the body."
                                     (should (string-match-p "TEST-1: remote markup could not be converted"
                                                             (buffer-string)))))))))
 
+(ert-deftest ejira-comments-dirty-p/only-real-edits ()
+  "Clean comments report nil; an edited comment reports non-nil.
+Regression: the raw `org-map-entries' list was returned, which is
+non-nil for any Comments heading, so every issue with comments had its
+pulls deferred as \"locally edited comments\"."
+  (let ((ejira--heading-cache (make-hash-table :test #'equal)))
+    (ejira-test--with-org-buf ejira-test--comments-task-content
+                              (goto-char (point-min))
+                              (re-search-forward org-heading-regexp)
+                              (re-search-forward org-heading-regexp)
+                              (puthash "TEST-1" (point-marker) ejira--heading-cache)
+                              ;; Baseline both comments on their current bodies.
+                              (goto-char (point-min))
+                              (while (re-search-forward "^\\*\\*\\* \\[c" nil t)
+                                (ejira--update-push-baseline))
+                              (should-not (ejira--issue-comments-dirty-p "TEST-1"))
+                              (goto-char (point-min))
+                              (re-search-forward "^body2")
+                              (replace-match "body2 edited")
+                              (should (ejira--issue-comments-dirty-p "TEST-1")))))
+
 (ert-deftest ejira-update-task/preserves-comments-on-incomplete-list ()
   "A truncated embedded comment page must not delete local comments."
   (should (equal '(:c1 1 :c2 1)
