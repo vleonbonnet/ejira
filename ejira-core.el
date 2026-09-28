@@ -485,6 +485,31 @@ scheme when PROJECT has no explicit policy."
           (car (mapcar (lambda (entry) (plist-get entry :id))
                        (ejira--get-priority-scheme reference-key)))))))
 
+(defun ejira--new-issue-priority-id (marker project &optional reference-key)
+  "Return the priority ID to create the heading at MARKER with in PROJECT.
+The heading's Org priority cookie selects the selectable Jira priority
+of the same rank (PROJECT's policy, else the scheme of REFERENCE-KEY).
+Without a cookie, or when no selectable priority has that rank, the
+project default applies, as `ejira--default-priority-id' defines it."
+  (let* ((cookie (org-with-point-at marker
+                   (save-excursion
+                     (org-back-to-heading t)
+                     (when (looking-at org-priority-regexp)
+                       (match-string-no-properties 2)))))
+         (rank (ejira--org-priority-rank cookie))
+         (selectable (plist-get (ejira--priority-policy project) :selectable))
+         (from-rank
+          (when rank
+            (if selectable
+                (cl-find-if (lambda (id)
+                              (equal (ejira--priority-policy-rank project id) rank))
+                            selectable)
+              (when reference-key
+                (plist-get (ejira--priority-entry-for-rank
+                            project (ejira--get-priority-scheme reference-key) rank)
+                           :id))))))
+    (or from-rank (ejira--default-priority-id project reference-key))))
+
 (defun ejira--org-priority-numeric-p ()
   "Return non-nil when Org's configured priority range is numeric."
   (< org-priority-lowest 65))

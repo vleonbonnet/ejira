@@ -204,13 +204,13 @@ heading by NEW-KEY."
 
 (defun ejira--push-scan-issue-children (parent-marker project-key)
   "Return (CHILDREN . BLOCKED-OPS) for the new issue heading at PARENT-MARKER.
-CHILDREN are direct-child plists (:marker :title :state :body) captured
-for cascade creation.  BLOCKED-OPS are ops for TODOs deeper than the
+CHILDREN are direct-child plists (:marker :title :state :body
+:priority-id) captured for cascade creation; the priority comes from
+the child's Org cookie within PROJECT-KEY's policy.  BLOCKED-OPS are ops for TODOs deeper than the
 direct children: the native Jira hierarchy has no place for them, so
 they are reported instead of being silently flattened or lost.  The
 child bodies are prepared (moved into description position) here, at
 plan-build time, so the reviewed payload is exactly what creation sends."
-  (ignore project-key)
   (let (children blocked)
     (org-with-wide-buffer
      (save-excursion
@@ -231,7 +231,9 @@ plan-build time, so the reviewed payload is exactly what creation sends."
                    (push (list :marker (point-marker)
                                :title  (ejira--jira-summary)
                                :state  (substring-no-properties (or todo-state ""))
-                               :body   (ejira--prepare-new-issue-description))
+                               :body   (ejira--prepare-new-issue-description)
+                               :priority-id (ejira--new-issue-priority-id
+                                             (point-marker) project-key))
                          children))
                (when (and (> lvl (1+ parent-level))
                           todo-state
@@ -282,7 +284,8 @@ parent's assign-self cell."
             (when ejira-epic-field
               (list `(,ejira-epic-field . ,parent-key))))
            (t nil)))
-         (priority-id (ejira--default-priority-id project-key parent-key))
+         (priority-id (or (plist-get child :priority-id)
+                          (ejira--default-priority-id project-key parent-key)))
          (result (progn
                    ;; Journal the attempt before the request, mirroring
                    ;; the standalone create path: a cascade child whose
@@ -510,7 +513,7 @@ remote field state for three-way reconciliation."
                                          :title heading-title
                                          :reason (format "cannot create an Epic under %s: ejira-parent-link-field is not configured; set it to the Portfolio Parent Link field id" parent-id))
                                    ops)
-                           (let ((kids (ejira--push-scan-issue-children marker parent-id)))
+                           (let ((kids (ejira--push-scan-issue-children marker project-key)))
                              (push (list :op 'create
                                          :object 'issue
                                          :key nil
@@ -534,7 +537,7 @@ remote field state for three-way reconciliation."
                                          :title heading-title
                                          :reason (format "cannot create an issue under Epic %s: ejira-epic-field is not configured; set it to the Epic Link field id" parent-id))
                                    ops)
-                           (let ((kids (ejira--push-scan-issue-children marker parent-id)))
+                           (let ((kids (ejira--push-scan-issue-children marker project-key)))
                              (push (list :op 'create
                                          :object 'issue
                                          :key nil
@@ -555,7 +558,7 @@ remote field state for three-way reconciliation."
                         ;; capture the subtree, block every TODO in it,
                         ;; and skip past it.
                         ((member parent-type '("ejira-issue" "ejira-story"))
-                         (let ((kids (ejira--push-scan-issue-children marker parent-id)))
+                         (let ((kids (ejira--push-scan-issue-children marker project-key)))
                            (push (list :op 'create
                                        :object 'subtask
                                        :key nil
@@ -581,7 +584,7 @@ remote field state for three-way reconciliation."
                                       (save-excursion (ejira--true-subtree-end))))))
                         ;; Under Project → create issue (top-level)
                         ((equal parent-type "ejira-project")
-                         (let ((kids (ejira--push-scan-issue-children marker parent-id)))
+                         (let ((kids (ejira--push-scan-issue-children marker project-key)))
                            (push (list :op 'create
                                        :object 'issue
                                        :key nil
@@ -949,6 +952,8 @@ remote field state for three-way reconciliation."
                                  ""))
                  (local-state (org-with-point-at marker
                                 (substring-no-properties (or (org-get-todo-state) ""))))
+                 (priority-id (ejira--new-issue-priority-id
+                               marker project-key parent-key))
                  (fields `(("title" ,heading-title)
                            ("state" ,local-state)
                            ("description" ,(or local-body ""))))
@@ -968,11 +973,13 @@ remote field state for three-way reconciliation."
                                        (format "summary: %s" heading-title)
                                        (format "issue type: %s" ejira-subtask-type-name)
                                        (format "parent: %s" parent-key)
+                                       (when priority-id (format "priority id: %s" priority-id))
                                        "description (Jira markup):"
                                        (ejira-parser-org-to-jira local-body))
                              :assign-self assign-self-cell
                              :send (let ((marker marker) (project-key project-key)
                                          (parent-key parent-key)
+                                         (priority-id priority-id)
                                          (summary heading-title)
                                          (reviewed-summary heading-title)
                                          (reviewed-body local-body)
@@ -994,10 +1001,7 @@ remote field state for three-way reconciliation."
                                                            (format-time-string "%Y-%m-%d %H:%M:%S")))
                                        (with-current-buffer (marker-buffer marker)
                                          (ejira--save-buffer-safe))
-                                       (let* ((priority-id
-                                               (ejira--default-priority-id
-                                                project-key parent-key))
-                                              (result (apply #'jiralib2-create-issue
+                                       (let* ((result (apply #'jiralib2-create-issue
                                                              project-key subtask-type
                                                              summary description
                                                              (delq nil
@@ -1044,6 +1048,8 @@ remote field state for three-way reconciliation."
                            ("state" ,local-state)
                            ("description" ,(or local-body ""))))
                  (is-epic (equal issue-type ejira-epic-type-name))
+                 (priority-id (ejira--new-issue-priority-id
+                               marker project-key parent-issue))
                  (label (cond (is-epic "epic")
                               (parent-epic "task")
                               (t "issue"))))
@@ -1065,6 +1071,7 @@ remote field state for three-way reconciliation."
                                                  (if ejira-parent-link-field
                                                      ""
                                                    " (preview only — ejira-parent-link-field is nil)")))
+                                       (when priority-id (format "priority id: %s" priority-id))
                                        "description (Jira markup):"
                                        desc-markup)
                              :assign-self (list ejira--assign-new-issues)
@@ -1073,6 +1080,7 @@ remote field state for three-way reconciliation."
                                          (summary heading-title)
                                          (desc-markup desc-markup)
                                          (children children)
+                                         (priority-id priority-id)
                                          (issue-type issue-type)
                                          (parent-epic parent-epic)
                                          (parent-initiative parent-initiative)
@@ -1094,9 +1102,6 @@ remote field state for three-way reconciliation."
                                        (let* ((epic-name-arg
                                                (when (and is-epic epic-summary-field)
                                                  `(,epic-summary-field . ,summary)))
-                                              (priority-id
-                                               (ejira--default-priority-id
-                                                project-key parent-issue))
                                               (result (apply #'jiralib2-create-issue
                                                              project-key issue-type
                                                              summary desc-markup

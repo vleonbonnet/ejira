@@ -857,6 +857,58 @@ Body for Jira.
            (should (equal "Body for Jira."
                           (string-trim (ejira--get-heading-body (point-marker)))))))))))
 
+(ert-deftest ejira-push--create/priority-from-cookie ()
+  "New issues are created with the priority their Org cookie names.
+Regression: creation always sent the project default, so a `[#2]'
+heading became the default priority in Jira."
+  (let ((ejira-priority-policies ejira-test--priority-policies)
+        (ejira-epic-field 'customfield_10857)
+        (ejira--assign-new-issues nil)
+        (created nil))
+    (ejira-test--with-org-buf
+     "* TEST-1 My Epic
+:PROPERTIES:
+:TYPE:     ejira-epic
+:ID:       TEST-1
+:Issuetype: Epic
+:END:
+** TODO [#B] New task
+*** TODO [#C] New child
+** TODO Default task
+"
+     (should (equal "p2" (ejira--new-issue-priority-id
+                          (save-excursion (re-search-forward "New task")
+                                          (point-marker))
+                          "TEST")))
+     (should (equal "p1" (ejira--new-issue-priority-id
+                          (save-excursion (re-search-forward "Default task")
+                                          (point-marker))
+                          "TEST")))
+     (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+            (creates (cl-remove-if-not
+                      (lambda (op) (eq 'create (plist-get op :op))) ops))
+            (plans (ejira--push-build-plans creates)))
+       (should (string-match-p "priority id: p2"
+                               (plist-get (car plans) :payload)))
+       (cl-letf (((symbol-function 'jiralib2-create-issue)
+                  (lambda (_project _type summary _description &rest args)
+                    (push (cons summary
+                                (alist-get 'id (alist-get 'priority args)))
+                          created)
+                    `((key . ,(format "TEST-%d" (+ 10 (length created)))))))
+                 ((symbol-function 'ejira--finalize-new-issue-review-safe)
+                  (lambda (&rest _) nil))
+                 ((symbol-function 'ejira--finalize-new-issue)
+                  (lambda (&rest _) nil))
+                 ((symbol-function 'ejira--transition-to-org-state)
+                  (lambda (&rest _) nil))
+                 ((symbol-function 'ejira--update-task-or-hold)
+                  (lambda (&rest _) t)))
+         (dolist (plan plans) (funcall (plist-get plan :send))))
+       (should (equal "p2" (cdr (assoc "New task" created))))
+       (should (equal "p3" (cdr (assoc "New child" created))))
+       (should (equal "p1" (cdr (assoc "Default task" created))))))))
+
 (ert-deftest ejira-push--rule-e/plain-heading-under-issue-ignored ()
   "Heading without TODO under ejira-issue is NOT detected as a new subtask."
   (let ((ops (ejira-test--scan
