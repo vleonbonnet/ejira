@@ -2322,6 +2322,42 @@ fresh."
            (kill-buffer b)))
        (delete-directory dir t))))
 
+(ert-deftest ejira-update-task/keeps-user-placed-heading-in-its-file ()
+  "A pull does not move a heading placed outside the ejira directory to
+a parent in another file.
+Regression: an epic kept with its backlog in a user file was refiled,
+subtree and all, under its Initiative in the project file."
+  (ejira-test--with-project-dir
+      (concat ejira-test--project-content
+              "** TODO Initiative\n:PROPERTIES:\n:ID:       TEST-9\n:TYPE:     ejira-issue\n:Issuetype: Initiative\n:END:\n")
+    (let* ((extra (make-temp-file "ejira-user-" nil ".org"))
+           (ejira-extra-scan-files (list extra))
+           (ejira--heading-cache (make-hash-table :test #'equal))
+           (ejira-assigned-tagname nil))
+      (unwind-protect
+          (progn
+            (with-temp-file extra
+              (insert "* TODO The epic\n:PROPERTIES:\n:ID:       TEST-5\n:TYPE:     ejira-epic\n:END:\n\nBody.\n"
+                      "** TODO Its task\n:PROPERTIES:\n:ID:       TEST-6\n:TYPE:     ejira-issue\n:END:\n"))
+            (let ((buf (find-file-noselect extra t)))
+              (cl-letf (((symbol-function 'ejira--my-fullname) (lambda () "Test User")))
+                (ejira--update-task
+                 (make-ejira-task :key "TEST-5" :type "Epic" :status "Open"
+                                  :project "TEST" :parent "TEST-9"
+                                  :updated (date-to-time "2026-09-02 00:00:00 +0000")
+                                  :created (date-to-time "2026-09-01 00:00:00 +0000")
+                                  :summary "The epic" :description "Body."
+                                  :comments-complete t)))
+              (should (eq buf (marker-buffer (ejira--find-heading "TEST-5"))))
+              (with-current-buffer buf
+                (goto-char (point-min))
+                (should (re-search-forward "^\\* TODO The epic" nil t))
+                (should (re-search-forward "^\\*\\* TODO Its task" nil t)))))
+        (when-let ((b (get-file-buffer extra)))
+          (with-current-buffer b (set-buffer-modified-p nil))
+          (kill-buffer b))
+        (delete-file extra)))))
+
 (ert-deftest ejira-refile/evicts-cached-descendant-markers ()
   "After a cross-file refile, a cached descendant marker must not be trusted.
 The refile moves the whole subtree; markers of cached descendants stay in

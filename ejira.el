@@ -1247,7 +1247,18 @@ acknowledgment are held for the normal review flow."
                             (length conflicts))
                    (ejira--auto-sync-log file conflicts))
                  (ejira--auto-sync-record-held file conflicts)
-                 (ejira--save-buffer-safe))
+                 (ejira--save-buffer-safe)
+                 ;; A pull can refile or create headings in other files
+                 ;; (the project files); save those too, or the change
+                 ;; lives only in an unsaved buffer.
+                 (dolist (other (delete-dups
+                                 (cl-loop for m being the hash-values of ejira--heading-cache
+                                          when (and (markerp m) (marker-buffer m)
+                                                    (not (eq (marker-buffer m) buf)))
+                                          collect (marker-buffer m))))
+                   (with-current-buffer other
+                     (when (buffer-modified-p)
+                       (ejira--save-buffer-safe)))))
              (org-fold-core-regions vis :override t))))))))
 
 (defun ejira--auto-sync-worker ()

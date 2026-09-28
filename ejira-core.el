@@ -949,21 +949,29 @@ converted to Org; callers hold the issue and report it."
           ;; Ensure comments are ordered by creation
           (ejira--sort-comments key)
 
-          ;; Refile to enforce the Jira hierarchy.  For parent/epic always enforce
-          ;; so subtasks and stories stay nested correctly.  For the project-level
-          ;; fallback, skip if the heading has been manually moved outside
-          ;; ejira-org-directory — use file-truename on both sides to handle symlinks.
+          ;; Refile to enforce the Jira hierarchy.  Inside ejira-org-directory
+          ;; always enforce, so subtasks and stories stay nested correctly.
+          ;; A heading the user placed outside it (a refiled epic living with
+          ;; its backlog) is only re-nested within its own file: moving it
+          ;; to a parent in another file would take the whole subtree out of
+          ;; the user's file (observed: an epic's subtree moved into the
+          ;; project file under its Initiative).  Use file-truename on both
+          ;; sides to handle symlinks.
           (let* ((target (cond (parent) (epic) (t project)))
-                 (heading-file (buffer-file-name
-                                (marker-buffer (ejira--find-heading key))))
+                 (heading-buf (marker-buffer (ejira--find-heading key)))
+                 (heading-file (buffer-file-name heading-buf))
+                 (target-m (ejira--find-heading target))
                  ;; `heading-file' is nil for non-file-backed buffers
                  ;; (tests, capture targets); treat them as outside the
                  ;; ejira directory.
                  (in-ejira-dir (and heading-file
                                     (string-prefix-p
                                      (file-truename (expand-file-name ejira-org-directory))
-                                     (file-truename heading-file)))))
-            (when (or parent epic in-ejira-dir)
+                                     (file-truename heading-file))))
+                 (same-buffer (and target-m (eq (marker-buffer target-m) heading-buf))))
+            (when (if in-ejira-dir
+                      t
+                    (and (or parent epic) same-buffer))
               (ejira--refile key target)))
           (message "Updated %s: %s" key summary)
           ;; Record the push baseline from the content we just wrote so later
