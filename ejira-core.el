@@ -1570,7 +1570,21 @@ next pull."
            (or (ejira--alist-get item 'fields 'status 'name) ""))
           "\0"
           (ejira--push-normalize
-           (or (ejira--alist-get item 'fields 'assignee 'displayName) ""))))
+           (or (ejira--alist-get item 'fields 'assignee 'displayName) ""))
+          "\0"
+          (ejira--remote-comments-identity item)))
+
+(defun ejira--remote-comments-identity (item)
+  "Return the identity of remote issue ITEM's embedded comment page.
+Each comment contributes its id and last-update time, so an added,
+edited or deleted Jira comment registers as a remote change; without
+it, comments posted in Jira never reached a file whose issue fields
+stayed the same.  The fetch must request the `comment' field."
+  (mapconcat (lambda (c)
+               (format "%s@%s" (ejira--alist-get c 'id)
+                       (or (ejira--alist-get c 'updated) "")))
+             (ejira--alist-get item 'fields 'comment 'comments)
+             ","))
 
 (defun ejira--store-remote-baseline (item)
   "Store the :Remotehash: of remote issue ITEM on the heading at point."

@@ -1904,6 +1904,29 @@ reviewed snapshot; later edits stay dirty."
     (should-not (equal (md5 (ejira--remote-fields-identity a))
                        (md5 (ejira--remote-fields-identity d))))))
 
+(ert-deftest ejira-auto-sync/remote-identity-covers-comments ()
+  "A comment added or edited in Jira is a remote change.
+Regression: comments were outside the identity, so an issue whose
+fields stayed the same never pulled comments posted in Jira."
+  (let* ((base (ejira-test--mock-item "S" "Open" "B"))
+         (with (lambda (comments)
+                 `((key . "TEST-1")
+                   (fields . ((summary . "S") (description . "B")
+                              (status . ((name . "Open")))
+                              (comment . ((comments . ,comments)))))))))
+    (should (equal (md5 (ejira--remote-fields-identity base))
+                   (md5 (ejira--remote-fields-identity (funcall with nil)))))
+    (let ((one (funcall with '(((id . "1") (updated . "2026-09-01T00:00:00.000+0000")))))
+          (edited (funcall with '(((id . "1") (updated . "2026-09-02T00:00:00.000+0000")))))
+          (two (funcall with '(((id . "1") (updated . "2026-09-01T00:00:00.000+0000"))
+                               ((id . "2") (updated . "2026-09-03T00:00:00.000+0000"))))))
+      (should-not (equal (md5 (ejira--remote-fields-identity base))
+                         (md5 (ejira--remote-fields-identity one))))
+      (should-not (equal (md5 (ejira--remote-fields-identity one))
+                         (md5 (ejira--remote-fields-identity edited))))
+      (should-not (equal (md5 (ejira--remote-fields-identity one))
+                         (md5 (ejira--remote-fields-identity two)))))))
+
 (ert-deftest ejira-auto-sync/store-and-detect-remote-change ()
   "A stored baseline detects remote changes; its absence means unknown."
   (ejira-test--with-org-buf

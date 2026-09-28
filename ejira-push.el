@@ -652,7 +652,9 @@ remote field state for three-way reconciliation."
              (remote-items
               (apply #'jiralib2-jql-search
                      (format "key in (%s)" (s-join ", " keys))
-                     '("summary" "description" "assignee" "priority" "duedate" "status"))))
+                     ;; `comment' feeds the remote identity stored on success.
+                     '("summary" "description" "assignee" "priority" "duedate" "status"
+                       "comment"))))
         (dolist (op issue-update-ops)
           (let* ((key (plist-get op :key))
                  (marker (plist-get op :marker))
@@ -778,7 +780,10 @@ remote field state for three-way reconciliation."
                    "\0"
                    (ejira--push-normalize
                     (if assignee-changed local-assignee
-                      (or remote-assignee ""))))))
+                      (or remote-assignee "")))
+                   ;; An issue update leaves the comments as fetched.
+                   "\0"
+                   (if item (ejira--remote-comments-identity item) ""))))
             (if changes
                 (push (list :op 'update
                             :object 'issue
