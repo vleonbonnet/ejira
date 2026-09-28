@@ -1001,7 +1001,11 @@ remote field state for three-way reconciliation."
                                                            (format-time-string "%Y-%m-%d %H:%M:%S")))
                                        (with-current-buffer (marker-buffer marker)
                                          (ejira--save-buffer-safe))
-                                       (let* ((result (apply #'jiralib2-create-issue
+                                       (let* ((priority-id
+                                               (or priority-id
+                                                   (ejira--default-priority-id
+                                                    project-key parent-key)))
+                                              (result (apply #'jiralib2-create-issue
                                                              project-key subtask-type
                                                              summary description
                                                              (delq nil
@@ -1102,6 +1106,10 @@ remote field state for three-way reconciliation."
                                        (let* ((epic-name-arg
                                                (when (and is-epic epic-summary-field)
                                                  `(,epic-summary-field . ,summary)))
+                                              (priority-id
+                                               (or priority-id
+                                                   (ejira--default-priority-id
+                                                    project-key parent-issue)))
                                               (result (apply #'jiralib2-create-issue
                                                              project-key issue-type
                                                              summary desc-markup

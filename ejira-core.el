@@ -490,7 +490,9 @@ scheme when PROJECT has no explicit policy."
 The heading's Org priority cookie selects the selectable Jira priority
 of the same rank (PROJECT's policy, else the scheme of REFERENCE-KEY).
 Without a cookie, or when no selectable priority has that rank, the
-project default applies, as `ejira--default-priority-id' defines it."
+policy's configured default applies.  Returns nil when neither exists;
+creation then asks `ejira--default-priority-id', which may need the
+server, at send time rather than while the plan is built."
   (let* ((cookie (org-with-point-at marker
                    (save-excursion
                      (org-back-to-heading t)
@@ -508,7 +510,8 @@ project default applies, as `ejira--default-priority-id' defines it."
                 (plist-get (ejira--priority-entry-for-rank
                             project (ejira--get-priority-scheme reference-key) rank)
                            :id))))))
-    (or from-rank (ejira--default-priority-id project reference-key))))
+    (or from-rank
+        (plist-get (ejira--priority-policy project) :default))))
 
 (defun ejira--org-priority-numeric-p ()
   "Return non-nil when Org's configured priority range is numeric."
@@ -736,13 +739,14 @@ The log buffer is never displayed automatically."
       (dolist (l lines)
         (insert "  " l "\n")))))
 
-(defun ejira--update-task-or-hold (issue)
+(defun ejira--update-task-or-hold (issue &optional on-hold)
   "Pull ISSUE with `ejira--update-task'; hold it when its markup fails.
 ISSUE is an issue key, a parsed `ejira-task', or a REST item alist.
 When the remote summary, description or a comment cannot be converted
-to Org, nothing is written (see `ejira--update-task'), the hold is
-recorded in the `*ejira sync log*' buffer, and nil is returned.
-Returns non-nil when the pull was applied."
+to Org, nothing is written (see `ejira--update-task') and nil is
+returned.  The hold is reported by calling ON-HOLD with the key and a
+reason line, or, without ON-HOLD, recorded in the `*ejira sync log*'
+buffer.  Returns non-nil when the pull was applied."
   (let ((key (cond ((stringp issue) issue)
                    ((ejira-task-p issue) (ejira-task-key issue))
                    (t (ejira--alist-get issue 'key)))))
@@ -755,13 +759,16 @@ Returns non-nil when the pull was applied."
                (ejira--parse-item issue))))
           t)
       (ejira-parser-error
-       (ejira--auto-sync-log
-        (or (ignore-errors
-              (buffer-file-name (marker-buffer (ejira--find-heading key))))
-            "ejira")
-        (list (format "%s: remote markup could not be converted (%s); pull held"
-                      key (cadr err))))
-       (message "ejira: %s held: remote markup could not be converted" key)
+       (let ((line (format "%s: remote markup could not be converted (%s); pull held"
+                           key (cadr err))))
+         (if on-hold
+             (funcall on-hold key line)
+           (ejira--auto-sync-log
+            (or (ignore-errors
+                  (buffer-file-name (marker-buffer (ejira--find-heading key))))
+                "ejira")
+            (list line))
+           (message "ejira: %s held: remote markup could not be converted" key)))
        nil))))
 
 (defun ejira--validate-remote-markup (description comments)

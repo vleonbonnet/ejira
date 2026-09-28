@@ -753,6 +753,151 @@ pushes; project headings and comments are excluded."
                              (ejira--get-fields-to-sync nil))))))
     items))
 
+;;; Held-issue indicator
+
+(defcustom ejira-auto-sync-mode-line t
+  "When non-nil, show the number of held auto-sync issues in the mode line.
+Held issues (changed on both sides, without a remote baseline, blocked,
+or with unconvertible remote markup) only appear in the
+`*ejira sync log*' buffer otherwise, which is easy never to look at."
+  :group 'ejira
+  :type 'boolean)
+
+(defvar ejira--auto-sync-held (make-hash-table :test 'equal)
+  "Map an auto-sync file to the held-issue lines of its last cycle.")
+
+(defun ejira--auto-sync-record-held (file lines)
+  "Record LINES as FILE's held issues from its latest cycle."
+  (puthash file lines ejira--auto-sync-held)
+  (force-mode-line-update t))
+
+(defun ejira-auto-sync-held-count ()
+  "Return the number of issues held by the latest auto-sync cycles."
+  (let ((n 0))
+    (maphash (lambda (_file lines) (setq n (+ n (length lines))))
+             ejira--auto-sync-held)
+    n))
+
+(defun ejira-auto-sync-show-log ()
+  "Display the `*ejira sync log*' buffer."
+  (interactive)
+  (pop-to-buffer (get-buffer-create "*ejira sync log*")))
+
+(defvar ejira--auto-sync-mode-line-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mode-line mouse-1] #'ejira-auto-sync-show-log)
+    map)
+  "Keymap for the auto-sync mode-line indicator.")
+
+(defun ejira--auto-sync-mode-line ()
+  "Return the mode-line indicator for held auto-sync issues, or nil."
+  (when ejira-auto-sync-mode-line
+    (let ((n (ejira-auto-sync-held-count)))
+      (when (> n 0)
+        (propertize (format " Jira:%d held" n)
+                    'face 'warning
+                    'help-echo "ejira auto-sync held issues; mouse-1: show *ejira sync log*"
+                    'mouse-face 'mode-line-highlight
+                    'local-map ejira--auto-sync-mode-line-map)))))
+
+(defconst ejira--auto-sync-mode-line-construct
+  '(:eval (ejira--auto-sync-mode-line))
+  "Mode-line construct added to `global-mode-string' by auto-sync.")
+
+;;; Discovery of Jira-side children
+
+(defcustom ejira-auto-sync-discover nil
+  "Whether the automatic sync imports Jira issues missing from the file.
+A Jira issue whose epic link or parent is an issue of an auto-sync file,
+but which the file does not contain yet (created in Jira, or by someone
+else), is otherwise never pulled: the cycle only fetches the keys the
+file already holds.
+  nil         never import;
+  `unresolved' import unresolved children;
+  `all'        import children whatever their resolution."
+  :group 'ejira
+  :type '(choice (const :tag "Never" nil)
+                 (const :tag "Unresolved children" unresolved)
+                 (const :tag "All children" all)))
+
+(defun ejira--buffer-issue-types ()
+  "Return an alist (KEY . TYPE) of the ejira issue headings in the buffer."
+  (let (res)
+    (org-with-wide-buffer
+     (goto-char (point-min))
+     (while (re-search-forward org-heading-regexp nil t)
+       (let ((id (org-entry-get nil "ID"))
+             (type (org-entry-get nil "TYPE")))
+         (when (and id type
+                    (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" id)
+                    (member type '("ejira-issue" "ejira-story"
+                                   "ejira-subtask" "ejira-epic")))
+           (push (cons id type) res)))))
+    (nreverse res)))
+
+(defun ejira--item-parent-key (item)
+  "Return the key of REST item ITEM's parent issue or epic, or nil."
+  (or (ejira--alist-get item 'fields 'parent 'key)
+      (and ejira-epic-field
+           (let ((v (ejira--alist-get item 'fields ejira-epic-field)))
+             (and (stringp v) v)))))
+
+(defun ejira--auto-sync-discover-items (buf)
+  "Return REST items that belong under issues of BUF but are absent from it.
+Children are found by epic link (for epic headings) and by parent (for
+the other issue headings); see `ejira-auto-sync-discover'."
+  (with-current-buffer buf
+    (let* ((types (ejira--buffer-issue-types))
+           (present (mapcar #'car types))
+           (epics (mapcar #'car (cl-remove-if-not
+                                 (lambda (e) (equal (cdr e) "ejira-epic")) types)))
+           (parents (mapcar #'car (cl-remove-if
+                                   (lambda (e) (member (cdr e) '("ejira-epic" "ejira-subtask")))
+                                   types)))
+           (clauses
+            (delq nil
+                  (list
+                   (when (and epics ejira-epic-field)
+                     (format "cf[%s] in (%s)"
+                             (replace-regexp-in-string
+                              "\\`customfield_" "" (symbol-name ejira-epic-field))
+                             (s-join ", " epics)))
+                   (when parents
+                     (format "parent in (%s)" (s-join ", " parents)))))))
+      (when clauses
+        (cl-remove-if
+         (lambda (item) (member (ejira--alist-get item 'key) present))
+         (apply #'jiralib2-jql-search
+                (concat "(" (s-join " OR " clauses) ")"
+                        (when (eq ejira-auto-sync-discover 'unresolved)
+                          " AND resolution = Unresolved"))
+                (ejira--get-fields-to-sync nil)))))))
+
+(defun ejira--auto-sync-import (item buf &optional on-hold)
+  "Import REST ITEM under its parent heading in BUF; return non-nil on success.
+The heading is created directly under the parent so it inherits the
+file's layout (body-as-description), then pulled and baselined.  An
+issue already present in another file is pulled, which refiles it
+here.  A conversion failure is reported through ON-HOLD (see
+`ejira--update-task-or-hold') and leaves no heading behind."
+  (let* ((key (ejira--alist-get item 'key))
+         (parent (ejira--item-parent-key item))
+         (parent-m (and parent (ejira--find-heading parent))))
+    (when (and parent-m (eq (marker-buffer parent-m) buf))
+      (let ((created (unless (ejira--find-heading key)
+                       (ejira--new-heading buf parent key))))
+        (if (ejira--update-task-or-hold item on-hold)
+            (when-let ((m (ejira--find-heading key)))
+              (org-with-point-at m (ejira--store-remote-baseline item))
+              t)
+          ;; Held: remove the empty placeholder so the next cycle retries
+          ;; discovery instead of seeing a heading with no content.
+          (when created
+            (org-with-point-at created
+              (delete-region (point) (ejira--true-subtree-end)))
+            (when ejira--heading-cache (remhash key ejira--heading-cache)))
+          nil)))))
+
 (defun ejira--auto-sync-execute (file plans)
   "Execute conflict-free PLANs for FILE without confirmation.
 Comment edits/deletions and plans whose remote changed since the last
@@ -804,7 +949,13 @@ acknowledgment are held for the normal review flow."
            (ejira--heading-cache (make-hash-table :test 'equal))
            (pulls nil)
            (conflicts nil)
-           (held-keys nil))
+           (notes nil)
+           (held-keys nil)
+           ;; Conversion holds: keep the issue's pushes out of the cycle
+           ;; and report it with the other held issues.
+           (on-hold (lambda (key line)
+                      (push key held-keys)
+                      (push line conflicts))))
       (with-current-buffer buf
         ;; Revert an unmodified buffer whose file changed externally; a
         ;; buffer with unsaved edits is a moving target — wait for its
@@ -857,6 +1008,14 @@ acknowledgment are held for the normal review flow."
                        (push key held-keys)
                        (push (format "%s: changed locally with no remote baseline" key)
                              conflicts)))))
+                 ;; ── import Jira-side children missing locally ──
+                 (when ejira-auto-sync-discover
+                   (dolist (item (ejira--auto-sync-discover-items buf))
+                     (let ((key (ejira--alist-get item 'key)))
+                       (when (ejira--auto-sync-import item buf on-hold)
+                         (push (format "%s: imported from Jira under %s"
+                                       key (ejira--item-parent-key item))
+                               notes)))))
                  ;; ── pull remote-only changes ──
                  (dolist (item (nreverse pulls))
                    (let ((key (ejira--alist-get item 'key)))
@@ -865,13 +1024,11 @@ acknowledgment are held for the normal review flow."
                                 (push (format "%s: locally edited comments; pull deferred"
                                               key)
                                       conflicts))
-                       (if (ejira--update-task-or-hold item)
-                           ;; The heading may have been refiled; re-find it.
-                           (when-let ((m (ejira--find-heading key)))
-                             (org-with-point-at m
-                               (ejira--store-remote-baseline item)))
-                         ;; Logged by the helper; keep its pushes out too.
-                         (push key held-keys)))))
+                       (when (ejira--update-task-or-hold item on-hold)
+                         ;; The heading may have been refiled; re-find it.
+                         (when-let ((m (ejira--find-heading key)))
+                           (org-with-point-at m
+                             (ejira--store-remote-baseline item)))))))
                  ;; ── push local-only changes ──
                  (let* ((ops (ejira--with-pre-scan buf
                                (ejira--push-scan-buffer buf)))
@@ -898,11 +1055,14 @@ acknowledgment are held for the normal review flow."
                           plans))
                    (when plans
                      (ejira--auto-sync-execute file plans)))
+                 (when notes
+                   (ejira--auto-sync-log file (nreverse notes)))
+                 (setq conflicts (nreverse conflicts))
                  (when conflicts
-                   (setq conflicts (nreverse conflicts))
                    (message "ejira auto-sync: %d issue(s) held back"
                             (length conflicts))
                    (ejira--auto-sync-log file conflicts))
+                 (ejira--auto-sync-record-held file conflicts)
                  (ejira--save-buffer-safe))
              (org-fold-core-regions vis :override t))))))))
 
@@ -956,6 +1116,10 @@ acknowledgment are held for the normal review flow."
           (run-with-idle-timer ejira-auto-sync-interval
                                ejira-auto-sync-interval
                                #'ejira--auto-sync-worker))
+    (unless (member ejira--auto-sync-mode-line-construct global-mode-string)
+      (setq global-mode-string
+            (append (or global-mode-string '(""))
+                    (list ejira--auto-sync-mode-line-construct))))
     (message "ejira: auto-sync enabled for %d file(s)"
              (length ejira-auto-sync-files))))
 
@@ -963,7 +1127,9 @@ acknowledgment are held for the normal review flow."
   "Tear down the automatic reconciliation timer."
   (when ejira--auto-sync-timer
     (cancel-timer ejira--auto-sync-timer)
-    (setq ejira--auto-sync-timer nil)))
+    (setq ejira--auto-sync-timer nil))
+  (setq global-mode-string
+        (delete ejira--auto-sync-mode-line-construct global-mode-string)))
 
 
 ;;;###autoload

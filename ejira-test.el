@@ -1985,6 +1985,83 @@ everything else executes.  Creation follows `ejira-auto-sync-create'."
       (ejira--auto-sync-execute "test.org" plans))
     (should (equal sent '(updated)))))
 
+(defconst ejira-test--discover-content
+  "* Project\n:PROPERTIES:\n:ID:       TEST\n:TYPE:     ejira-project\n:END:\n\
+** TODO The epic\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-epic\n\
+:Issuetype: Epic\n:EJIRA_DESCRIPTION_IN_BODY: t\n:END:\n\nEpic body.\n")
+
+(defun ejira-test--child-item (key description)
+  "A REST item for task KEY in epic TEST-1 with DESCRIPTION."
+  `((key . ,key)
+    (fields . ((summary . "Created in Jira")
+               (description . ,description)
+               (status . ((name . "Open")))
+               (issuetype . ((name . "Task")))
+               (project . ((key . "TEST")))
+               (customfield_10857 . "TEST-1")
+               (created . "2026-09-20T10:00:00.000+0000")
+               (updated . "2026-09-21T10:00:00.000+0000")))))
+
+(ert-deftest ejira-auto-sync/discovers-children-created-in-jira ()
+  "An unresolved Jira child of an epic in the file is imported under it.
+Regression: the cycle fetched only the keys the file already held, so
+an issue created in Jira under a synced epic never reached the file."
+  (when (get-buffer "*ejira sync log*")
+    (with-current-buffer "*ejira sync log*" (erase-buffer)))
+  (ejira-test--with-project-dir ejira-test--discover-content
+                                (let* ((file (expand-file-name "TEST.org" ejira-org-directory))
+                                       (buf (find-file-noselect file t))
+                                       (ejira-epic-field 'customfield_10857)
+                                       (ejira-auto-sync-discover 'unresolved)
+                                       (ejira-assigned-tagname nil)
+                                       (jql nil))
+                                  (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
+                                            ((symbol-function 'jiralib2-jql-search)
+                                             (lambda (q &rest _)
+                                               (setq jql q)
+                                               (list (ejira-test--child-item "TEST-2" "Line with {{code}}.\n* (x) todo"))))
+                                            ((symbol-function 'ejira--push-scan-buffer) (lambda (_buf) nil)))
+                                    (ejira--auto-sync-reconcile file))
+                                  (should (string-match-p "cf\\[10857\\] in (TEST-1)" jql))
+                                  (should (string-match-p "resolution = Unresolved" jql))
+                                  (with-current-buffer buf
+                                    (goto-char (point-min))
+                                    (should (re-search-forward "^\\*\\*\\* TODO Created in Jira" nil t))
+                                    (should (equal "TEST-2" (org-entry-get nil "ID")))
+                                    (should (org-entry-get nil "Remotehash"))
+                                    (should-not (ejira--locally-modified-p))
+                                    ;; Body-as-description inherited from the epic: converted body,
+                                    ;; not a Description child and not raw markup.
+                                    (should (equal "Line with =code=.\n- [ ] todo"
+                                                   (string-trim (ejira--jira-description)))))
+                                  (with-current-buffer "*ejira sync log*"
+                                    (should (string-match-p "TEST-2: imported from Jira under TEST-1"
+                                                            (buffer-string)))))))
+
+(ert-deftest ejira-auto-sync/discovery-hold-leaves-no-heading ()
+  "A discovered child whose markup cannot be converted is held, not stubbed."
+  (clrhash ejira--auto-sync-held)
+  (ejira-test--with-project-dir ejira-test--discover-content
+                                (let* ((file (expand-file-name "TEST.org" ejira-org-directory))
+                                       (buf (find-file-noselect file t))
+                                       (ejira-epic-field 'customfield_10857)
+                                       (ejira-auto-sync-discover 'all)
+                                       (ejira-assigned-tagname nil)
+                                       (ejira-parser-patterns
+                                        (cons (cons "boom" (lambda () (error "Rule failure")))
+                                              ejira-parser-patterns)))
+                                  (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
+                                            ((symbol-function 'jiralib2-jql-search)
+                                             (lambda (&rest _) (list (ejira-test--child-item "TEST-3" "a boom"))))
+                                            ((symbol-function 'ejira--push-scan-buffer) (lambda (_buf) nil)))
+                                    (ejira--auto-sync-reconcile file))
+                                  (with-current-buffer buf
+                                    (should-not (string-match-p "TEST-3\\|ejira new heading" (buffer-string))))
+                                  (should (= 1 (ejira-auto-sync-held-count)))
+                                  (should (string-match-p "1 held" (ejira--auto-sync-mode-line)))
+                                  (clrhash ejira--auto-sync-held)
+                                  (should-not (ejira--auto-sync-mode-line)))))
+
 (ert-deftest ejira-auto-sync/reconcile-classification ()
   "One reconcile cycle: clean+remote-changed pulls, dirty+remote-changed
 holds as conflict, clean+unchanged does nothing."
