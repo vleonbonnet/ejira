@@ -98,6 +98,35 @@ project ancestor."
            ((equal type "ejira-project")
             (throw 'result (list type id nil)))))))))
 
+(defun ejira--creation-target-id (marker)
+  "Return a stable identity for the new-issue heading at MARKER.
+The heading's Org ID, created when missing.  Creation is resolved by
+this ID at send time instead of by MARKER: sends that run before it
+rewrite other headings' bodies (a finalize pull replaces the parent's
+or a sibling's description), and a marker at a heading start then
+collapses into the rewritten region -- observed live: a cascade wrote
+each child's issue key onto its parent heading.  `ejira--record-new-issue-key'
+keeps the ID as ORIG_ID and rewrites links to it."
+  (org-with-point-at marker
+    (or (org-entry-get nil "ID")
+        (let ((id (org-id-new)))
+          (org-entry-put nil "ID" id)
+          (when-let ((file (buffer-file-name (buffer-base-buffer))))
+            (org-id-add-location id file))
+          id))))
+
+(defun ejira--creation-target (marker id)
+  "Return a marker on the heading of MARKER's buffer whose ID is ID.
+Signal an error when no such heading exists any more."
+  (with-current-buffer (marker-buffer marker)
+    (org-with-wide-buffer
+     (goto-char (point-min))
+     (if (re-search-forward (concat "^[ \t]*:ID:[ \t]+" (regexp-quote id) "[ \t]*$")
+                            nil t)
+         (progn (org-back-to-heading t) (point-marker))
+       (error "ejira: the heading to create (ID %s) is no longer in %s"
+              id (buffer-name))))))
+
 (defun ejira--record-new-issue-key (new-key marker)
   "Record newly created Jira issue key NEW-KEY on MARKER's heading.
 
@@ -204,8 +233,9 @@ heading by NEW-KEY."
 
 (defun ejira--push-scan-issue-children (parent-marker project-key)
   "Return (CHILDREN . BLOCKED-OPS) for the new issue heading at PARENT-MARKER.
-CHILDREN are direct-child plists (:marker :title :state :body
-:priority-id) captured for cascade creation; the priority comes from
+CHILDREN are direct-child plists (:marker :id :title :state :body
+:priority-id) captured for cascade creation (see
+`ejira--creation-target-id' for :id); the priority comes from
 the child's Org cookie within PROJECT-KEY's policy.  BLOCKED-OPS are ops for TODOs deeper than the
 direct children: the native Jira hierarchy has no place for them, so
 they are reported instead of being silently flattened or lost.  The
@@ -216,7 +246,10 @@ plan-build time, so the reviewed payload is exactly what creation sends."
      (save-excursion
        (goto-char parent-marker)
        (let* ((parent-level (org-current-level))
-              (end (save-excursion (org-end-of-subtree t) (point))))
+              ;; A marker: capturing a child can insert text (its
+              ;; creation ID, a moved description), which would leave an
+              ;; integer bound short of the later children.
+              (end (save-excursion (org-end-of-subtree t) (point-marker))))
          (while (and (outline-next-heading) (< (point) end))
            (let* ((lvl (org-current-level))
                   (type (org-entry-get nil "TYPE"))
@@ -229,6 +262,7 @@ plan-build time, so the reviewed payload is exactly what creation sends."
                             (not (equal heading ejira-description-heading-name))
                             (not (equal heading ejira-comments-heading-name)))
                    (push (list :marker (point-marker)
+                               :id     (ejira--creation-target-id (point-marker))
                                :title  (ejira--jira-summary)
                                :state  (substring-no-properties (or todo-state ""))
                                :body   (ejira--prepare-new-issue-description)
@@ -255,7 +289,10 @@ plist with :marker :title :state :body (the body already prepared at
 scan time).  TODO-KEYWORDS is the org-todo-keywords-1 list for
 state-transition lookup; ASSIGN-SELF is the value (t/nil) of the
 parent's assign-self cell."
-  (let* ((child-marker (plist-get child :marker))
+  (let* ((child-marker (if (plist-get child :id)
+                           (ejira--creation-target (plist-get child :marker)
+                                                   (plist-get child :id))
+                         (plist-get child :marker)))
          (orig-state   (plist-get child :state))
          (summary      (plist-get child :title))
          (description  (plist-get child :body))
@@ -983,6 +1020,7 @@ remote field state for three-way reconciliation."
                                        (ejira-parser-org-to-jira local-body))
                              :assign-self assign-self-cell
                              :send (let ((marker marker) (project-key project-key)
+                                         (target-id (ejira--creation-target-id marker))
                                          (parent-key parent-key)
                                          (priority-id priority-id)
                                          (summary heading-title)
@@ -996,6 +1034,9 @@ remote field state for three-way reconciliation."
                                                        org-todo-keywords-1)))
                                          (assign-self assign-self-cell))
                                      (lambda ()
+                                       ;; Resolve the heading by its ID: an
+                                       ;; earlier send may have moved it.
+                                       (setq marker (ejira--creation-target marker target-id))
                                        ;; Journal the attempt before the
                                        ;; request: if Jira accepts it and the
                                        ;; response is lost, the :Creating:
@@ -1085,6 +1126,7 @@ remote field state for three-way reconciliation."
                                        desc-markup)
                              :assign-self (list ejira--assign-new-issues)
                              :send (let ((marker marker) (project-key project-key)
+                                         (target-id (ejira--creation-target-id marker))
                                          (orig-state local-state)
                                          (summary heading-title)
                                          (desc-markup desc-markup)
@@ -1101,6 +1143,9 @@ remote field state for three-way reconciliation."
                                                      (when (boundp 'org-todo-keywords-1)
                                                        org-todo-keywords-1))))
                                      (lambda ()
+                                       ;; Resolve the heading by its ID: an
+                                       ;; earlier send may have moved it.
+                                       (setq marker (ejira--creation-target marker target-id))
                                        ;; Journal the attempt before the
                                        ;; request; see the subtask path.
                                        (org-with-point-at marker

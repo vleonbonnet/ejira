@@ -909,6 +909,71 @@ heading became the default priority in Jira."
        (should (equal "p3" (cdr (assoc "New child" created))))
        (should (equal "p1" (cdr (assoc "Default task" created))))))))
 
+(defun ejira-test--rewrite-body-of (key)
+  "Rewrite the body of the heading whose ID is KEY, as a finalize pull does."
+  (save-excursion
+    (goto-char (point-min))
+    (re-search-forward (concat "^:ID: +" (regexp-quote key) "$"))
+    (org-back-to-heading t)
+    (progn
+      (ejira--set-task-description
+       (concat "Rewritten by the finalize pull of " key
+               ", longer than the local body it replaces.")))))
+
+(ert-deftest ejira-push--create/keys-land-on-their-own-headings ()
+  "Each created issue's key lands on its own heading.
+Regression: creation targets were raw markers captured at plan time.
+A finalize pull rewrites the created issue's body; a marker sitting at
+the start of the next heading (a cascade child, or the next sibling
+plan) collapsed into the rewritten region, and that issue's key was
+written onto the previous heading -- observed live: every child's key
+overwrote its parent's."
+  (let ((ejira-priority-policies ejira-test--priority-policies)
+        (ejira-epic-field 'customfield_10857)
+        (ejira--assign-new-issues nil)
+        (counter 20))
+    (ejira-test--with-org-buf
+     "* TEST-1 My Epic
+:PROPERTIES:
+:TYPE:     ejira-epic
+:ID:       TEST-1
+:Issuetype: Epic
+:EJIRA_DESCRIPTION_IN_BODY: t
+:END:
+** TODO Parent task
+Parent body.
+*** TODO First child
+First body.
+*** DONE Second child
+Second body.
+** TODO Sibling task
+Sibling body.
+"
+     (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+            (plans (ejira--push-build-plans
+                    (cl-remove-if-not (lambda (o) (eq 'create (plist-get o :op))) ops)))
+            (created nil))
+       (cl-letf (((symbol-function 'jiralib2-create-issue)
+                  (lambda (_project _type summary &rest _)
+                    (let ((key (format "TEST-%d" (cl-incf counter))))
+                      (push (cons summary key) created)
+                      `((key . ,key)))))
+                 ((symbol-function 'ejira--finalize-new-issue-review-safe)
+                  (lambda (new-key &rest _) (ejira-test--rewrite-body-of new-key)))
+                 ((symbol-function 'ejira--finalize-new-issue)
+                  (lambda (new-key &rest _) (ejira-test--rewrite-body-of new-key)))
+                 ((symbol-function 'ejira--save-buffer-safe) #'ignore))
+         (dolist (plan plans) (funcall (plist-get plan :send))))
+       (dolist (title '("Parent task" "First child" "Second child" "Sibling task"))
+         (goto-char (point-min))
+         (re-search-forward (concat "^\\*+ \\(TODO\\|DONE\\) " title "$"))
+         (should (equal (cdr (assoc title created)) (org-entry-get nil "ID"))))
+       ;; No heading lost its identity to another's key.
+       (should (equal '("Parent task" "First child" "Second child" "Sibling task")
+                      (reverse (mapcar #'car created))))
+       (goto-char (point-min))
+       (should (= 4 (count-matches "^:ID: +TEST-2[0-9]$")))))))
+
 (ert-deftest ejira-push--rule-e/plain-heading-under-issue-ignored ()
   "Heading without TODO under ejira-issue is NOT detected as a new subtask."
   (let ((ops (ejira-test--scan
@@ -1330,10 +1395,10 @@ Converting a key the Org files do not hold would create a dead link."
 (ert-deftest ejira-parser/known-issue-uses-ejira-lookup ()
   "ejira-core's predicate finds a heading a stale org-id index misses."
   (ejira-test--with-project-dir ejira-test--project-content
-    (let ((org-id-locations (make-hash-table :test 'equal)))
-      (should (eq ejira-parser-issue-known-function #'ejira--issue-known-p))
-      (should (ejira--issue-known-p "TEST-1"))
-      (should-not (ejira--issue-known-p "TEST-404")))))
+                                (let ((org-id-locations (make-hash-table :test 'equal)))
+                                  (should (eq ejira-parser-issue-known-function #'ejira--issue-known-p))
+                                  (should (ejira--issue-known-p "TEST-1"))
+                                  (should-not (ejira--issue-known-p "TEST-404")))))
 
 (ert-deftest ejira-parser/replacement-cannot-clobber-match-data ()
   "A replacement function that matches strings does not break conversion.
