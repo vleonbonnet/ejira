@@ -51,7 +51,7 @@
   "Format the heading with ID KEY."
   (let ((marker (or (ejira--find-heading key)
                     (progn
-                      (ejira--update-task key)
+                      (ejira--update-task-or-hold key)
                       (ejira--find-heading key)))))
     (when marker
       (org-with-point-at marker
@@ -120,9 +120,8 @@ Association list ((<jql> . (<key1> <key2> <key3> ...)) ...)")
   "`org-agenda' -type which filters the issues with JQL.
 Prefix argument causes discarding the cached issue key list."
   (when (equal current-prefix-arg '(16))
-    (mapc #'ejira--update-task
-          (mapcar #'ejira--parse-item
-                  (apply #'jiralib2-jql-search jql (ejira--get-fields-to-sync)))))
+    (mapc #'ejira--update-task-or-hold
+          (apply #'jiralib2-jql-search jql (ejira--get-fields-to-sync))))
   (when (or current-prefix-arg (not (alist-get jql ejira-agenda--jql-cache nil nil #'equal)))
     (setf (alist-get jql ejira-agenda--jql-cache nil nil 'equal)
           (mapcar (-partial #'alist-get 'key) (jiralib2-jql-search jql "key"))))

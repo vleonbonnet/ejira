@@ -685,8 +685,64 @@ something a background auto-pull should ever do."
                             (md5 (ejira--heading-state-fields)))
         (ejira--update-push-baseline)))))
 
+(defun ejira--auto-sync-log (file lines)
+  "Append LINES for FILE to the `*ejira sync log*' buffer.
+The log buffer is never displayed automatically."
+  (when lines
+    (with-current-buffer (get-buffer-create "*ejira sync log*")
+      (goto-char (point-max))
+      (insert (format-time-string "[%Y-%m-%d %H:%M:%S] ") file "\n")
+      (dolist (l lines)
+        (insert "  " l "\n")))))
+
+(defun ejira--update-task-or-hold (issue)
+  "Pull ISSUE with `ejira--update-task'; hold it when its markup fails.
+ISSUE is an issue key, a parsed `ejira-task', or a REST item alist.
+When the remote summary, description or a comment cannot be converted
+to Org, nothing is written (see `ejira--update-task'), the hold is
+recorded in the `*ejira sync log*' buffer, and nil is returned.
+Returns non-nil when the pull was applied."
+  (let ((key (cond ((stringp issue) issue)
+                   ((ejira-task-p issue) (ejira-task-key issue))
+                   (t (ejira--alist-get issue 'key)))))
+    (condition-case err
+        (progn
+          (ejira--update-task
+           (if (or (stringp issue) (ejira-task-p issue))
+               issue
+             (let ((ejira-parser-signal-failures t))
+               (ejira--parse-item issue))))
+          t)
+      (ejira-parser-error
+       (ejira--auto-sync-log
+        (or (ignore-errors
+              (buffer-file-name (marker-buffer (ejira--find-heading key))))
+            "ejira")
+        (list (format "%s: remote markup could not be converted (%s); pull held"
+                      key (cadr err))))
+       (message "ejira: %s held: remote markup could not be converted" key)
+       nil))))
+
+(defun ejira--validate-remote-markup (description comments)
+  "Signal `ejira-parser-error' unless DESCRIPTION and COMMENTS convert to Org.
+DESCRIPTION is JIRA markup; COMMENTS are `ejira-comment' structs.  Run
+before a pull mutates anything, so a conversion failure holds the
+whole issue instead of leaving it half-updated or storing raw markup."
+  (let ((ejira-parser-signal-failures t))
+    (ejira--parse-body description)
+    (dolist (c comments)
+      (ejira--parse-body (ejira-comment-body c)))))
+
 (defun ejira--update-task (issue-key)
-  "Pull the task ISSUE-KEY from the server and update it's org state."
+  "Pull the task ISSUE-KEY from the server and update it's org state.
+Signals `ejira-parser-error', before changing anything but the priority
+metadata, when the remote summary, description or a comment cannot be
+converted to Org; callers hold the issue and report it."
+  (let ((ejira-parser-signal-failures t))
+    (ejira--update-task-1 issue-key)))
+
+(defun ejira--update-task-1 (issue-key)
+  "Implementation of `ejira--update-task' for ISSUE-KEY."
   (ejira--with-bind-struct ejira-task (if (ejira-task-p issue-key) issue-key
                                         (ejira--parse-item
                                          (jiralib2-get-issue issue-key)))
@@ -768,6 +824,11 @@ something a background auto-pull should ever do."
         ;; Modified stores the last-seen Jira updated timestamp; equality means
         ;; nothing else on the server changed since the last sync.
         (when modified-p
+          ;; Convert first, change second: a description or comment that
+          ;; cannot be converted aborts the pull before the heading is
+          ;; touched, so it is never half-applied.
+          (ejira--validate-remote-markup (unless local-dirty-p description)
+                                         comments)
           (unless state-dirty-p
             (ejira--set-todo-state key (funcall ejira-todo-state-fn status resolution)))
 
@@ -983,8 +1044,10 @@ can be compared against the current body to detect whether a push is needed."
 
 (defun ejira--set-heading-body-jira-markup (heading content)
   "Update body of heading HEADING to parsed JIRA markup from CONTENT.
-The content will be adjusted based on the heading level."
-  (ejira--set-heading-body heading (ejira--expected-org-body heading content)))
+The content will be adjusted based on the heading level.  Signals
+`ejira-parser-error' rather than storing unconverted markup."
+  (let ((ejira-parser-signal-failures t))
+    (ejira--set-heading-body heading (ejira--expected-org-body heading content))))
 
 (defun ejira--set-jira-description-jira-markup (id content)
   "Set issue ID's Jira-facing description from Jira markup CONTENT.
@@ -992,7 +1055,13 @@ The content will be adjusted based on the heading level."
 For a projected heading, update its `JIRA_DESCRIPTION' child and leave the
 ordinary local description untouched.  In body-as-description mode, rewrite
 the task's owned body region.  Otherwise retain ejira's established
-`Description' child behavior."
+`Description' child behavior.  Signals `ejira-parser-error' rather than
+storing unconverted markup."
+  (let ((ejira-parser-signal-failures t))
+    (ejira--set-jira-description-jira-markup-1 id content)))
+
+(defun ejira--set-jira-description-jira-markup-1 (id content)
+  "Implementation of `ejira--set-jira-description-jira-markup' for ID, CONTENT."
   (ejira--with-point-on id
     (cond
      ((ejira--jira-projection-p)

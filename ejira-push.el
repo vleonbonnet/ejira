@@ -149,7 +149,7 @@ must already be recorded (via `ejira--record-new-issue-key')."
     (error (display-warning 'ejira (format "transition skipped for new issue %s: %s"
                                            new-key (error-message-string err))
                             :warning)))
-  (ejira--update-task new-key)
+  (ejira--update-task-or-hold new-key)
   (when (and (stringp orig-state) (> (length orig-state) 0))
     (let* ((m (ejira--find-heading new-key))
            (cur (when m (org-with-point-at m
@@ -161,7 +161,7 @@ must already be recorded (via `ejira--record-new-issue-key')."
         (org-with-point-at m (org-todo orig-state))))))
 
 (defun ejira--finalize-new-issue-review-safe (new-key marker orig-state todo-kws
-                                                       reviewed-summary reviewed-body)
+                                                      reviewed-summary reviewed-body)
   "Like `ejira--finalize-new-issue', then restore post-review local edits.
 
 The reviewed payload is what creation sent; edits made while the
@@ -189,8 +189,18 @@ heading by NEW-KEY."
         (ejira--set-summary new-key edited-summary))
       (when (not (equal (ejira--push-normalize edited-body)
                         (ejira--push-normalize reviewed-body)))
-        (ejira--set-jira-description-jira-markup
-         new-key (ejira-parser-org-to-jira edited-body))))))
+        (condition-case nil
+            (ejira--set-jira-description-jira-markup
+             new-key (ejira-parser-org-to-jira edited-body))
+          (ejira-parser-error
+           ;; The round trip cannot be converted back; never store raw
+           ;; markup.  Hand the unsent edit to the user instead.
+           (kill-new edited-body)
+           (display-warning
+            'ejira
+            (format "%s: edits made during review could not be restored; they are on the kill ring"
+                    new-key)
+            :warning)))))))
 
 (defun ejira--push-scan-issue-children (parent-marker project-key)
   "Return (CHILDREN . BLOCKED-OPS) for the new issue heading at PARENT-MARKER.
@@ -892,7 +902,7 @@ remote field state for three-way reconciliation."
                                          (if action
                                              (progn
                                                (jiralib2-do-action key (car action))
-                                               (ejira--update-task key)
+                                               (ejira--update-task-or-hold key)
                                                (org-with-point-at marker
                                                  (org-delete-property "PendingTransition")))
                                            (error "ejira: transition '%s' not available for %s"
@@ -909,7 +919,7 @@ remote field state for three-way reconciliation."
                              :send (let ((key key) (marker marker) (new-type new-type))
                                      (lambda ()
                                        (jiralib2-set-issue-type key new-type)
-                                       (ejira--update-task key)
+                                       (ejira--update-task-or-hold key)
                                        (org-with-point-at marker
                                          (org-delete-property "PendingIssuetype"))))))))
          ((and (eq op-type 'update) (eq object 'epic))
@@ -924,7 +934,7 @@ remote field state for three-way reconciliation."
                                          (epic-field ejira-epic-field))
                                      (lambda ()
                                        (jiralib2-update-issue key `(,epic-field . ,new-epic))
-                                       (ejira--update-task key)
+                                       (ejira--update-task-or-hold key)
                                        (org-with-point-at marker
                                          (org-delete-property "PendingEpic"))))))))
          ((and (eq op-type 'create) (eq object 'subtask))

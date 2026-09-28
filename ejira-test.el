@@ -877,7 +877,7 @@ Body for Jira.
 :parent-epic set and :issue-type from `ejira-epic-child-type-name'."
   (let* ((ejira-epic-field 'customfield_10857)
          (ops (ejira-test--scan
-              "* PROJ-1 My Epic
+               "* PROJ-1 My Epic
 :PROPERTIES:
 :TYPE:     ejira-epic
 :ID:       PROJ-1
@@ -899,7 +899,7 @@ Body for Jira.
 → create-issue op with :parent-initiative set and :issue-type \"Epic\"."
   (let* ((ejira-parent-link-field 'customfield_14051)
          (ops (ejira-test--scan
-              "* PROJ-1 My Initiative
+               "* PROJ-1 My Initiative
 :PROPERTIES:
 :TYPE:     ejira-issue
 :ID:       PROJ-1
@@ -1227,6 +1227,65 @@ Org reads | -1| rows as horizontal rules and discards them."
 (ert-deftest ejira-parser/verbatim-with-edge-spaces-kept ()
   "Org emphasis cannot wrap edge whitespace; keep the JIRA form."
   (should (equal "{{ x }}" (ejira-test--parse "{{ x }}"))))
+
+(ert-deftest ejira-parser/verbatim-escaped-braces ()
+  "Escaped braces inside inline verbatim are literal content.
+The exporter writes `{{a\\}}}' for =a}=: JIRA closes a span at the
+first bare `}}', so the escape is what keeps the brace inside it."
+  (should (equal "=a}=" (ejira-test--parse "{{a\\}}}")))
+  (should (equal "={x}=" (ejira-test--parse "{{\\{x\\}}}")))
+  (should (equal "=/api/jobs/{id}= ok"
+                 (ejira-test--parse "{{/api/jobs/\\{id\\}}} ok")))
+  ;; An unescaped triple brace is JIRA's own reading: the span closes
+  ;; at the first `}}'.  The difference from the local text is what
+  ;; lets the next push upgrade the remote markup.
+  (should (equal "=a=}" (ejira-test--parse "{{a}}}"))))
+
+(ert-deftest ejira-parser/browse-links-as-id ()
+  "Issue browse links import as `id:' links when enabled.
+Regression: the rule used to run `string-match' without preserving
+match data, so the parser's `replace-match' failed and the WHOLE
+description was kept as raw JIRA markup -- `* (x)' checkbox lines
+became Org headings and `{{code}}' stayed literal."
+  (let ((jiralib2-url "https://jira.example.com")
+        (ejira-parser-browse-links-as-id t)
+        (jira (concat "See [the task|https://jira.example.com/browse/ABC-12] and "
+                      "[a page|https://example.com/p].\n\n"
+                      "* (x) open {{code}} _it_\n"
+                      "* (/) done")))
+    (should (equal (concat "See [[id:ABC-12][the task]] and "
+                           "[[https://example.com/p][a page]].\n\n"
+                           "- [ ] open =code= /it/\n"
+                           "- [X] done")
+                   (ejira-test--parse jira))))
+  (let ((jiralib2-url "https://jira.example.com")
+        (ejira-parser-browse-links-as-id nil))
+    (should (equal "[[https://jira.example.com/browse/ABC-12][t]]"
+                   (ejira-test--parse "[t|https://jira.example.com/browse/ABC-12]")))))
+
+(ert-deftest ejira-parser/replacement-cannot-clobber-match-data ()
+  "A replacement function that matches strings does not break conversion.
+The parser preserves the pattern's match data around every
+replacement function, so a careless rule cannot turn one link into a
+failed conversion of the whole text."
+  (let ((ejira-parser-patterns
+         (cons (cons "\\[\\([^]|\n]*\\)\\]"
+                     (lambda ()
+                       (let ((s (match-string 1)))
+                         (string-match "\\(.\\)" s)
+                         (upcase (match-string 1 s)))))
+               ejira-parser-patterns)))
+    (should (equal "before X after _" (ejira-test--parse "before [x] after _")))))
+
+(ert-deftest ejira-parser/failure-signals-when-requested ()
+  "A failed conversion signals instead of returning raw markup when asked.
+Writers bind `ejira-parser-signal-failures': raw JIRA markup stored as
+an Org body is corruption, not a fallback."
+  (let ((ejira-parser-patterns
+         (list (cons "boom" (lambda () (error "Rule failure"))))))
+    (should (equal "a boom" (ejira-test--parse "a boom")))
+    (let ((ejira-parser-signal-failures t))
+      (should-error (ejira-test--parse "a boom") :type 'ejira-parser-error))))
 
 (ert-deftest ejira-parser/adjacent-italics ()
   "A boundary character is not consumed by the preceding span."
@@ -2123,6 +2182,47 @@ body2\n")
                               (list :c1 (count-matches ":CommId: +111" (point-min) (point-max))
                                     :c2 (count-matches ":CommId: +222" (point-min) (point-max))))))
 
+(ert-deftest ejira-update-task/unconvertible-markup-changes-nothing ()
+  "A description or comment that cannot be converted aborts the pull
+before the heading is touched, and the or-hold wrapper logs a hold.
+Writing the raw markup instead turned `* (x) item' list lines into Org
+headings and left `{{code}}' literal in the body."
+  (dolist (where '(description comment))
+    (let ((ejira--heading-cache (make-hash-table :test #'equal))
+          (ejira-assigned-tagname nil)
+          (ejira-parser-patterns
+           (cons (cons "boom" (lambda () (error "Rule failure")))
+                 ejira-parser-patterns))
+          (task (make-ejira-task
+                 :key "TEST-1" :type "Task" :status "Done"
+                 :project "TEST"
+                 :updated (date-to-time "2026-09-02 00:00:00 +0000")
+                 :created (date-to-time "2026-09-01 00:00:00 +0000")
+                 :summary "Issue renamed"
+                 :description (if (eq where 'description) "a boom" "fine")
+                 :comments (list (make-ejira-comment
+                                  :id "111" :author "A"
+                                  :created (date-to-time "2026-09-01")
+                                  :updated (date-to-time "2026-09-02")
+                                  :body (if (eq where 'comment) "c boom" "ok")))
+                 :comments-complete t)))
+      (when (get-buffer "*ejira sync log*")
+        (with-current-buffer "*ejira sync log*" (erase-buffer)))
+      (ejira-test--with-org-buf ejira-test--comments-task-content
+                                (goto-char (point-min))
+                                (re-search-forward org-heading-regexp)
+                                (puthash "TEST" (point-marker) ejira--heading-cache)
+                                (re-search-forward org-heading-regexp)
+                                (puthash "TEST-1" (point-marker) ejira--heading-cache)
+                                (let ((before (buffer-string)))
+                                  (should-error (ejira--update-task task) :type 'ejira-parser-error)
+                                  (should (equal before (buffer-string)))
+                                  (should-not (ejira--update-task-or-hold task))
+                                  (should (equal before (buffer-string)))
+                                  (with-current-buffer "*ejira sync log*"
+                                    (should (string-match-p "TEST-1: remote markup could not be converted"
+                                                            (buffer-string)))))))))
+
 (ert-deftest ejira-update-task/preserves-comments-on-incomplete-list ()
   "A truncated embedded comment page must not delete local comments."
   (should (equal '(:c1 1 :c2 1)
@@ -2165,7 +2265,7 @@ Scanning the child independently — its new-parent ancestor has no ID
 yet — created the ticket twice: once via the parent's cascade and once
 standalone under the grandparent."
   (ejira-test--with-org-buf
-      "* PROJ
+   "* PROJ
 :PROPERTIES:
 :TYPE:     ejira-project
 :ID:       PROJ
@@ -2178,24 +2278,24 @@ Parent body.
 
 Child body.
 "
-    (let* ((ops (ejira--push-scan-buffer (current-buffer)))
-           (create-ops (cl-remove-if-not
-                        (lambda (op) (eq (plist-get op :op) 'create))
-                        ops))
-           (blocked-ops (cl-remove-if-not
-                         (lambda (op) (eq (plist-get op :op) 'blocked))
-                         ops)))
-      (should (= 1 (length create-ops)))
-      (should (= 1 (length (plist-get (plist-get (car create-ops) :data) :children))))
-      ;; the grandchild-level TODO under the captured child is reported,
-      ;; not silently dropped
-      (should (null blocked-ops)))))
+   (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+          (create-ops (cl-remove-if-not
+                       (lambda (op) (eq (plist-get op :op) 'create))
+                       ops))
+          (blocked-ops (cl-remove-if-not
+                        (lambda (op) (eq (plist-get op :op) 'blocked))
+                        ops)))
+     (should (= 1 (length create-ops)))
+     (should (= 1 (length (plist-get (plist-get (car create-ops) :data) :children))))
+     ;; the grandchild-level TODO under the captured child is reported,
+     ;; not silently dropped
+     (should (null blocked-ops)))))
 
 (ert-deftest ejira-push--rule-e/todo-below-new-child-is-blocked ()
   "A TODO deeper than a new parent's direct children is blocked, not
 flattened under the grandparent."
   (ejira-test--with-org-buf
-      "* PROJ
+   "* PROJ
 :PROPERTIES:
 :TYPE:     ejira-project
 :ID:       PROJ
@@ -2206,13 +2306,13 @@ flattened under the grandparent."
 
 **** TODO Deeper grandchild
 "
-    (let* ((ops (ejira--push-scan-buffer (current-buffer)))
-           (blocked-ops (cl-remove-if-not
-                         (lambda (op) (eq (plist-get op :op) 'blocked))
-                         ops)))
-      (should (= 1 (length blocked-ops)))
-      (should (string-match-p "cannot create below a new child"
-                              (plist-get (car blocked-ops) :reason))))))
+   (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+          (blocked-ops (cl-remove-if-not
+                        (lambda (op) (eq (plist-get op :op) 'blocked))
+                        ops)))
+     (should (= 1 (length blocked-ops)))
+     (should (string-match-p "cannot create below a new child"
+                             (plist-get (car blocked-ops) :reason))))))
 
 (ert-deftest ejira-state/priority-cookie-edit-dirties-state ()
   "A direct `[#A]' cookie edit is caught even when no hashed field moved."
@@ -2220,7 +2320,7 @@ flattened under the grandparent."
         (org-priority-lowest 5)
         (ejira--heading-cache (make-hash-table :test #'equal)))
     (ejira-test--with-org-buf
-        "* TODO [#3] TEST-1 Issue
+     "* TODO [#3] TEST-1 Issue
 :PROPERTIES:
 :ID: TEST-1
 :TYPE: ejira-issue
@@ -2228,10 +2328,10 @@ flattened under the grandparent."
 :JiraPriorityRank: 2
 :END:
 "
-      (goto-char (point-min))
-      (re-search-forward org-heading-regexp)
-      ;; stored rank 2 (=[#2]); the cookie says 3 → modified
-      (should (ejira--priority-cookie-modified-p)))))
+     (goto-char (point-min))
+     (re-search-forward org-heading-regexp)
+     ;; stored rank 2 (=[#2]); the cookie says 3 → modified
+     (should (ejira--priority-cookie-modified-p)))))
 
 (provide (quote ejira-test))
 ;;; ejira-test.el ends here

@@ -180,7 +180,7 @@ Called from async callbacks once all network responses have arrived."
                                   (ejira--alist-get i 'fields 'status 'name)
                                   (ejira--alist-get i 'fields 'assignee 'displayName)
                                   (ejira--alist-get i 'fields 'resolution 'name)))
-                             (lambda (i) (ejira--update-task (ejira--parse-item i))))))
+                             #'ejira--update-task-or-hold)))
             (mapc update-fn unresolved-items)
             (mapc update-fn resolved-items))
           (ejira--trace "after loop")
@@ -341,7 +341,7 @@ comments. With SHALLOW, only update todo status and assignee."
                                  (ejira--alist-get i 'fields 'status 'name)
                                  (ejira--alist-get i 'fields 'assignee 'displayName)
                                  (ejira--alist-get i 'fields 'resolution 'name))
-                              (ejira--update-task (ejira--parse-item i))))
+                              (ejira--update-task-or-hold i)))
                 (apply #'jiralib2-jql-search
                        (funcall ejira-update-jql-unresolved-multi-fn (list id))
                        (ejira--get-fields-to-sync shallow)))
@@ -367,7 +367,7 @@ comments. With SHALLOW, only update todo status and assignee."
                                      (ejira--alist-get i 'fields 'status 'name)
                                      (ejira--alist-get i 'fields 'assignee 'displayName)
                                      (ejira--alist-get i 'fields 'resolution 'name))
-                                  (ejira--update-task (ejira--parse-item i))))
+                                  (ejira--update-task-or-hold i)))
                     (apply #'jiralib2-jql-search
                            (funcall ejira-update-jql-resolved-fn id keys)
                            (ejira--get-fields-to-sync shallow)))))
@@ -470,14 +470,22 @@ thousands of issues, and remote-only issues have nothing to repair."
               (push key dirty))
              (t
               (let ((current (or (ejira--jira-description m) ""))
-                    (expected (or (ejira--expected-jira-description m markup) "")))
-                (if (and (equal (string-trim current) (string-trim expected))
-                         (ejira--body-shape-canonical-p current))
-                    (cl-incf unchanged)
+                    (expected (condition-case nil
+                                  (let ((ejira-parser-signal-failures t))
+                                    (or (ejira--expected-jira-description m markup) ""))
+                                (ejira-parser-error :unconvertible))))
+                (cond
+                 ;; Never re-render into raw markup: report it as dirty
+                 ;; (needs attention) instead.
+                 ((eq expected :unconvertible) (push key dirty))
+                 ((and (equal (string-trim current) (string-trim expected))
+                       (ejira--body-shape-canonical-p current))
+                  (cl-incf unchanged))
+                 (t
                   (push key repaired)
                   (when apply-p
                     (ejira--set-jira-description-jira-markup key markup)
-                    (cl-pushnew (marker-buffer m) buffers :test #'eq))))))))))
+                    (cl-pushnew (marker-buffer m) buffers :test #'eq)))))))))))
     ;; Baselines are recorded after saving: a `before-save-hook' like
     ;; `whitespace-cleanup' may still adjust the buffer during the save,
     ;; and a baseline computed before that cleanup would immediately
@@ -745,16 +753,6 @@ pushes; project headings and comments are excluded."
                              (ejira--get-fields-to-sync nil))))))
     items))
 
-(defun ejira--auto-sync-log (file lines)
-  "Append LINES for FILE to the `*ejira sync log*' buffer.
-The log buffer is never displayed automatically."
-  (when lines
-    (with-current-buffer (get-buffer-create "*ejira sync log*")
-      (goto-char (point-max))
-      (insert (format-time-string "[%Y-%m-%d %H:%M:%S] ") file "\n")
-      (dolist (l lines)
-        (insert "  " l "\n")))))
-
 (defun ejira--auto-sync-execute (file plans)
   "Execute conflict-free PLANs for FILE without confirmation.
 Comment edits/deletions and plans whose remote changed since the last
@@ -867,11 +865,13 @@ acknowledgment are held for the normal review flow."
                                 (push (format "%s: locally edited comments; pull deferred"
                                               key)
                                       conflicts))
-                       (ejira--update-task (ejira--parse-item item))
-                       ;; The heading may have been refiled; re-find it.
-                       (when-let ((m (ejira--find-heading key)))
-                         (org-with-point-at m
-                           (ejira--store-remote-baseline item))))))
+                       (if (ejira--update-task-or-hold item)
+                           ;; The heading may have been refiled; re-find it.
+                           (when-let ((m (ejira--find-heading key)))
+                             (org-with-point-at m
+                               (ejira--store-remote-baseline item)))
+                         ;; Logged by the helper; keep its pushes out too.
+                         (push key held-keys)))))
                  ;; ── push local-only changes ──
                  (let* ((ops (ejira--with-pre-scan buf
                                (ejira--push-scan-buffer buf)))

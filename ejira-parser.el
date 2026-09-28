@@ -48,6 +48,35 @@
 A failed conversion keeps the raw markup so no content is lost; this
 hook only reports the event.  Set to nil to report nothing.")
 
+(defvar ejira-parser-signal-failures nil
+  "When non-nil, a failed JIRA-to-Org conversion signals `ejira-parser-error'.
+The default keeps the raw markup, which is right for comparisons and
+previews.  Code that writes the result into an Org body binds this to
+t: raw JIRA markup stored as Org is corruption, not a fallback -- a
+list line such as `* (x) item' becomes an Org heading.")
+
+(define-error 'ejira-parser-error "JIRA markup could not be converted to Org")
+
+(defvar ejira-parser-browse-links-as-id nil
+  "When non-nil, import issue browse links as `id:' links.
+A JIRA link whose URL is `<jiralib2-url>/browse/KEY' becomes
+`[[id:KEY][label]]', so an Org file that references issues by their
+ejira heading IDs keeps doing so across a pull.  Enable it together
+with an exporter that writes `id:' issue links back as browse URLs.")
+
+(defun ejira-parser--browse-url-issue-id (url)
+  "Return `id:KEY' when URL browses issue KEY on this server, else nil.
+Only active when `ejira-parser-browse-links-as-id' is non-nil.  Match
+data is preserved: replacement functions run between the pattern
+search and its `replace-match'."
+  (when (and ejira-parser-browse-links-as-id
+             (boundp 'jiralib2-url) jiralib2-url)
+    (save-match-data
+      (when (string-match (concat "\\`" (regexp-quote jiralib2-url)
+                                  "/browse/\\([A-Z][A-Z0-9]+-[0-9]+\\)\\'")
+                          url)
+        (concat "id:" (match-string 1 url))))))
+
 (defvar ejira-parser--list-token nil
   "Random per-conversion token marking ordered-list placeholders.
 Literal text can never contain it, so the numbering pass cannot be
@@ -179,7 +208,7 @@ bodies are escaped or indented there and must keep their exact shape."
           ('begin (cl-incf block-depth))
           ('end (cl-decf block-depth)))
         (setq prev-kind kind))
-    (forward-line 1))))
+      (forward-line 1))))
 
 (defun ejira-parser--renumber-ordered-lists (token)
   "Renumber ordered-list placeholders containing TOKEN in the buffer.
@@ -324,12 +353,16 @@ new top-level construct.  Indented continuation lines do not reset."
            (format "[[%s/secure/ViewProfile.jspa?name=%s][%s]]"
                    jiralib2-url username name))))
 
-    ;; Link with description
+    ;; Link with description.  With `ejira-parser-browse-links-as-id',
+    ;; a browse URL for an issue key on this server comes back as an
+    ;; `id:' link, the form the org side uses for issue references.
     ("\\[\\([^][\n]*?\\)|\\([^][\n]*?\\)\\]"
      . (lambda ()
          (let ((label (match-string 1))
                (url (match-string 2)))
-           (format "[[%s][%s]]" url label))))
+           (format "[[%s][%s]]"
+                   (or (ejira-parser--browse-url-issue-id url) url)
+                   label))))
 
     ;; Link without description, as emitted by the exporter.
     ("\\[\\(https?://[^][\n]*?\\)\\]"
@@ -433,15 +466,27 @@ files or run local code into a JIRA field."
 (defun ejira-parser-jira-to-org (s &optional level)
   "Transform JIRA-style string S into org-style.
 If LEVEL is given, shift all
-headings to the right by that amount."
-  (condition-case nil
+headings to the right by that amount.
+
+On failure the raw markup is returned and `ejira-parser-failure-function'
+is called, unless `ejira-parser-signal-failures' is non-nil, in which
+case `ejira-parser-error' is signalled instead."
+  (condition-case err
       (let ((backslash-replacement (random-identifier 32))
             (percent-replacement (random-identifier 32))
+            (brace-open-replacement (random-identifier 32))
+            (brace-close-replacement (random-identifier 32))
             (ejira-parser--list-token (random-identifier 32)))
         (with-temp-buffer
           (let ((replacements ())
                 (jira-to-org--convert-level (or level 0)))
 
+            ;; Escaped braces (\{ \}) are literal characters in JIRA, and
+            ;; the exporter writes them inside inline verbatim so a value
+            ;; like `a}' survives JIRA's first-`}}' span scan.  Tokenize
+            ;; them first so no rule mistakes them for markup -- in
+            ;; particular the verbatim rule's `}}' closer -- and restore
+            ;; them as plain braces last.
             ;; Literal backslashes need to be handled separately, they mess up
             ;; other regexp patching. They get replaced with the identifier
             ;; first, and restored last.
@@ -449,15 +494,23 @@ headings to the right by that amount."
                      (replace-regexp-in-string
                       "\\\\" backslash-replacement
                       (replace-regexp-in-string
-                       "%" percent-replacement s))
+                       "%" percent-replacement
+                       (replace-regexp-in-string
+                        "\\\\}" brace-close-replacement
+                        (replace-regexp-in-string
+                         "\\\\{" brace-open-replacement s t t)
+                        t t)))
                      'utf-8))
             (cl-loop
              for (pattern . replacement) in ejira-parser-patterns do
              (goto-char (point-min))
              (while (re-search-forward pattern nil t)
                (let ((identifier (random-identifier 32))
-                     (rep (funcall replacement)))
-                 (replace-match identifier)
+                     ;; A replacement function may search or match
+                     ;; strings; the `replace-match' below needs this
+                     ;; pattern's match data, whatever the function did.
+                     (rep (save-match-data (funcall replacement))))
+                 (replace-match identifier t t)
 
                  ;; Prepend to the list so that the replacements will be applied in
                  ;; reverse order.
@@ -486,12 +539,18 @@ headings to the right by that amount."
           ;; restoration must not be computed and then discarded.
           (let ((restored
                  (replace-regexp-in-string
-                  percent-replacement "%"
+                  brace-open-replacement "{"
                   (replace-regexp-in-string
-                   "\\\\\\([][{}]\\)" "\\1"
+                   brace-close-replacement "}"
                    (replace-regexp-in-string
-                    backslash-replacement "\\\\"
-                    (buffer-string))))))
+                    percent-replacement "%"
+                    (replace-regexp-in-string
+                     "\\\\\\([][{}]\\)" "\\1"
+                     (replace-regexp-in-string
+                      backslash-replacement "\\\\"
+                      (buffer-string))))
+                   t t)
+                  t t)))
             (with-temp-buffer
               (insert restored)
               ;; Unwrap Jira's hard-wrapped prose only after the backslash
@@ -501,9 +560,12 @@ headings to the right by that amount."
               (ejira-parser--normalize-heading-spacing)
               (buffer-string)))))
     (error
-     (when ejira-parser-failure-function
-       (funcall ejira-parser-failure-function s))
-     s)))
+     (if ejira-parser-signal-failures
+         (signal 'ejira-parser-error (list (error-message-string err)
+                                           (substring s 0 (min 200 (length s)))))
+       (when ejira-parser-failure-function
+         (funcall ejira-parser-failure-function s))
+       s))))
 
 (provide 'ejira-parser)
 ;;; ejira-parser.el ends here
