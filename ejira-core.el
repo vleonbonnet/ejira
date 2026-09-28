@@ -661,29 +661,45 @@ something a background auto-pull should ever do."
           (progn (cl-pushnew issue-key ejira--deferred-keys :test #'equal) nil)
         (ejira--update-task issue-key))
 
-    (ejira--with-point-on issue-key
-      (unless (equal (org-entry-get (point-marker) "Status") status)
-        (org-set-property "Status" status))
-      (let ((target-assignee (or assignee "")))
-        (unless (equal (org-entry-get (point-marker) "Assignee") target-assignee)
-          (org-set-property "Assignee" target-assignee)))
-      (when ejira-assigned-tagname
-        (let ((has-tag (member ejira-assigned-tagname (org-get-tags))))
-          (if (equal assignee (ejira--my-fullname))
-              (unless has-tag (org-toggle-tag ejira-assigned-tagname 'on))
-            (when has-tag (org-toggle-tag ejira-assigned-tagname 'off))))))
-    (ejira--set-todo-state issue-key
-                           (funcall ejira-todo-state-fn status resolution))
-    ;; Refresh push baseline so sync-induced state/assignee changes are not
-    ;; mistaken for local edits on the next save.  A v2 heading acknowledges
-    ;; only the state fields this shallow pull fetched: its content baseline
-    ;; must not move, or unpushed local summary/description edits would be
-    ;; silently acknowledged although they were never sent.
-    (ejira--with-point-on issue-key
-      (if (ejira--v2-baseline-p)
-          (org-set-property ejira-state-hash-property
-                            (md5 (ejira--heading-state-fields)))
-        (ejira--update-push-baseline)))))
+    ;; A shallow pull may only acknowledge what it fetched.  A v2 heading
+    ;; with a pending local state edit, or a legacy heading with any
+    ;; pending edit (its single hash cannot tell state from content), is
+    ;; left entirely alone: applying the remote state and re-baselining
+    ;; would silently acknowledge work that was never pushed.  The full
+    ;; reconcile or the push flow resolves it.
+    (let* ((v2 (ejira--with-point-on issue-key (ejira--v2-baseline-p)))
+           (pending (ejira--with-point-on issue-key
+                      (if v2
+                          (ejira--state-modified-p)
+                        (ejira--locally-modified-p)))))
+      (if pending
+          (message "ejira: %s has unpushed local edits; shallow pull skipped" issue-key)
+        (ejira--with-point-on issue-key
+          (unless (equal (org-entry-get (point-marker) "Status") status)
+            (org-set-property "Status" status))
+          (let ((target-assignee (or assignee "")))
+            (unless (equal (org-entry-get (point-marker) "Assignee") target-assignee)
+              (org-set-property "Assignee" target-assignee)))
+          (when ejira-assigned-tagname
+            (let ((has-tag (member ejira-assigned-tagname (org-get-tags))))
+              (if (equal assignee (ejira--my-fullname))
+                  (unless has-tag (org-toggle-tag ejira-assigned-tagname 'on))
+                (when has-tag (org-toggle-tag ejira-assigned-tagname 'off))))))
+        (ejira--set-todo-state issue-key
+                               (funcall ejira-todo-state-fn status resolution))
+        ;; Refresh the baseline so sync-induced state/assignee changes are
+        ;; not mistaken for local edits.  A v2 heading acknowledges only the
+        ;; state fields this pull fetched: its content baseline must not
+        ;; move, or unpushed summary/description edits would be silently
+        ;; acknowledged.  A clean legacy heading is upgraded to v2 here: it
+        ;; had nothing pending, so its current content IS the baseline.  A
+        ;; heading with no baseline at all gets none: only a full pull,
+        ;; which compares the content, may establish one.
+        (ejira--with-point-on issue-key
+          (cond
+           (v2 (org-set-property ejira-state-hash-property
+                                 (md5 (ejira--heading-state-fields))))
+           ((org-entry-get nil "Pushhash") (ejira--migrate-push-baseline))))))))
 
 (defun ejira--auto-sync-log (file lines)
   "Append LINES for FILE to the `*ejira sync log*' buffer.

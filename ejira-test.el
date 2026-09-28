@@ -1729,9 +1729,11 @@ not acknowledge unpushed local content edits."
                                     (should (ejira--content-modified-p))
                                     (should (ejira--locally-modified-p))))))
 
-(ert-deftest ejira-v2-baseline/legacy-light-pull-acks-everything ()
-  "Legacy headings keep their historical single-hash behavior: a
-shallow pull re-baselines the whole content, edits included."
+(ert-deftest ejira-v2-baseline/legacy-light-pull-keeps-pending-edits ()
+  "A shallow pull must not acknowledge a legacy heading's pending edit.
+Regression: the legacy branch re-hashed the whole content, so any
+unpushed summary or description edit looked synced after the next
+background pull, and a later full pull overwrote it with Jira's text."
   (ejira-test--with-project-dir ejira-test--project-content
                                 (let ((buf (find-file-noselect
                                             (expand-file-name "TEST.org" ejira-org-directory) t)))
@@ -1748,7 +1750,45 @@ shallow pull re-baselines the whole content, edits included."
                                     (cl-letf (((symbol-function 'ejira--my-fullname)
                                                (lambda () "Test User")))
                                       (ejira--update-task-light "TEST-1" "Done" "someone"))
+                                    ;; Nothing applied, nothing acknowledged.
+                                    (should (ejira--locally-modified-p))
+                                    (should (equal "TODO" (org-get-todo-state)))))))
+
+(ert-deftest ejira-v2-baseline/legacy-clean-light-pull-migrates ()
+  "A clean legacy heading takes the remote state and upgrades to v2."
+  (ejira-test--with-project-dir ejira-test--project-content
+                                (let ((buf (find-file-noselect
+                                            (expand-file-name "TEST.org" ejira-org-directory) t)))
+                                  (with-current-buffer buf
+                                    (goto-char (point-min))
+                                    (re-search-forward "^\\*\\* TODO An issue")
+                                    (ejira--update-push-baseline)
+                                    (should-not (ejira--v2-baseline-p))
+                                    (cl-letf (((symbol-function 'ejira--my-fullname)
+                                               (lambda () "Test User")))
+                                      (ejira--update-task-light "TEST-1" "Done" "someone"))
+                                    (should (ejira--v2-baseline-p))
+                                    (should (equal "Done" (org-entry-get nil "Status")))
                                     (should-not (ejira--locally-modified-p))))))
+
+(ert-deftest ejira-v2-baseline/light-pull-keeps-pending-state-edit ()
+  "A pending local todo-state edit survives a shallow pull, still dirty."
+  (ejira-test--with-project-dir ejira-test--project-content
+                                (let ((buf (find-file-noselect
+                                            (expand-file-name "TEST.org" ejira-org-directory) t)))
+                                  (with-current-buffer buf
+                                    (goto-char (point-min))
+                                    (re-search-forward "^\\*\\* TODO An issue")
+                                    (ejira--migrate-push-baseline)
+                                    (let ((org-inhibit-logging t)
+                                          (org-log-done nil))
+                                      (org-todo "DONE"))
+                                    (should (ejira--state-modified-p))
+                                    (cl-letf (((symbol-function 'ejira--my-fullname)
+                                               (lambda () "Test User")))
+                                      (ejira--update-task-light "TEST-1" "Open" "someone"))
+                                    (should (equal "DONE" (org-get-todo-state)))
+                                    (should (ejira--state-modified-p))))))
 
 (ert-deftest ejira-v2-baseline/state-edits-are-detected ()
   "A local todo-state edit dirties the state baseline, not the
