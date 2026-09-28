@@ -161,6 +161,21 @@ Ejira Push — 3 changes: 1 modified, 2 new
 - =Assign new issues to me= and the per-issue =assign to me= boxes control assignment of created issues.
 - =C-c C-c= pushes the ticked items; failures are collected into one warning and the other items still go through. =C-c C-k= cancels.
 
+*** Automatic reconciliation
+Files listed in =ejira-auto-sync-files= reconcile themselves instead of opening the review buffer on save.  Start the idle worker with =ejira--start-auto-sync=.  Each cycle fetches every issue of the file and compares it with two baselines: the local one (=Pushhash=/=Statehash=, what was last pulled or pushed) and the remote one (=Remotehash=, what Jira held at that moment).
+
+- Remote-only changes are pulled; local-only changes are pushed without confirmation.
+- An issue changed on both sides, or edited locally while its remote baseline is unknown, is held.  So is an issue whose Jira markup cannot be converted to Org: ejira never stores raw Jira markup in an Org body.
+- Held issues are listed in the =*ejira sync log*= buffer and counted in the mode line (=Jira:N held=, =ejira-auto-sync-mode-line=).  Resolve one with =ejira-push-item-under-point= on its heading.
+- =ejira-auto-sync-create= set to nil keeps creations of new issues in the review buffer while updates still sync automatically.
+- =ejira-auto-sync-discover= (=unresolved= or =all=) imports Jira issues whose epic or parent is an issue of the file but which the file does not contain yet, directly under their parent.
+
+Shallow pulls (=ejira-auto-pull-shallow=) only ever acknowledge the state they fetched, and leave a heading with pending local edits untouched.
+
+=M-x ejira-sync-audit= compares each auto-sync file with Jira without changing anything: summary, description, state, priority and comments of every issue, classified as identical, local-newer, remote-newer, both-changed, unknown-baseline, unconvertible or missing-in-jira, plus Jira children missing locally and TODO headings with no Jira identity.  Use it after any bulk change and as a periodic health check.
+
+=ejira-parser-browse-links-as-id= imports =[label|<jiralib2-url>/browse/KEY]= links as =[[id:KEY][label]]=, for Org files that reference issues by their ejira heading IDs; pair it with an exporter that writes those links back as browse URLs.
+
 *** Agenda & Boards
 Ejira integrates to =org-agenda= by providing a new type for the agenda definitions: =ejira-jql=. =ejira-jql= behaves exactly alike the =tags=-type, except instead of a tag/property filter it uses a jql-query. Below is an example of an agenda view that shows the issues from board "Ejira" and groups them by their assignment status:
 
