@@ -2837,6 +2837,37 @@ the content update; the baseline then hid the gap for good."
         (ejira--update-task task))
       (should (= 1 (count-matches ":CommId: +333" (point-min) (point-max)))))))
 
+(ert-deftest ejira-update-task/discard-local-edits-takes-jira-version ()
+  "With `ejira--discard-local-edits' a dirty heading takes Jira's content
+and becomes clean; without it the local edit is kept."
+  (let ((ejira--heading-cache (make-hash-table :test #'equal))
+        (ejira-assigned-tagname nil)
+        (task (make-ejira-task
+               :key "TEST-1" :type "Task" :status "Open" :project "TEST"
+               :updated (date-to-time "2026-09-01 00:00:00 +0000")
+               :created (date-to-time "2026-08-01 00:00:00 +0000")
+               :summary "Jira title" :description "Jira body."
+               :comments-complete t)))
+    (ejira-test--with-org-buf
+     (concat "* TEST\n:PROPERTIES:\n:ID: TEST\n:TYPE: ejira-project\n:END:\n"
+             "* TODO Local title\n:PROPERTIES:\n:ID: TEST-1\n:TYPE: ejira-issue\n"
+             ":EJIRA_DESCRIPTION_IN_BODY: t\n:Modified: 2026-09-01 00:00:00\n:END:\n\nLocal body.\n")
+     (goto-char (point-min))
+     (re-search-forward org-heading-regexp)
+     (puthash "TEST" (point-marker) ejira--heading-cache)
+     (re-search-forward org-heading-regexp)
+     (puthash "TEST-1" (point-marker) ejira--heading-cache)
+     (org-set-property "Pushhash" "v2:stale")
+     (org-set-property "Statehash" (md5 (ejira--heading-state-fields)))
+     (should (ejira--locally-modified-p))
+     (ejira--update-task task)
+     (should (equal "Local title" (org-get-heading t t t t)))
+     (let ((ejira--discard-local-edits t))
+       (ejira--update-task task))
+     (should (equal "Jira title" (org-get-heading t t t t)))
+     (should (equal "Jira body." (string-trim (ejira--jira-description))))
+     (should-not (ejira--locally-modified-p)))))
+
 (ert-deftest ejira-update-task/preserves-comments-on-incomplete-list ()
   "A truncated embedded comment page must not delete local comments."
   (should (equal '(:c1 1 :c2 1)

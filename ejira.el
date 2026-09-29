@@ -228,9 +228,12 @@ Called from async callbacks once all network responses have arrived."
     (message "ejira: sync finished")))
 
 (defun ejira-pull-item-under-point ()
-  "Update the issue, project or comment under point."
+  "Replace the issue, project or comment under point with Jira's version.
+Pending local edits of an issue are discarded: this is how a held issue
+whose local copy is stale is resolved without pushing it."
   (interactive)
-  (let* ((item (ejira-get-id-under-point))
+  (let* ((ejira--discard-local-edits t)
+         (item (ejira-get-id-under-point))
          (id (nth 1 item))
          (type (nth 0 item)))
     (cond ((equal type "ejira-comment")

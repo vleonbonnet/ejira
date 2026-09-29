@@ -644,6 +644,11 @@ the baseline asserts the heading reflects Jira, so a stale shortcut --
 comments never imported, a pushed text never re-rendered -- must not
 be acknowledged as synced.")
 
+(defvar ejira--discard-local-edits nil
+  "When non-nil, `ejira--update-task' replaces pending local edits with Jira's.
+Bound by `ejira-pull-item-under-point': taking Jira's version is how a
+held issue whose local copy is stale gets resolved without pushing it.")
+
 (defvar ejira--shallow-only nil
   "When non-nil, `ejira--update-task-light' must not escalate to a full update.
 Bound by `ejira--apply-sync' for shallow (auto-pull) syncs.")
@@ -828,6 +833,7 @@ converted to Org; callers hold the issue and report it."
       (let* ((key-m (ejira--find-heading key))
              (modified-p
               (or ejira--force-full-update
+                  ejira--discard-local-edits
                   (not (equal (org-entry-get key-m "Modified")
                               (format-time-string "%Y-%m-%d %H:%M:%S"
                                                   updated "UTC")))))
@@ -837,16 +843,18 @@ converted to Org; callers hold the issue and report it."
              ;; content fields gate summary/description imports: a pending
              ;; local state edit must not block a description pull.
              (local-dirty-p
-              (org-with-point-at key-m
-                (if (ejira--v2-baseline-p)
-                    (ejira--content-modified-p)
-                  (ejira--locally-modified-p))))
+              (and (not ejira--discard-local-edits)
+                   (org-with-point-at key-m
+                     (if (ejira--v2-baseline-p)
+                         (ejira--content-modified-p)
+                       (ejira--locally-modified-p)))))
              (state-dirty-p
               ;; Pending local state edits (todo keyword, assignee, status)
               ;; on a v2 heading: the pull keeps the local values and leaves
               ;; them dirty for the push flow instead of reversing them.
-              (org-with-point-at key-m
-                (and (ejira--v2-baseline-p) (ejira--state-modified-p))))
+              (and (not ejira--discard-local-edits)
+                   (org-with-point-at key-m
+                     (and (ejira--v2-baseline-p) (ejira--state-modified-p)))))
              (stored-priority-id
               (org-entry-get key-m ejira-priority-id-property))
              (stored-priority-name
