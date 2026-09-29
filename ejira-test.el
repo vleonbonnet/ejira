@@ -2893,6 +2893,15 @@ and becomes clean; without it the local edit is kept."
      (should (equal "Jira body." (string-trim (ejira--jira-description))))
      (should-not (ejira--locally-modified-p)))))
 
+(ert-deftest ejira-set-heading-summary/takes-exact-case ()
+  "A new summary replaces the title exactly, whatever the old case.
+Regression: `replace-match' re-cased the replacement like the matched
+title, so a Title Case heading kept its capitals forever."
+  (ejira-test--with-org-buf
+   "* DONE Start The Review By Next Week\n:PROPERTIES:\n:ID: TEST-1\n:END:\n"
+   (ejira--set-heading-summary (point-marker) "Start the review by next week")
+   (should (equal "Start the review by next week" (org-get-heading t t t t)))))
+
 (ert-deftest ejira-update-task/preserves-comments-on-incomplete-list ()
   "A truncated embedded comment page must not delete local comments."
   (should (equal '(:c1 1 :c2 1)

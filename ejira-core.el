@@ -2120,11 +2120,15 @@ buffers, scratch) are left alone."
     (goto-char (point-min))
     (org-with-wide-buffer
      (org-narrow-to-subtree)
-     (when (search-forward
-            (org-get-heading t t t t))
+     ;; Exact case both ways: a case-folded match made `replace-match'
+     ;; re-case the new title like the old one, so a Title Case heading
+     ;; never took Jira's sentence-case summary.
+     (when (let ((case-fold-search nil))
+             (search-forward (org-get-heading t t t t)))
        (replace-match
         (s-replace "\\" "" (replace-regexp-in-string "\\\\\\(.\\)" "\\1"
-                                                     summary)))))))
+                                                     summary))
+        t t)))))
 
 (defun ejira--set-summary (id summary)
   "Set item ID's Jira-facing summary to SUMMARY.
