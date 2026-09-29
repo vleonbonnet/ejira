@@ -2107,12 +2107,32 @@ everything else executes.  Creation follows `ejira-auto-sync-create'."
                  (list :op 'update :object 'issue :title "plain update"
                        :send (lambda () (push 'updated sent))))))
     (let ((ejira-auto-sync-create t))
-      (ejira--auto-sync-execute "test.org" plans))
+      (should (equal 3 (length (ejira--auto-sync-execute "test.org" plans)))))
     (should (equal sent '(updated created)))
     (setq sent nil)
-    (let ((ejira-auto-sync-create nil))
-      (ejira--auto-sync-execute "test.org" plans))
+    ;; Held lines are returned, so the cycle counts creation holds too.
+    (let* ((ejira-auto-sync-create nil)
+           (held (ejira--auto-sync-execute "test.org" plans)))
+      (should (= 4 (length held)))
+      (should (cl-some (lambda (l) (string-match-p "new issue: creation held" l)) held)))
     (should (equal sent '(updated)))))
+
+(ert-deftest ejira-auto-sync/execute-holds-everything-when-file-changed ()
+  "Plans built from a buffer whose file changed on disk are not executed.
+Regression: the stale-buffer check logged a hold and executed anyway."
+  (let* ((file (make-temp-file "ejira-exec-" nil ".org"))
+         (sent nil)
+         (plans (list (list :op 'update :object 'issue :title "update"
+                            :send (lambda () (push 'updated sent))))))
+    (unwind-protect
+        (let ((buf (find-file-noselect file t)))
+          (with-temp-file file (insert "changed on disk\n"))
+          (set-file-times file (time-add (current-time) 10))
+          (let ((held (ejira--auto-sync-execute file plans)))
+            (should (null sent))
+            (should (string-match-p "file changed on disk" (car held))))
+          (kill-buffer buf))
+      (delete-file file))))
 
 (defconst ejira-test--discover-content
   "* Project\n:PROPERTIES:\n:ID:       TEST\n:TYPE:     ejira-project\n:END:\n\

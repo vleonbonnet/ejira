@@ -1084,42 +1084,44 @@ the `*ejira sync audit*' buffer and return the audit plists."
 
 (defun ejira--auto-sync-execute (file plans)
   "Execute conflict-free PLANs for FILE without confirmation.
-Comment edits/deletions and plans whose remote changed since the last
-acknowledgment are held for the normal review flow."
-  (let ((buf (get-file-buffer file)))
+Comment edits/deletions, creations while `ejira-auto-sync-create' is
+nil, and plans whose remote changed since the last acknowledgment are
+held for the review flow.  Return the held and failed lines, for the
+caller to log and count with the cycle's other held issues."
+  (let ((buf (get-file-buffer file))
+        held)
     (if (and buf (buffer-live-p buf) (not (verify-visited-file-modtime buf)))
         ;; The file changed on disk mid-cycle (another editor, git): the
         ;; plans were built from stale in-memory content.  Hold everything.
-        (ejira--auto-sync-log
-         file
-         (list "file changed on disk mid-cycle; all pushes held for review")))
-    (dolist (plan plans)
-      (let* ((op (plist-get plan :op))
-             (object (plist-get plan :object))
-             (send (plist-get plan :send))
-             (title (plist-get plan :title)))
-        (cond
-         ((plist-get plan :remote-changed)
-          (ejira--auto-sync-log
-           file (list (format "%s: changed remotely since last sync; held for review" title))))
-         ((and (eq op 'update) (eq object 'comment))
-          (ejira--auto-sync-log
-           file (list (format "%s: comment edit held for review" title))))
-         ((and (eq op 'delete) (eq object 'comment))
-          (ejira--auto-sync-log
-           file (list (format "%s: comment deletion held for review" title))))
-         ((and (eq op 'create)
-               (not (eq object 'comment))
-               (not ejira-auto-sync-create))
-          (ejira--auto-sync-log
-           file (list (format "%s: creation held (ejira-auto-sync-create is nil)" title))))
-         (send
-          (condition-case err
-              (funcall send)
-            (error (ejira--auto-sync-log
-                    file
-                    (list (format "%s: push failed: %s"
-                                  title (error-message-string err))))))))))))
+        (dolist (plan plans)
+          (push (format "%s: file changed on disk mid-cycle; held for review"
+                        (plist-get plan :title))
+                held))
+      (dolist (plan plans)
+        (let* ((op (plist-get plan :op))
+               (object (plist-get plan :object))
+               (send (plist-get plan :send))
+               (title (plist-get plan :title)))
+          (cond
+           ((plist-get plan :remote-changed)
+            (push (format "%s: changed remotely since last sync; held for review" title)
+                  held))
+           ((and (eq op 'update) (eq object 'comment))
+            (push (format "%s: comment edit held for review" title) held))
+           ((and (eq op 'delete) (eq object 'comment))
+            (push (format "%s: comment deletion held for review" title) held))
+           ((and (eq op 'create)
+                 (not (eq object 'comment))
+                 (not ejira-auto-sync-create))
+            (push (format "%s: creation held for review (ejira-auto-sync-create is nil)" title)
+                  held))
+           (send
+            (condition-case err
+                (funcall send)
+              (error (push (format "%s: push failed: %s"
+                                   title (error-message-string err))
+                           held))))))))
+    (nreverse held)))
 
 (defun ejira--auto-sync-reconcile (file)
   "Run one pull-then-push reconciliation cycle for FILE."
@@ -1239,7 +1241,9 @@ acknowledgment are held for the normal review flow."
                             (member (plist-get plan :parent-issue) held-keys))
                           plans))
                    (when plans
-                     (ejira--auto-sync-execute file plans)))
+                     (setq conflicts
+                           (append (reverse (ejira--auto-sync-execute file plans))
+                                   conflicts))))
                  (when notes
                    (ejira--auto-sync-log file (nreverse notes)))
                  (setq conflicts (nreverse conflicts))
