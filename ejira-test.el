@@ -2532,6 +2532,28 @@ subtree and all, under its Initiative in the project file."
           (kill-buffer b))
         (delete-file extra)))))
 
+(ert-deftest ejira-update-task/foreign-epic-does-not-move-issue ()
+  "An issue whose epic is in a project ejira does not sync stays put.
+Regression: the pull fetched the foreign epic, created a project file
+for its project and refiled the issue there."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let* ((ejira--heading-cache (make-hash-table :test #'equal))
+           (ejira-assigned-tagname nil)
+           (fetched nil))
+      (cl-letf (((symbol-function 'jiralib2-get-issue)
+                 (lambda (key) (push key fetched) (error "Must not fetch %s" key)))
+                ((symbol-function 'ejira--my-fullname) (lambda () "Test User")))
+        (ejira--update-task
+         (make-ejira-task :key "TEST-1" :type "Task" :status "Open"
+                          :project "TEST" :epic "OTHER-7"
+                          :updated (date-to-time "2026-09-02 00:00:00 +0000")
+                          :created (date-to-time "2026-09-01 00:00:00 +0000")
+                          :summary "An issue" :comments-complete t)))
+      (should-not fetched)
+      (should-not (file-exists-p (expand-file-name "OTHER.org" ejira-org-directory)))
+      (should (equal (expand-file-name "TEST.org" ejira-org-directory)
+                     (buffer-file-name (marker-buffer (ejira--find-heading "TEST-1"))))))))
+
 (ert-deftest ejira-refile/evicts-cached-descendant-markers ()
   "After a cross-file refile, a cached descendant marker must not be trusted.
 The refile moves the whole subtree; markers of cached descendants stay in

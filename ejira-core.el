@@ -816,11 +816,20 @@ converted to Org; callers hold the issue and report it."
       ;; Ensure that the project file is there to begin with.
       (unless (ejira--find-heading project) (ejira--update-project project))
 
-      ;; Subtasks parent needs to be updated first so we can refile
-      (when (and parent (not (ejira--find-heading parent))) (ejira--update-task parent))
+      ;; Subtasks parent needs to be updated first so we can refile.  Only
+      ;; within the synced projects: a parent or epic in another project
+      ;; would make ejira create a project file for it and move this issue
+      ;; there, out of the file that holds it (observed: an issue under an
+      ;; epic of another project left the RNDSEC project file for a new
+      ;; SPM file).
+      (when (and parent (ejira--synced-key-p parent)
+                 (not (ejira--find-heading parent)))
+        (ejira--update-task parent))
 
       ;; Epic needs to be updated first, so that we can refile
-      (when (and epic (not (ejira--find-heading epic))) (ejira--update-task epic))
+      (when (and epic (ejira--synced-key-p epic)
+                 (not (ejira--find-heading epic)))
+        (ejira--update-task epic))
 
       ;; Find or create the issue heading.  Bind the marker so the skip check
       ;; and any other callers reuse the same cache hit rather than calling
@@ -974,7 +983,9 @@ converted to Org; callers hold the issue and report it."
           ;; the user's file (observed: an epic's subtree moved into the
           ;; project file under its Initiative).  Use file-truename on both
           ;; sides to handle symlinks.
-          (let* ((target (cond (parent) (epic) (t project)))
+          (let* ((target (cond ((and parent (ejira--find-heading parent)) parent)
+                               ((and epic (ejira--find-heading epic)) epic)
+                               (t project)))
                  (heading-buf (marker-buffer (ejira--find-heading key)))
                  (heading-file (buffer-file-name heading-buf))
                  (target-m (ejira--find-heading target))
@@ -1990,6 +2001,12 @@ runs first."
             (puthash id m ejira--heading-cache))
           m))))
 
+
+(defun ejira--synced-key-p (key)
+  "Return non-nil when issue KEY belongs to one of `ejira-projects'.
+With no `ejira-projects' configured every project counts as synced."
+  (or (null ejira-projects)
+      (member (car (split-string key "-")) ejira-projects)))
 
 (defun ejira--issue-known-p (key)
   "Return non-nil when issue KEY has a local heading.
