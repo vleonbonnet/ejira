@@ -2389,6 +2389,27 @@ auto-sync by default; nothing has to be listed."
             (kill-buffer b))
           (delete-file f))))))
 
+(ert-deftest ejira-auto-sync/worker-reconciles-one-file-per-call ()
+  "Each worker call reconciles one file, so input is not held up by a
+whole round of cycles; the rest wait for the next idle call."
+  (let* ((a (make-temp-file "ejira-a-" nil ".org"))
+         (b (make-temp-file "ejira-b-" nil ".org"))
+         (ejira-auto-sync-tracked nil)
+         (ejira-auto-sync-files (list a b))
+         (ejira--auto-sync-queue nil)
+         (ejira--auto-sync-mtimes (make-hash-table :test 'equal))
+         (done nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'ejira--auto-sync-reconcile)
+                   (lambda (file &rest _) (push file done))))
+          (ejira--auto-sync-worker)
+          (should (= 1 (length done)))
+          (ejira--auto-sync-worker)
+          (should (= 2 (length done)))
+          (ejira--auto-sync-worker)
+          (should (= 2 (length done))))
+      (delete-file a) (delete-file b))))
+
 (ert-deftest ejira-auto-sync/local-todos-are-not-held ()
   "A TODO with no Jira ancestor, or under a sub-task, is a local task:
 it can never become an issue, so it is not held or counted."

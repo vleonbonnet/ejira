@@ -816,7 +816,10 @@ changed on both sides; see `ejira--auto-sync-reconcile'."
   (interactive)
   (dolist (file (ejira--auto-sync-files))
     (ejira--auto-sync-enqueue file t))
-  (ejira--auto-sync-worker))
+  ;; Asked for now: work through the whole queue.
+  (let ((guard (length ejira--auto-sync-queue)))
+    (while (and ejira--auto-sync-queue (>= (cl-decf guard) 0))
+      (ejira--auto-sync-worker))))
 
 (defvar ejira--auto-sync-mode-line-map
   (let ((map (make-sparse-keymap)))
@@ -1372,57 +1375,61 @@ not reviewable pushes and stay in the log."
              (org-fold-core-regions vis :override t))))))))
 
 (defun ejira--auto-sync-worker ()
-  "Process queued and externally changed auto-sync files."
+  "Reconcile the next queued or externally changed auto-sync file.
+One file per call: the idle timer calls again while Emacs stays idle,
+so input between files is never held up by a whole round of cycles."
   (when (and (ejira--auto-sync-files)
              (not ejira--sync-in-progress)
              (not (and (boundp 'ejira--pushing) ejira--pushing))
              (not (and (boundp 'ejira--syncing) ejira--syncing)))
-    (let* ((queued (prog1 ejira--auto-sync-queue
-                     (setq ejira--auto-sync-queue nil)))
-           (files (delete-dups (append (reverse queued)
-                                       (ejira--auto-sync-files)))))
-      (dolist (file files)
+    (let* ((queued (reverse ejira--auto-sync-queue))
+           (file (cl-find-if
+                  (lambda (f)
+                    (or (member f queued)
+                        ;; The rest run when the file changed.
+                        (let ((mtime (ignore-errors
+                                       (file-attribute-modification-time
+                                        (file-attributes f)))))
+                          (and mtime
+                               (not (equal mtime (gethash f ejira--auto-sync-mtimes)))))))
+                  (delete-dups (append queued (ejira--auto-sync-files))))))
+      (when file
+        (setq ejira--auto-sync-queue (delete file ejira--auto-sync-queue))
         (let ((mtime (ignore-errors
                        (file-attribute-modification-time
                         (file-attributes file)))))
-          ;; Explicitly queued files always run (a deferred cycle is not
-          ;; behind an mtime change); the rest run when the file changed.
-          (when (or (member file queued)
-                    (and mtime
-                         (not (equal mtime
-                                     (gethash file ejira--auto-sync-mtimes)))))
-            ;; Record the mtime only after a successful cycle: a transient
-            ;; failure leaves the recorded time stale, so the next worker
-            ;; pass retries the file instead of silently dropping it.
-            (condition-case err
-                (progn
-                  (ejira--auto-sync-reconcile
-                   file
-                   (prog1 (member file ejira--auto-sync-review-queue)
-                     (setq ejira--auto-sync-review-queue
-                           (delete file ejira--auto-sync-review-queue))))
-                  ;; The cycle's own save changed the file: record that
-                  ;; time, or the next pass would reconcile it again.
-                  (puthash file
-                           (or (ignore-errors
-                                 (file-attribute-modification-time
-                                  (file-attributes file)))
-                               mtime)
-                           ejira--auto-sync-mtimes)
-                  (remhash file ejira--auto-sync-attempts))
-              (error
-               (let ((n (1+ (gethash file ejira--auto-sync-attempts 0))))
-                 (puthash file n ejira--auto-sync-attempts)
-                 (if (>= n ejira-auto-sync-retry-limit)
-                     (progn
-                       ;; Stop retrying: pin the mtime and report once.
-                       (puthash file mtime ejira--auto-sync-mtimes)
-                       (remhash file ejira--auto-sync-attempts)
-                       (message "ejira auto-sync: giving up on %s after %d attempts: %s"
-                                file n (error-message-string err)))
-                   (message "ejira auto-sync: %s failed (attempt %d/%d): %s"
-                            file n ejira-auto-sync-retry-limit
-                            (error-message-string err))))))))))))
+          ;; Record the mtime only after a successful cycle: a transient
+          ;; failure leaves the recorded time stale, so the next worker
+          ;; pass retries the file instead of silently dropping it.
+          (condition-case err
+              (progn
+                (ejira--auto-sync-reconcile
+                 file
+                 (prog1 (member file ejira--auto-sync-review-queue)
+                   (setq ejira--auto-sync-review-queue
+                         (delete file ejira--auto-sync-review-queue))))
+                ;; The cycle's own save changed the file: record that
+                ;; time, or the next pass would reconcile it again.
+                (puthash file
+                         (or (ignore-errors
+                               (file-attribute-modification-time
+                                (file-attributes file)))
+                             mtime)
+                         ejira--auto-sync-mtimes)
+                (remhash file ejira--auto-sync-attempts))
+            (error
+             (let ((n (1+ (gethash file ejira--auto-sync-attempts 0))))
+               (puthash file n ejira--auto-sync-attempts)
+               (if (>= n ejira-auto-sync-retry-limit)
+                   (progn
+                     ;; Stop retrying: pin the mtime and report once.
+                     (puthash file mtime ejira--auto-sync-mtimes)
+                     (remhash file ejira--auto-sync-attempts)
+                     (message "ejira auto-sync: giving up on %s after %d attempts: %s"
+                              file n (error-message-string err)))
+                 (message "ejira auto-sync: %s failed (attempt %d/%d): %s"
+                          file n ejira-auto-sync-retry-limit
+                          (error-message-string err)))))))))))
 
 (defun ejira--start-auto-sync ()
   "Start the automatic reconciliation timer for the auto-sync files.
