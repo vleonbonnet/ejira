@@ -1302,7 +1302,8 @@ reconciliation queue instead."
              (not ejira--sync-in-progress)
              (derived-mode-p 'org-mode)
              (ejira--auto-sync-file-p))
-    (ejira--auto-sync-enqueue (buffer-file-name)))
+    ;; A save in Emacs is the user asking to sync: review what is held.
+    (ejira--auto-sync-enqueue (buffer-file-name) t))
   (when (and ejira-push-on-save
              (not ejira--pushing)
              (not ejira--syncing)

@@ -718,11 +718,24 @@ save or external change resets the counter."
   :type 'integer
   :group 'ejira)
 
-(defun ejira--auto-sync-enqueue (file)
-  "Schedule FILE for an automatic reconciliation cycle."
+(defvar ejira--auto-sync-review-queue nil
+  "Auto-sync files whose next cycle must open the review buffer.
+Filled by a save in Emacs and by `ejira-auto-sync-review'; a cycle
+caused by an external change (another editor, git, an agent) only
+counts its held items in the mode line.")
+
+(defvar ejira--auto-sync-review-plans nil
+  "Plans the running cycle held for review, bound by the cycle.")
+
+(defun ejira--auto-sync-enqueue (file &optional review)
+  "Schedule FILE for an automatic reconciliation cycle.
+With REVIEW, the cycle opens the review buffer for what it holds."
   (when (ejira--auto-sync-file-p file)
     (cl-pushnew (file-truename file) ejira--auto-sync-queue
-                :test #'equal)))
+                :test #'equal)
+    (when review
+      (cl-pushnew (file-truename file) ejira--auto-sync-review-queue
+                  :test #'equal))))
 
 (defun ejira--buffer-issue-keys ()
   "Return the issue keys of all ejira-managed headings in the buffer.
@@ -783,9 +796,26 @@ or with unconvertible remote markup) only appear in the
   (interactive)
   (pop-to-buffer (get-buffer-create "*ejira sync log*")))
 
+(defun ejira--auto-sync-show-review (plans)
+  "Open the review buffer for PLANS held by an auto-sync cycle.
+After the confirmed pushes run, the files are queued for a fresh
+cycle so the held count reflects what is left."
+  (when plans
+    (ejira-confirm-show plans)))
+
+(defun ejira-auto-sync-review ()
+  "Reconcile the auto-sync files now and review what they hold.
+Opens the review buffer for held creations, comment edits and issues
+changed on both sides; see `ejira--auto-sync-reconcile'."
+  (interactive)
+  (dolist (file ejira-auto-sync-files)
+    (ejira--auto-sync-enqueue (expand-file-name file) t))
+  (ejira--auto-sync-worker))
+
 (defvar ejira--auto-sync-mode-line-map
   (let ((map (make-sparse-keymap)))
-    (define-key map [mode-line mouse-1] #'ejira-auto-sync-show-log)
+    (define-key map [mode-line mouse-1] #'ejira-auto-sync-review)
+    (define-key map [mode-line mouse-3] #'ejira-auto-sync-show-log)
     map)
   "Keymap for the auto-sync mode-line indicator.")
 
@@ -796,7 +826,7 @@ or with unconvertible remote markup) only appear in the
       (when (> n 0)
         (propertize (format " Jira:%d held" n)
                     'face 'warning
-                    'help-echo "ejira auto-sync held issues; mouse-1: show *ejira sync log*"
+                    'help-echo "ejira auto-sync held issues; mouse-1: review, mouse-3: show *ejira sync log*"
                     'mouse-face 'mode-line-highlight
                     'local-map ejira--auto-sync-mode-line-map)))))
 
@@ -1108,8 +1138,9 @@ the `*ejira sync audit*' buffer and return the audit plists."
   "Execute conflict-free PLANs for FILE without confirmation.
 Comment edits/deletions, creations while `ejira-auto-sync-create' is
 nil, and plans whose remote changed since the last acknowledgment are
-held for the review flow.  Return the held and failed lines, for the
-caller to log and count with the cycle's other held issues."
+held for the review flow and collected in
+`ejira--auto-sync-review-plans'.  Return the held and failed lines, for
+the caller to log and count with the cycle's other held issues."
   (let ((buf (get-file-buffer file))
         held)
     (if (and buf (buffer-live-p buf) (not (verify-visited-file-modtime buf)))
@@ -1126,15 +1157,19 @@ caller to log and count with the cycle's other held issues."
                (title (plist-get plan :title)))
           (cond
            ((plist-get plan :remote-changed)
+            (push plan ejira--auto-sync-review-plans)
             (push (format "%s: changed remotely since last sync; held for review" title)
                   held))
            ((and (eq op 'update) (eq object 'comment))
+            (push plan ejira--auto-sync-review-plans)
             (push (format "%s: comment edit held for review" title) held))
            ((and (eq op 'delete) (eq object 'comment))
+            (push plan ejira--auto-sync-review-plans)
             (push (format "%s: comment deletion held for review" title) held))
            ((and (eq op 'create)
                  (not (eq object 'comment))
                  (not ejira-auto-sync-create))
+            (push plan ejira--auto-sync-review-plans)
             (push (format "%s: creation held for review (ejira-auto-sync-create is nil)" title)
                   held))
            (send
@@ -1145,8 +1180,13 @@ caller to log and count with the cycle's other held issues."
                            held))))))))
     (nreverse held)))
 
-(defun ejira--auto-sync-reconcile (file)
-  "Run one pull-then-push reconciliation cycle for FILE."
+(defun ejira--auto-sync-reconcile (file &optional review)
+  "Run one pull-then-push reconciliation cycle for FILE.
+With REVIEW (a save in Emacs, or `ejira-auto-sync-review'), open the
+review buffer for everything the cycle held that a push can resolve:
+creations, comment edits, and issues changed on both sides or without
+a remote baseline.  Duplicate identities and unconvertible markup are
+not reviewable pushes and stay in the log."
   (catch 'defer
     (when (not (file-exists-p file))
       (remhash file ejira--auto-sync-mtimes)
@@ -1161,8 +1201,11 @@ caller to log and count with the cycle's other held issues."
            (held-keys nil)
            ;; Conversion holds: keep the issue's pushes out of the cycle
            ;; and report it with the other held issues.
+           (unreviewable-keys nil)
+           (ejira--auto-sync-review-plans nil)
            (on-hold (lambda (key line)
                       (push key held-keys)
+                      (push key unreviewable-keys)
                       (push line conflicts))))
       (with-current-buffer buf
         ;; Revert an unmodified buffer whose file changed externally; a
@@ -1184,6 +1227,7 @@ caller to log and count with the cycle's other held issues."
                      (let ((files (gethash key locations)))
                        (when (> (length files) 1)
                          (push key held-keys)
+                         (push key unreviewable-keys)
                          (push (format "%s: %d headings carry this key (%s); held until one is removed"
                                        key (length files)
                                        (s-join ", " (mapcar #'file-name-nondirectory
@@ -1271,6 +1315,11 @@ caller to log and count with the cycle's other held issues."
                    ;; keeps its staged transitions, type changes and
                    ;; cascade creations out of the cycle too — a plan
                    ;; whose parent-issue is held runs unattended anyway.
+                   (dolist (plan plans)
+                     (let ((issue (plist-get plan :parent-issue)))
+                       (when (and (member issue held-keys)
+                                  (not (member issue unreviewable-keys)))
+                         (push plan ejira--auto-sync-review-plans))))
                    (setq plans
                          (cl-remove-if
                           (lambda (plan)
@@ -1289,6 +1338,11 @@ caller to log and count with the cycle's other held issues."
                    (ejira--auto-sync-log file conflicts))
                  (ejira--auto-sync-record-held file conflicts)
                  (ejira--save-buffer-safe)
+                 (when (and review ejira--auto-sync-review-plans)
+                   ;; Shown after the cycle's own writes; confirming runs
+                   ;; the plans, and the next cycle refreshes the count.
+                   (let ((plans (nreverse ejira--auto-sync-review-plans)))
+                     (run-at-time 0 nil #'ejira--auto-sync-show-review plans)))
                  ;; A pull can refile or create headings in other files
                  ;; (the project files); save those too, or the change
                  ;; lives only in an unsaved buffer.
@@ -1328,7 +1382,11 @@ caller to log and count with the cycle's other held issues."
             ;; pass retries the file instead of silently dropping it.
             (condition-case err
                 (progn
-                  (ejira--auto-sync-reconcile file)
+                  (ejira--auto-sync-reconcile
+                   file
+                   (prog1 (member file ejira--auto-sync-review-queue)
+                     (setq ejira--auto-sync-review-queue
+                           (delete file ejira--auto-sync-review-queue))))
                   (puthash file mtime ejira--auto-sync-mtimes)
                   (remhash file ejira--auto-sync-attempts))
               (error

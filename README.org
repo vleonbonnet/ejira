@@ -166,7 +166,8 @@ Files listed in =ejira-auto-sync-files= reconcile themselves instead of opening 
 
 - Remote-only changes are pulled; local-only changes are pushed without confirmation.
 - An issue changed on both sides, or edited locally while its remote baseline is unknown, is held.  So is an issue whose Jira markup cannot be converted to Org: ejira never stores raw Jira markup in an Org body.
-- Held issues are listed in the =*ejira sync log*= buffer and counted in the mode line (=Jira:N held=, =ejira-auto-sync-mode-line=).  Resolve one with =ejira-push-item-under-point= on its heading.
+- Held issues are listed in the =*ejira sync log*= buffer and counted in the mode line (=Jira:N held=, =ejira-auto-sync-mode-line=).
+- Saving the file in Emacs runs the cycle at once and opens the review buffer for what it held and a push can resolve: new issues (with =ejira-auto-sync-create= nil), comment edits and deletions, and issues changed on both sides or without a remote baseline.  A cycle caused by an external change (git, another editor) only updates the count; =M-x ejira-auto-sync-review=, or =mouse-1= on the indicator, reviews them (=mouse-3= shows the log).
 - =ejira-auto-sync-create= set to nil keeps creations of new issues in the review buffer while updates still sync automatically.
 - =ejira-auto-sync-discover= (=unresolved= or =all=) imports Jira issues whose epic or parent is an issue of the file but which the file does not contain yet, directly under their parent.
 

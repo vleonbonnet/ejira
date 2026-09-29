@@ -2318,6 +2318,38 @@ and refiled it into the auto-sync file as a second heading."
           (kill-buffer b))
         (delete-file extra)))))
 
+(ert-deftest ejira-auto-sync/save-opens-review-for-held-creations ()
+  "A save runs the cycle with review: held creations open the review buffer.
+An external change runs the same cycle without opening anything."
+  (ejira-test--with-project-dir
+      (concat ejira-test--discover-content "*** TODO Brand new task\n")
+    (let* ((file (file-truename (expand-file-name "TEST.org" ejira-org-directory)))
+           (buf (find-file-noselect file t))
+           (ejira-auto-sync-files (list file))
+           (ejira-auto-sync-create nil)
+           (ejira-epic-field 'customfield_10857)
+           (ejira--auto-sync-queue nil)
+           (ejira--auto-sync-review-queue nil)
+           (ejira--auto-sync-mtimes (make-hash-table :test 'equal))
+           (shown nil))
+      (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
+                ((symbol-function 'jiralib2-jql-search) (lambda (&rest _) nil))
+                ((symbol-function 'run-at-time)
+                 (lambda (_time _repeat fn &rest args) (apply fn args)))
+                ((symbol-function 'ejira-confirm-show)
+                 (lambda (plans) (setq shown (mapcar (lambda (p) (plist-get p :title)) plans)))))
+        ;; External change: no review.
+        (ejira--auto-sync-worker)
+        (should-not shown)
+        ;; A save in Emacs: review.
+        (with-current-buffer buf
+          (set-buffer-modified-p t)
+          (save-buffer))
+        (should (member file ejira--auto-sync-review-queue))
+        (ejira--auto-sync-worker)
+        (should (equal '("new task: Brand new task") shown))
+        (should-not ejira--auto-sync-review-queue)))))
+
 (ert-deftest ejira-auto-sync/reconcile-classification ()
   "One reconcile cycle: clean+remote-changed pulls, dirty+remote-changed
 holds as conflict, clean+unchanged does nothing."
