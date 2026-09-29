@@ -23,7 +23,7 @@ Individual cells are mutable `(list t)' stored on each plan's
 ;; Defined in ejira.el; loaded after this file.  Auto-sync files route
 ;; their saves to the reconciliation queue instead of the review buffer.
 (defvar ejira-auto-sync-files)
-(declare-function ejira--auto-sync-enqueue "ejira.el" (file))
+(declare-function ejira--auto-sync-enqueue "ejira" (file &optional review))
 
 (defvar ejira-state-resolution-alist
   '((5 . "Done")
@@ -528,6 +528,7 @@ remote field state for three-way reconciliation."
                          (push (list :op 'blocked
                                      :marker marker
                                      :title heading-title
+                                     :local-only t
                                      :reason "no project or task ancestor; cannot determine the project")
                                ops))
                         ;; Native hierarchy only: a subtask cannot have
@@ -1285,15 +1286,21 @@ operates on buffer text regardless of fold state."
 (defun ejira--auto-sync-file-p (&optional file)
   "Return non-nil when FILE (default: current buffer's file) auto-syncs.
 Auto-sync files are reconciled by the coordinated pull-then-push cycle
-instead of the save-time confirmation buffer."
-  (and (or file (buffer-file-name))
-       (member (file-truename (or file (buffer-file-name)))
-               (mapcar #'file-truename ejira-auto-sync-files))))
+instead of the save-time confirmation buffer; see
+`ejira-auto-sync-tracked'.  Without FILE, an Org buffer holding an
+ejira issue heading counts as tracked too."
+  (let ((name (or file (buffer-file-name))))
+    (and name
+         (or (member (file-truename name) (ejira--auto-sync-files))
+             (and (not file)
+                  ejira-auto-sync-tracked
+                  (derived-mode-p 'org-mode)
+                  (ejira--buffer-has-issue-heading-p))))))
 
 (defun ejira--push-on-save ()
   "Offer to push locally-edited ejira items after saving a managed buffer.
-Files in `ejira-auto-sync-files' are handed to the automatic
-reconciliation queue instead."
+Auto-sync files (see `ejira-auto-sync-tracked') are handed to the
+automatic reconciliation queue instead, with review."
   (when (and ejira-push-on-save
              (not ejira--pushing)
              (not ejira--syncing)

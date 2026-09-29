@@ -1862,6 +1862,38 @@ returns the existing one instead.  Callers reach here after a failed
              (puthash id (abbreviate-file-name (buffer-file-name buffer)) org-id-locations)
              (point-marker)))))))
 
+(defcustom ejira-auto-sync-tracked t
+  "When non-nil, every Org file ejira tracks reconciles automatically.
+Tracked files are the project files in `ejira-org-directory', the files
+in `ejira-extra-scan-files', those in `ejira-auto-sync-files', and on
+save any Org buffer holding an ejira issue heading.  Saving one runs
+the pull-then-push cycle and opens the review buffer for what needs
+approval; an external change runs the cycle and counts what is held.
+When nil, only `ejira-auto-sync-files' reconcile; other files keep the
+save-time push review."
+  :group 'ejira
+  :type 'boolean)
+
+(defvar ejira-auto-sync-files)
+
+(defun ejira--auto-sync-files ()
+  "Return the true names of the existing files that reconcile automatically."
+  (delete-dups
+   (mapcar #'file-truename
+           (seq-filter #'file-exists-p
+                       (mapcar #'expand-file-name
+                               (append (when ejira-auto-sync-tracked
+                                         (append (ejira--project-files)
+                                                 ejira-extra-scan-files))
+                                       ejira-auto-sync-files))))))
+
+(defun ejira--buffer-has-issue-heading-p ()
+  "Return non-nil when the current buffer holds an ejira issue heading."
+  (org-with-wide-buffer
+   (goto-char (point-min))
+   (re-search-forward
+    "^[ \t]*:TYPE:[ \t]+ejira-\\(?:issue\\|epic\\|subtask\\|story\\)[ \t]*$" nil t)))
+
 (defun ejira--project-files ()
   "Return the existing org files backing `ejira-projects'."
   (delq nil

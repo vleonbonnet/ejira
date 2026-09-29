@@ -162,14 +162,15 @@ Ejira Push — 3 changes: 1 modified, 2 new
 - =C-c C-c= pushes the ticked items; failures are collected into one warning and the other items still go through. =C-c C-k= cancels.
 
 *** Automatic reconciliation
-Files listed in =ejira-auto-sync-files= reconcile themselves instead of opening the review buffer on save.  Start the idle worker with =ejira--start-auto-sync=.  Each cycle fetches every issue of the file and compares it with two baselines: the local one (=Pushhash=/=Statehash=, what was last pulled or pushed) and the remote one (=Remotehash=, what Jira held at that moment).
+Every Org file ejira tracks reconciles itself: the project files in =ejira-org-directory=, the files in =ejira-extra-scan-files=, any other Org buffer holding an issue heading when it is saved, and extra files listed in =ejira-auto-sync-files=.  Set =ejira-auto-sync-tracked= to nil to limit this to =ejira-auto-sync-files=.  Start the idle worker with =ejira--start-auto-sync=.  Each cycle fetches every issue of the file and compares it with two baselines: the local one (=Pushhash=/=Statehash=, what was last pulled or pushed) and the remote one (=Remotehash=, what Jira held at that moment).
 
 - Remote-only changes are pulled; local-only changes are pushed without confirmation.
 - An issue changed on both sides, or edited locally while its remote baseline is unknown, is held.  So is an issue whose Jira markup cannot be converted to Org: ejira never stores raw Jira markup in an Org body.
 - Held issues are listed in the =*ejira sync log*= buffer and counted in the mode line (=Jira:N held=, =ejira-auto-sync-mode-line=).
 - Saving the file in Emacs runs the cycle at once and opens the review buffer for what it held and a push can resolve: new issues (with =ejira-auto-sync-create= nil), comment edits and deletions, and issues changed on both sides or without a remote baseline.  A cycle caused by an external change (git, another editor) only updates the count; =M-x ejira-auto-sync-review=, or =mouse-1= on the indicator, reviews them (=mouse-3= shows the log).
 - =ejira-auto-sync-create= set to nil keeps creations of new issues in the review buffer while updates still sync automatically.
-- =ejira-auto-sync-discover= (=unresolved= or =all=) imports Jira issues whose epic or parent is an issue of the file but which the file does not contain yet, directly under their parent.
+- =ejira-auto-sync-discover= (=unresolved= or =all=) imports Jira issues of =ejira-projects= whose epic or parent is an issue of the file but which the file does not contain yet, directly under their parent.
+- A TODO heading with no Jira ancestor is a local task: it is neither created nor counted as held.
 
 Shallow pulls (=ejira-auto-pull-shallow=) only ever acknowledge the state they fetched, and leave a heading with pending local edits untouched.
 

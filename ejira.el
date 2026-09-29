@@ -679,7 +679,9 @@ Added to `window-buffer-change-functions' by `ejira--start-auto-pull'."
 ;;; Automatic reconciliation (auto-sync)
 
 (defcustom ejira-auto-sync-files nil
-  "Org files that reconcile automatically when saved or changed externally.
+  "Extra Org files that reconcile automatically when saved or changed.
+With `ejira-auto-sync-tracked' (the default) every tracked file already
+reconciles; list here only files ejira would not otherwise track.
 A save of (or external change to) one of these files schedules a full
 reconciliation cycle: remote-only changes are pulled and applied,
 local-only changes are pushed without confirmation, and issues changed
@@ -729,8 +731,9 @@ counts its held items in the mode line.")
 
 (defun ejira--auto-sync-enqueue (file &optional review)
   "Schedule FILE for an automatic reconciliation cycle.
-With REVIEW, the cycle opens the review buffer for what it holds."
-  (when (ejira--auto-sync-file-p file)
+With REVIEW, the cycle opens the review buffer for what it holds.
+Callers decide that FILE auto-syncs (`ejira--auto-sync-file-p')."
+  (progn
     (cl-pushnew (file-truename file) ejira--auto-sync-queue
                 :test #'equal)
     (when review
@@ -808,8 +811,8 @@ cycle so the held count reflects what is left."
 Opens the review buffer for held creations, comment edits and issues
 changed on both sides; see `ejira--auto-sync-reconcile'."
   (interactive)
-  (dolist (file ejira-auto-sync-files)
-    (ejira--auto-sync-enqueue (expand-file-name file) t))
+  (dolist (file (ejira--auto-sync-files))
+    (ejira--auto-sync-enqueue file t))
   (ejira--auto-sync-worker))
 
 (defvar ejira--auto-sync-mode-line-map
@@ -899,6 +902,12 @@ the other issue headings); see `ejira-auto-sync-discover'."
          (lambda (item) (member (ejira--alist-get item 'key) present))
          (apply #'jiralib2-jql-search
                 (concat "(" (s-join " OR " clauses) ")"
+                        ;; Only projects ejira syncs: a child in another
+                        ;; project would make ejira create a project file
+                        ;; for it.
+                        (when ejira-projects
+                          (format " AND project in (%s)"
+                                  (s-join ", " ejira-projects)))
                         (when (eq ejira-auto-sync-discover 'unresolved)
                           " AND resolution = Unresolved"))
                 (ejira--get-fields-to-sync nil)))))))
@@ -1102,11 +1111,11 @@ Return a plist:
             :duplicates duplicates :summary summary))))
 
 (defun ejira-sync-audit (&optional file)
-  "Audit FILE (default: each of `ejira-auto-sync-files') against Jira.
+  "Audit FILE (default: each auto-sync file) against Jira.
 Read-only: nothing is pulled, pushed or baselined.  Show the report in
 the `*ejira sync audit*' buffer and return the audit plists."
   (interactive)
-  (let* ((files (if file (list file) (mapcar #'expand-file-name ejira-auto-sync-files)))
+  (let* ((files (if file (list file) (ejira--auto-sync-files)))
          (audits (mapcar (lambda (f) (cons f (ejira-sync-audit-file f))) files)))
     (when (called-interactively-p 'any)
       (with-current-buffer (get-buffer-create "*ejira sync audit*")
@@ -1307,10 +1316,13 @@ not reviewable pushes and stay in the log."
                                   ops))
                         (plans (when actions (ejira--push-build-plans actions))))
                    (dolist (b blocked)
-                     (push (format "%s: %s"
-                                   (plist-get b :title)
-                                   (plist-get b :reason))
-                           conflicts))
+                     ;; A TODO with no Jira ancestor is a local task, not
+                     ;; a sync item: tracked files mix both freely.
+                     (unless (plist-get b :local-only)
+                       (push (format "%s: %s"
+                                     (plist-get b :title)
+                                     (plist-get b :reason))
+                             conflicts)))
                    ;; Issue-wide holds: an issue classified as conflicted
                    ;; keeps its staged transitions, type changes and
                    ;; cascade creations out of the cycle too — a plan
@@ -1358,15 +1370,14 @@ not reviewable pushes and stay in the log."
 
 (defun ejira--auto-sync-worker ()
   "Process queued and externally changed auto-sync files."
-  (when (and ejira-auto-sync-files
+  (when (and (ejira--auto-sync-files)
              (not ejira--sync-in-progress)
              (not (and (boundp 'ejira--pushing) ejira--pushing))
              (not (and (boundp 'ejira--syncing) ejira--syncing)))
     (let* ((queued (prog1 ejira--auto-sync-queue
                      (setq ejira--auto-sync-queue nil)))
            (files (delete-dups (append (reverse queued)
-                                       (mapcar #'file-truename
-                                               ejira-auto-sync-files)))))
+                                       (ejira--auto-sync-files)))))
       (dolist (file files)
         (let ((mtime (ignore-errors
                        (file-attribute-modification-time
@@ -1387,7 +1398,14 @@ not reviewable pushes and stay in the log."
                    (prog1 (member file ejira--auto-sync-review-queue)
                      (setq ejira--auto-sync-review-queue
                            (delete file ejira--auto-sync-review-queue))))
-                  (puthash file mtime ejira--auto-sync-mtimes)
+                  ;; The cycle's own save changed the file: record that
+                  ;; time, or the next pass would reconcile it again.
+                  (puthash file
+                           (or (ignore-errors
+                                 (file-attribute-modification-time
+                                  (file-attributes file)))
+                               mtime)
+                           ejira--auto-sync-mtimes)
                   (remhash file ejira--auto-sync-attempts))
               (error
                (let ((n (1+ (gethash file ejira--auto-sync-attempts 0))))
@@ -1404,8 +1422,9 @@ not reviewable pushes and stay in the log."
                             (error-message-string err))))))))))))
 
 (defun ejira--start-auto-sync ()
-  "Start the automatic reconciliation timer for `ejira-auto-sync-files'."
-  (when (and ejira-auto-sync-files (not ejira--auto-sync-timer))
+  "Start the automatic reconciliation timer for the auto-sync files.
+See `ejira-auto-sync-tracked' and `ejira-auto-sync-files'."
+  (when (and (ejira--auto-sync-files) (not ejira--auto-sync-timer))
     (setq ejira--auto-sync-timer
           (run-with-idle-timer ejira-auto-sync-interval
                                ejira-auto-sync-interval
@@ -1415,7 +1434,7 @@ not reviewable pushes and stay in the log."
             (append (or global-mode-string '(""))
                     (list ejira--auto-sync-mode-line-construct))))
     (message "ejira: auto-sync enabled for %d file(s)"
-             (length ejira-auto-sync-files))))
+             (length (ejira--auto-sync-files)))))
 
 (defun ejira--stop-auto-sync ()
   "Tear down the automatic reconciliation timer."

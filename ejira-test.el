@@ -2350,6 +2350,56 @@ An external change runs the same cycle without opening anything."
         (should (equal '("new task: Brand new task") shown))
         (should-not ejira--auto-sync-review-queue)))))
 
+(ert-deftest ejira-auto-sync/every-tracked-file-auto-syncs ()
+  "Project files, extra scan files and buffers holding issue headings
+auto-sync by default; nothing has to be listed."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let* ((project (expand-file-name "TEST.org" ejira-org-directory))
+           (extra (make-temp-file "ejira-extra-" nil ".org"))
+           (other (make-temp-file "ejira-other-" nil ".org"))
+           (plain (make-temp-file "ejira-plain-" nil ".org"))
+           (ejira-extra-scan-files (list extra))
+           (ejira-auto-sync-files nil)
+           (ejira--auto-sync-queue nil)
+           (ejira--auto-sync-review-queue nil))
+      (unwind-protect
+          (progn
+            (with-temp-file other
+              (insert "* TODO Refiled\n:PROPERTIES:\n:ID:       TEST-3\n:TYPE:     ejira-issue\n:END:\n"))
+            (with-temp-file plain (insert "* TODO Just a note\n"))
+            (should (ejira--auto-sync-file-p project))
+            (should (ejira--auto-sync-file-p extra))
+            (should-not (ejira--auto-sync-file-p other))
+            (with-current-buffer (find-file-noselect other t)
+              (should (ejira--auto-sync-file-p)))
+            (with-current-buffer (find-file-noselect plain t)
+              (should-not (ejira--auto-sync-file-p)))
+            ;; Saving the project file queues a cycle with review.
+            (with-current-buffer (find-file-noselect project t)
+              (set-buffer-modified-p t)
+              (save-buffer))
+            (should (member (file-truename project) ejira--auto-sync-review-queue))
+            (let ((ejira-auto-sync-tracked nil))
+              (should-not (ejira--auto-sync-file-p project))
+              (with-current-buffer (find-file-noselect other t)
+                (should-not (ejira--auto-sync-file-p)))))
+        (dolist (f (list extra other plain))
+          (when-let ((b (get-file-buffer f)))
+            (with-current-buffer b (set-buffer-modified-p nil))
+            (kill-buffer b))
+          (delete-file f))))))
+
+(ert-deftest ejira-auto-sync/local-todos-are-not-held ()
+  "A TODO with no Jira ancestor is a local task: not held, not counted."
+  (clrhash ejira--auto-sync-held)
+  (ejira-test--with-project-dir
+      (concat "* TODO Personal task\n" ejira-test--project-content)
+    (let ((file (file-truename (expand-file-name "TEST.org" ejira-org-directory))))
+      (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
+                ((symbol-function 'jiralib2-jql-search) (lambda (&rest _) nil)))
+        (ejira--auto-sync-reconcile file))
+      (should (= 0 (ejira-auto-sync-held-count))))))
+
 (ert-deftest ejira-auto-sync/reconcile-classification ()
   "One reconcile cycle: clean+remote-changed pulls, dirty+remote-changed
 holds as conflict, clean+unchanged does nothing."

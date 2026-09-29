@@ -36,6 +36,7 @@ Defined in ejira-push.el; declared here so the executor can bind it.")
 
 (declare-function ejira--find-heading "ejira-core" (id))
 (declare-function ejira--auto-sync-enqueue "ejira" (file &optional review))
+(declare-function ejira--auto-sync-files "ejira-core" ())
 
 ;;; String helpers
 
@@ -207,9 +208,8 @@ Auto-sync files are then queued for a cycle, so baselines and the
 held-issue count reflect the pushes just made."
   (let ((ejira--pushing t))
     (org-sync-confirm-execute-items items 'ejira))
-  (when (and (boundp 'ejira-auto-sync-files) ejira-auto-sync-files)
-    (dolist (file ejira-auto-sync-files)
-      (ejira--auto-sync-enqueue (expand-file-name file)))))
+  (dolist (file (ejira--auto-sync-files))
+    (ejira--auto-sync-enqueue file)))
 
 (defun ejira-confirm-show (plans)
   "Display the review buffer for pending push PLANS."
