@@ -917,6 +917,20 @@ ways rather than by index alone."
                               (lambda (e) (= (cdr e) local-index))
                               ejira-todo-states-alist)))))))
 
+(defun ejira--audit-normalize (s)
+  "Normalize Org text S for the audit's local/remote comparison.
+Drops what the Jira export cannot carry or renders equivalently, so the
+audit reports content differences only: drawers (a LOGBOOK under a
+description subheading is never exported), blank lines (the exporter
+separates every element with one), and the brackets of a bare link
+\\=(a plain URL exports as [url] and imports as [[url]])."
+  (let ((s (ejira--push-normalize s)))
+    (setq s (replace-regexp-in-string
+             "^[ \t]*:[A-Za-z_]+:[ \t]*\n\\(?:.*\n\\)*?[ \t]*:END:[ \t]*$" "" s))
+    (setq s (replace-regexp-in-string "\\[\\[\\(https?://[^]\n]+\\)\\]\\]" "\\1" s))
+    (setq s (replace-regexp-in-string "\n\\(?:[ \t]*\n\\)+" "\n" s))
+    (string-trim s)))
+
 (defun ejira--audit-convert (markup level)
   "Convert JIRA MARKUP at LEVEL, or return `:unconvertible'."
   (condition-case nil
@@ -948,8 +962,8 @@ ways rather than by index alone."
             (cond
              ((eq expected :unconvertible)
               (push (format "comment %s unconvertible" id) diffs))
-             ((not (equal (ejira--push-normalize expected)
-                          (ejira--push-normalize
+             ((not (equal (ejira--audit-normalize expected)
+                          (ejira--audit-normalize
                            (ejira--get-heading-body (nth 1 l)))))
               (push (format "comment %s differs%s" id
                             (if (nth 2 l) " (edited locally)" ""))
@@ -1012,8 +1026,8 @@ Return a plist:
                                                     (ejira--push-normalize (ejira--jira-summary))))
                                         "summary"))
                                  (cond ((eq rdesc :unconvertible) "description unconvertible")
-                                       ((not (equal (ejira--push-normalize rdesc)
-                                                    (ejira--push-normalize
+                                       ((not (equal (ejira--audit-normalize rdesc)
+                                                    (ejira--audit-normalize
                                                      (ejira--jira-description))))
                                         "description"))
                                  (unless (ejira--audit-state-match-p

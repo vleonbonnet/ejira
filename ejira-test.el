@@ -2211,6 +2211,20 @@ an issue created in Jira under a synced epic never reached the file."
                                   (clrhash ejira--auto-sync-held)
                                   (should-not (ejira--auto-sync-mode-line)))))
 
+(ert-deftest ejira-sync-audit/normalize-ignores-export-artifacts ()
+  "Blank lines, drawers and bare-link brackets do not count as differences.
+The exporter separates elements with blank lines, drops drawers and
+brackets bare URLs, so a freshly pushed text never renders back
+character for character."
+  (should (equal (ejira--audit-normalize "Intro:\n- a\n- b\nSee https://e.x/y.")
+                 (ejira--audit-normalize
+                  "Intro:\n\n- a\n- b\n\nSee [[https://e.x/y]].")))
+  (should (equal (ejira--audit-normalize "** Part\nText.")
+                 (ejira--audit-normalize
+                  "** Part\n:LOGBOOK:\n- [2026-09-02 Wed 10:22] Refiled\n:END:\nText.")))
+  (should-not (equal (ejira--audit-normalize "Intro: a")
+                     (ejira--audit-normalize "Intro: b"))))
+
 (ert-deftest ejira-sync-audit/classifies-without-writing ()
   "The audit classifies each heading and never modifies the file."
   (ejira-test--with-project-dir
