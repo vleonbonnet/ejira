@@ -974,6 +974,27 @@ Sibling body.
        (goto-char (point-min))
        (should (= 4 (count-matches "^:ID: +TEST-2[0-9]$")))))))
 
+(ert-deftest ejira-push--record-new-issue-key/rewrites-links-intact ()
+  "Links to the created heading's old ID keep their bracket structure.
+Regression: the match included the closing bracket but the replacement
+dropped it, leaving [[id:KEY[label]] -- a broken link."
+  (ejira-test--with-org-buf
+   "* TODO New task
+:PROPERTIES:
+:ID:       0A1B2C3D-0000-0000-0000-000000000000
+:END:
+* Notes
+See [[id:0A1B2C3D-0000-0000-0000-000000000000][the task]] and [[id:0A1B2C3D-0000-0000-0000-000000000000]].
+"
+   (let ((m (point-marker)))
+     (cl-letf (((symbol-function 'ejira--project-files) (lambda () nil)))
+       (let ((ejira-extra-scan-files nil))
+         (ejira--record-new-issue-key "TEST-7" m)))
+     (should (equal "TEST-7" (org-entry-get m "ID")))
+     (should (equal "0A1B2C3D-0000-0000-0000-000000000000" (org-entry-get m "ORIG_ID")))
+     (goto-char (point-min))
+     (should (search-forward "See [[id:TEST-7][the task]] and [[id:TEST-7]]." nil t)))))
+
 (ert-deftest ejira-push--rule-e/plain-heading-under-issue-ignored ()
   "Heading without TODO under ejira-issue is NOT detected as a new subtask."
   (let ((ops (ejira-test--scan

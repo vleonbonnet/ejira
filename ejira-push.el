@@ -164,7 +164,8 @@ links keep resolving."
              (goto-char (point-min))
              (while (re-search-forward
                      (concat "\\[\\[id:" (regexp-quote orig) "\\]") nil t)
-               (replace-match (concat "[[id:" new-key) t t)))))))))
+               ;; The match includes the closing bracket; keep it.
+               (replace-match (concat "[[id:" new-key "]") t t)))))))))
 
 (defun ejira--finalize-new-issue (new-key marker orig-state todo-keywords)
   "Post-create housekeeping for a newly-created Jira issue NEW-KEY.
