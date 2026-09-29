@@ -535,9 +535,12 @@ remote field state for three-way reconciliation."
                         ;; children, so the branch is blocked rather than
                         ;; flattened or silently skipped.
                         ((equal parent-type "ejira-subtask")
+                         ;; It can never become a Jira issue: a local task,
+                         ;; reported by the review-time scan but not held.
                          (push (list :op 'blocked
                                      :marker marker
                                      :title heading-title
+                                     :local-only t
                                      :reason (format "%s is a subtask and Jira subtasks cannot have children; restructure the outline" parent-id))
                                ops))
                         ;; Under Initiative (or other epic-parent type) →

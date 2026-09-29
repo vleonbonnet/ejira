@@ -2390,10 +2390,13 @@ auto-sync by default; nothing has to be listed."
           (delete-file f))))))
 
 (ert-deftest ejira-auto-sync/local-todos-are-not-held ()
-  "A TODO with no Jira ancestor is a local task: not held, not counted."
+  "A TODO with no Jira ancestor, or under a sub-task, is a local task:
+it can never become an issue, so it is not held or counted."
   (clrhash ejira--auto-sync-held)
   (ejira-test--with-project-dir
-      (concat "* TODO Personal task\n" ejira-test--project-content)
+      (concat "* TODO Personal task\n" ejira-test--project-content
+              "*** DONE A subtask\n:PROPERTIES:\n:ID:       TEST-2\n:TYPE:     ejira-subtask\n:END:\n"
+              "**** TODO Personal checklist item\n")
     (let ((file (file-truename (expand-file-name "TEST.org" ejira-org-directory))))
       (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
                 ((symbol-function 'jiralib2-jql-search) (lambda (&rest _) nil)))
