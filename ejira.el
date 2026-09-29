@@ -984,10 +984,11 @@ Return a plist:
              `both-changed', `unconvertible' or `missing-in-jira';
   :missing   REST keys of unresolved Jira children absent from FILE;
   :local-only titles of TODO headings with no Jira identity;
+  :duplicates (KEY . FILES) for keys carried by more than one heading;
   :summary   counts per class."
   (let* ((buf (find-file-noselect file t))
          (ejira--heading-cache (make-hash-table :test 'equal))
-         rows missing local-only)
+         rows missing local-only duplicates)
     (with-current-buffer buf
       (org-with-wide-buffer
        (let* ((keys (ejira--buffer-issue-keys))
@@ -1049,6 +1050,10 @@ Return a plist:
                    (push (list key :class class :diffs diffs
                                :dirty (and dirty t) :baseline baseline)
                          rows))))))
+         (let ((locations (ejira--issue-heading-locations)))
+           (dolist (key keys)
+             (when (> (length (gethash key locations)) 1)
+               (push (cons key (gethash key locations)) duplicates))))
          (let ((ejira-auto-sync-discover 'unresolved))
            (setq missing (mapcar (lambda (i) (ejira--alist-get i 'key))
                                  (ejira--auto-sync-discover-items buf))))
@@ -1064,7 +1069,7 @@ Return a plist:
         (let ((c (plist-get (cdr r) :class)))
           (setf (alist-get c summary) (1+ (alist-get c summary 0)))))
       (list :rows rows :missing missing :local-only (nreverse local-only)
-            :summary summary))))
+            :duplicates duplicates :summary summary))))
 
 (defun ejira-sync-audit (&optional file)
   "Audit FILE (default: each of `ejira-auto-sync-files') against Jira.
@@ -1089,6 +1094,9 @@ the `*ejira sync audit*' buffer and return the audit plists."
                                   (s-join "; " (plist-get (cdr row) :diffs))))))
               (dolist (k (plist-get r :missing))
                 (insert (format "  %-12s %-16s\n" k 'missing-locally)))
+              (dolist (d (plist-get r :duplicates))
+                (insert (format "  %-12s %-16s %s\n" (car d) 'duplicate
+                                (s-join ", " (cdr d)))))
               (dolist (h (plist-get r :local-only))
                 (insert (format "  %-12s %-16s %s\n" "-" 'local-only h))))))
         (goto-char (point-min))
@@ -1170,9 +1178,23 @@ caller to log and count with the cycle's other held issues."
            (outline-show-all)
            (unwind-protect
                (progn
+                 ;; ── duplicate identities: hold, never pick one ──
+                 (let ((locations (ejira--issue-heading-locations)))
+                   (dolist (key (ejira--buffer-issue-keys))
+                     (let ((files (gethash key locations)))
+                       (when (> (length files) 1)
+                         (push key held-keys)
+                         (push (format "%s: %d headings carry this key (%s); held until one is removed"
+                                       key (length files)
+                                       (s-join ", " (mapcar #'file-name-nondirectory
+                                                            (delete-dups (copy-sequence files)))))
+                               conflicts)))))
                  ;; ── classify against the remote baselines ──
-                 (dolist (item (ejira--auto-sync-fetch
-                                (ejira--buffer-issue-keys)))
+                 (dolist (item (cl-remove-if
+                                (lambda (i) (member (ejira--alist-get i 'key) held-keys))
+                                (ejira--auto-sync-fetch
+                                 (cl-remove-if (lambda (k) (member k held-keys))
+                                               (ejira--buffer-issue-keys)))))
                    (let* ((key (ejira--alist-get item 'key))
                           (m (ejira--find-heading key))
                           (stored (and m (org-with-point-at m

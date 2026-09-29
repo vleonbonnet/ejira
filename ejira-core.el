@@ -1870,6 +1870,28 @@ returns the existing one instead.  Callers reach here after a failed
                     (and (file-exists-p f) f)))
                 ejira-projects)))
 
+(defun ejira--issue-heading-locations ()
+  "Map each issue key to the files whose headings carry it as their ID.
+Scans the project files and `ejira-extra-scan-files' once.  A key with
+more than one location is a duplicate identity: `ejira--find-heading'
+returns whichever copy it meets first, so a pull can update -- and
+refile -- the wrong one (observed: a stray copy in the project file,
+left by an interrupted creation, was pulled and refiled into the
+auto-sync file as a second heading)."
+  (let ((locations (make-hash-table :test 'equal))
+        (re "^[ \t]*:ID:[ \t]+\\([A-Z][A-Z0-9]+-[0-9]+\\)[ \t]*$"))
+    (dolist (file (seq-filter #'file-exists-p
+                              (delete-dups
+                               (mapcar #'file-truename
+                                       (append (ejira--project-files)
+                                               ejira-extra-scan-files)))))
+      (with-current-buffer (find-file-noselect file t)
+        (org-with-wide-buffer
+         (goto-char (point-min))
+         (while (re-search-forward re nil t)
+           (push file (gethash (match-string-no-properties 1) locations))))))
+    locations))
+
 (defun ejira--find-heading-by-scan (id)
   "Locate ID by scanning the ejira project files directly.
 

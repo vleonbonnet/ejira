@@ -2281,6 +2281,43 @@ character for character."
          (should (equal before (buffer-string)))
          (should-not (buffer-modified-p)))))))
 
+(ert-deftest ejira-auto-sync/duplicate-identity-is-held ()
+  "An issue key carried by two headings is held and reported, not pulled.
+Regression: a stray copy in the project file (left by an interrupted
+creation) was the one `ejira--find-heading' found; the pull updated it
+and refiled it into the auto-sync file as a second heading."
+  (when (get-buffer "*ejira sync log*")
+    (with-current-buffer "*ejira sync log*" (erase-buffer)))
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let* ((extra (make-temp-file "ejira-sync-" nil ".org"))
+           (ejira-extra-scan-files (list extra))
+           (pulled nil))
+      (unwind-protect
+          (progn
+            (with-temp-file extra
+              (insert "* TODO An issue\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n:END:\n"))
+            (cl-letf (((symbol-function 'ejira--auto-sync-fetch)
+                       (lambda (keys)
+                         (mapcar (lambda (k) (ejira-test--mock-item "An issue" "Done" nil)) keys)))
+                      ((symbol-function 'ejira--update-task)
+                       (lambda (&rest _) (setq pulled t)))
+                      ((symbol-function 'ejira--push-scan-buffer) (lambda (_buf) nil)))
+              (ejira--auto-sync-reconcile (file-truename extra)))
+            (should-not pulled)
+            (with-current-buffer "*ejira sync log*"
+              (should (string-match-p "TEST-1: 2 headings carry this key"
+                                      (buffer-string))))
+            (let ((audit (cl-letf (((symbol-function 'ejira--auto-sync-fetch)
+                                    (lambda (_keys) nil))
+                                   ((symbol-function 'jiralib2-jql-search)
+                                    (lambda (&rest _) nil)))
+                           (ejira-sync-audit-file extra))))
+              (should (assoc "TEST-1" (plist-get audit :duplicates)))))
+        (when-let ((b (get-file-buffer extra)))
+          (with-current-buffer b (set-buffer-modified-p nil))
+          (kill-buffer b))
+        (delete-file extra)))))
+
 (ert-deftest ejira-auto-sync/reconcile-classification ()
   "One reconcile cycle: clean+remote-changed pulls, dirty+remote-changed
 holds as conflict, clean+unchanged does nothing."
