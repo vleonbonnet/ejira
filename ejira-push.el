@@ -909,9 +909,13 @@ the heading's Jira priority before re-baselining."
                                           (jiralib2-update-issue
                                            key `(priority . ((id . ,local-priority-id))))))
                                       (when deadline-changed
+                                        ;; A removed deadline clears the due
+                                        ;; date: Jira takes JSON null (a nil
+                                        ;; value), and rejects "" as an
+                                        ;; unparsable date.
                                         (ejira--jira-write (format "set %s due date" key)
                                           (jiralib2-update-issue
-                                           key `(duedate . ,(or local-deadline "")))))
+                                           key `(duedate . ,local-deadline))))
                                       (when state-changed
                                         (ejira--transition-to-org-state key local-state todo-kws))
                                       (ejira--push-finalize marker reviewed-hash
