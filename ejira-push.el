@@ -70,13 +70,14 @@ Signals an error if no matching transition is available or the API call fails."
              (resolution-required (eq (cdr (assoc 'required res-field)) t))
              (resolution-name (when resolution-required
                                 (cdr (assq idx ejira-state-resolution-alist)))))
-        (if resolution-name
-            (jiralib2-session-call
-             (format "/rest/api/2/issue/%s/transitions" key)
-             :type "POST"
-             :data (json-encode `((transition . ((id . ,action-id)))
-                                  (fields . ((resolution . ((name . ,resolution-name))))))))
-          (jiralib2-do-action key action-id))))))
+        (ejira--jira-write (format "transition %s to %s" key (cdr action))
+          (if resolution-name
+              (jiralib2-session-call
+               (format "/rest/api/2/issue/%s/transitions" key)
+               :type "POST"
+               :data (json-encode `((transition . ((id . ,action-id)))
+                                    (fields . ((resolution . ((name . ,resolution-name))))))))
+            (jiralib2-do-action key action-id)))))))
 
 (defun ejira--nearest-task-ancestor ()
   "Return (TYPE ID ISSUETYPE) of the nearest task ancestor of the heading at point.
@@ -335,18 +336,19 @@ parent's assign-self cell."
                                        (format-time-string "%Y-%m-%d %H:%M:%S")))
                    (with-current-buffer (marker-buffer child-marker)
                      (ejira--save-buffer-safe))
-                   (apply #'jiralib2-create-issue
-                          project-key child-type
-                          summary
-                          (ejira-parser-org-to-jira description)
-                          (delq nil
-                                (append extra-fields
-                                        (list
-                                         (when (equal child-type
-                                                      ejira-subtask-type-name)
-                                           `(parent . ((key . ,parent-key))))
-                                         (when priority-id
-                                           `(priority . ((id . ,priority-id))))))))))
+                   (ejira--jira-write (format "create %s under %s" child-type parent-key)
+                     (apply #'jiralib2-create-issue
+                            project-key child-type
+                            summary
+                            (ejira-parser-org-to-jira description)
+                            (delq nil
+                                  (append extra-fields
+                                          (list
+                                           (when (equal child-type
+                                                        ejira-subtask-type-name)
+                                             `(parent . ((key . ,parent-key))))
+                                           (when priority-id
+                                             `(priority . ((id . ,priority-id)))))))))))
          (new-key (ejira--alist-get result 'key)))
     (ejira--record-new-issue-key new-key child-marker)
     (org-with-point-at child-marker
@@ -354,7 +356,8 @@ parent's assign-self cell."
     (when assign-self
       (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
         (when my-name
-          (jiralib2-assign-issue new-key my-name))))
+          (ejira--jira-write (format "assign %s" new-key)
+            (jiralib2-assign-issue new-key my-name)))))
     (ejira--finalize-new-issue new-key child-marker orig-state todo-keywords)))
 
 (defun ejira--push-payload (&rest parts)
@@ -867,20 +870,24 @@ remote field state for three-way reconciliation."
                                         (state-changed state-changed))
                                     (lambda ()
                                       (when (or summary-changed desc-changed)
-                                        (jiralib2-update-summary-description
-                                         key local-summary
-                                         (ejira-parser-org-to-jira local-desc-org
-                                                                   desc-level)))
+                                        (ejira--jira-write (format "update %s summary/description" key)
+                                          (jiralib2-update-summary-description
+                                           key local-summary
+                                           (ejira-parser-org-to-jira local-desc-org
+                                                                     desc-level))))
                                       (when assignee-changed
                                         (let* ((users (ejira--get-assignable-users key))
                                                (username (car (rassoc local-assignee users))))
-                                          (jiralib2-assign-issue key username)))
+                                          (ejira--jira-write (format "assign %s" key)
+                                            (jiralib2-assign-issue key username))))
                                       (when (and priority-changed local-priority-id)
-                                        (jiralib2-update-issue
-                                         key `(priority . ((id . ,local-priority-id)))))
+                                        (ejira--jira-write (format "set %s priority" key)
+                                          (jiralib2-update-issue
+                                           key `(priority . ((id . ,local-priority-id))))))
                                       (when deadline-changed
-                                        (jiralib2-update-issue
-                                         key `(duedate . ,(or local-deadline ""))))
+                                        (ejira--jira-write (format "set %s due date" key)
+                                          (jiralib2-update-issue
+                                           key `(duedate . ,(or local-deadline "")))))
                                       (when state-changed
                                         (ejira--transition-to-org-state key local-state todo-kws))
                                       (ejira--push-finalize marker reviewed-hash
@@ -931,9 +938,10 @@ remote field state for three-way reconciliation."
                                            (body local-body)
                                            (reviewed-hash reviewed-hash))
                                        (lambda ()
-                                         (jiralib2-edit-comment
-                                          issue-key commid
-                                          (ejira-parser-org-to-jira body comment-level))
+                                         (ejira--jira-write (format "edit comment %s on %s" commid issue-key)
+                                           (jiralib2-edit-comment
+                                            issue-key commid
+                                            (ejira-parser-org-to-jira body comment-level)))
                                          (ejira--push-finalize marker reviewed-hash))))))))
          ((and (eq op-type 'update) (eq object 'status))
           (let ((action-name (plist-get data :action-name)))
@@ -951,7 +959,8 @@ remote field state for three-way reconciliation."
                                                        actions)))
                                          (if action
                                              (progn
-                                               (jiralib2-do-action key (car action))
+                                               (ejira--jira-write (format "transition %s: %s" key action-name)
+                                                 (jiralib2-do-action key (car action)))
                                                (ejira--update-task-or-hold key)
                                                (org-with-point-at marker
                                                  (org-delete-property "PendingTransition")))
@@ -968,7 +977,8 @@ remote field state for three-way reconciliation."
                              :changes `(("issuetype" ,(or old-type "") ,new-type))
                              :send (let ((key key) (marker marker) (new-type new-type))
                                      (lambda ()
-                                       (jiralib2-set-issue-type key new-type)
+                                       (ejira--jira-write (format "set %s issue type" key)
+                                         (jiralib2-set-issue-type key new-type))
                                        (ejira--update-task-or-hold key)
                                        (org-with-point-at marker
                                          (org-delete-property "PendingIssuetype"))))))))
@@ -983,7 +993,8 @@ remote field state for three-way reconciliation."
                              :send (let ((key key) (marker marker) (new-epic new-epic)
                                          (epic-field ejira-epic-field))
                                      (lambda ()
-                                       (jiralib2-update-issue key `(,epic-field . ,new-epic))
+                                       (ejira--jira-write (format "set %s epic link" key)
+                                         (jiralib2-update-issue key `(,epic-field . ,new-epic)))
                                        (ejira--update-task-or-hold key)
                                        (org-with-point-at marker
                                          (org-delete-property "PendingEpic"))))))))
@@ -1056,14 +1067,15 @@ remote field state for three-way reconciliation."
                                                (or priority-id
                                                    (ejira--default-priority-id
                                                     project-key parent-key)))
-                                              (result (apply #'jiralib2-create-issue
-                                                             project-key subtask-type
-                                                             summary description
-                                                             (delq nil
-                                                                   (list
-                                                                    `(parent . ((key . ,parent-key)))
-                                                                    (when priority-id
-                                                                      `(priority . ((id . ,priority-id))))))))
+                                              (result (ejira--jira-write (format "create sub-task under %s" parent-key)
+                                                        (apply #'jiralib2-create-issue
+                                                               project-key subtask-type
+                                                               summary description
+                                                               (delq nil
+                                                                     (list
+                                                                      `(parent . ((key . ,parent-key)))
+                                                                      (when priority-id
+                                                                        `(priority . ((id . ,priority-id)))))))))
                                               (new-key (ejira--alist-get result 'key)))
                                          ;; Identity first: a failure in any
                                          ;; later step must not make the
@@ -1074,7 +1086,8 @@ remote field state for three-way reconciliation."
                                          (when (car assign-self)
                                            (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
                                              (when my-name
-                                               (jiralib2-assign-issue new-key my-name))))
+                                               (ejira--jira-write (format "assign %s" new-key)
+                                                 (jiralib2-assign-issue new-key my-name)))))
                                          (ejira--finalize-new-issue-review-safe
                                           new-key marker orig-state todo-kws
                                           reviewed-summary reviewed-body)
@@ -1165,18 +1178,19 @@ remote field state for three-way reconciliation."
                                                (or priority-id
                                                    (ejira--default-priority-id
                                                     project-key parent-issue)))
-                                              (result (apply #'jiralib2-create-issue
-                                                             project-key issue-type
-                                                             summary desc-markup
-                                                             (delq nil
-                                                                   (list epic-name-arg
-                                                                         (when (and parent-epic epic-field)
-                                                                           `(,epic-field . ,parent-epic))
-                                                                         (when (and is-epic parent-initiative
-                                                                                    ejira-parent-link-field)
-                                                                           `(,ejira-parent-link-field . ,parent-initiative))
-                                                                         (when priority-id
-                                                                           `(priority . ((id . ,priority-id))))))))
+                                              (result (ejira--jira-write (format "create %s in %s" issue-type project-key)
+                                                        (apply #'jiralib2-create-issue
+                                                               project-key issue-type
+                                                               summary desc-markup
+                                                               (delq nil
+                                                                     (list epic-name-arg
+                                                                           (when (and parent-epic epic-field)
+                                                                             `(,epic-field . ,parent-epic))
+                                                                           (when (and is-epic parent-initiative
+                                                                                      ejira-parent-link-field)
+                                                                             `(,ejira-parent-link-field . ,parent-initiative))
+                                                                           (when priority-id
+                                                                             `(priority . ((id . ,priority-id)))))))))
                                               (new-key (ejira--alist-get result 'key)))
                                          (when (and is-epic parent-initiative
                                                     (not ejira-parent-link-field))
@@ -1199,7 +1213,8 @@ remote field state for three-way reconciliation."
                                          (when (car assign-self)
                                            (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
                                              (when my-name
-                                               (jiralib2-assign-issue new-key my-name))))
+                                               (ejira--jira-write (format "assign %s" new-key)
+                                                 (jiralib2-assign-issue new-key my-name)))))
                                          (ejira--finalize-new-issue-review-safe
                                           new-key marker orig-state todo-kws
                                           summary local-body)
@@ -1231,9 +1246,10 @@ remote field state for three-way reconciliation."
                                          (body body))
                                      (lambda ()
                                        (let* ((comment (ejira--parse-comment
-                                                        (jiralib2-add-comment
-                                                         issue-key
-                                                         (ejira-parser-org-to-jira body)))))
+                                                        (ejira--jira-write (format "add comment on %s" issue-key)
+                                                          (jiralib2-add-comment
+                                                           issue-key
+                                                           (ejira-parser-org-to-jira body))))))
                                          (org-with-point-at marker
                                            (org-set-property "CommId" (ejira-comment-id comment))
                                            (org-set-property "TYPE" "ejira-comment"))
@@ -1250,7 +1266,8 @@ remote field state for three-way reconciliation."
                              :preview (or body "(empty)")
                              :send (let ((issue-key issue-key) (commid commid) (marker marker))
                                      (lambda ()
-                                       (jiralib2-delete-comment issue-key commid)
+                                       (ejira--jira-write (format "delete comment %s on %s" commid issue-key)
+                                         (jiralib2-delete-comment issue-key commid))
                                        (org-with-point-at marker
                                          (ejira--with-expand-all
                                            (org-cut-subtree))))))))))
@@ -1288,8 +1305,8 @@ operates on buffer text regardless of fold state."
 
 (defun ejira--auto-sync-file-p (&optional file)
   "Return non-nil when FILE (default: current buffer's file) auto-syncs.
-Auto-sync files are reconciled by the coordinated pull-then-push cycle
-instead of the save-time confirmation buffer; see
+Auto-sync files are reconciled by the coordinated cycle (pull, then
+review every local change) instead of a bare save-time review; see
 `ejira-auto-sync-tracked'.  Without FILE, an Org buffer holding an
 ejira issue heading counts as tracked too."
   (let ((name (or file (buffer-file-name))))

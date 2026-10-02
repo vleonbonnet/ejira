@@ -93,9 +93,13 @@ The directory is deleted after BODY completes."
 ;;; ── Push pipeline helper (bypasses interactive confirm) ─────────────────────
 
 (defun ejira-e2e--push-buffer (buf)
-  "Scan BUF, build plans, execute every :send thunk; return plan count."
+  "Scan BUF, build plans, execute every :send thunk; return plan count.
+Stands in for the confirmed review buffer, so it authorizes the
+writes the way `ejira-confirm--execute' does.  Only for this suite,
+which runs against a disposable test project."
   (let* ((ops   (ejira--push-scan-buffer buf))
-         (plans (when ops (ejira--push-build-plans ops))))
+         (plans (when ops (ejira--push-build-plans ops)))
+         (ejira--jira-write-authorized t))
     (dolist (plan plans)
       (funcall (plist-get plan :send)))
     (length plans)))

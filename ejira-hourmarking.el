@@ -1,4 +1,4 @@
-;;; ejira-hourmarking.el --- Syncing org-clock entries to JIRA.
+;;; ejira-hourmarking.el --- Syncing org-clock entries to JIRA.  -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2017 Henrik Nyman
 
@@ -36,6 +36,13 @@
 (require 's)
 (require 'jiralib2)
 (require 'ejira-core)
+(require 'ejira-confirm)
+
+(defvar ejira-hourmarking--date-filter nil
+  "Date (YYYY-MM-DD) whose clocks are collected; bound while parsing.")
+
+(defvar-local ejira-hourlog-entries nil
+  "The clock entries shown in the current `*ejira-hourlog*' buffer.")
 
 (defvar ejira-hourmarking-step 15
   "Step size for adjusting clocked entries in clock buffer.")
@@ -85,7 +92,6 @@
     (let* ((timestamp (org-element-property :value element))
            (headlines (ejira-hourmarking--find-headlines element))
            (headlines-values (mapcar (lambda (h) (org-element-property :raw-value h)) headlines))
-           (task-headline (car headlines))
            (task (car headlines-values))
            (subtask-p (unless (org-element-property :ID (car headlines)) t))
 
@@ -194,7 +200,6 @@ Limit entries to DATE-STR."
       (let ((mode 'ejira-hourlog-mode))
         (funcall mode))
 
-      (make-local-variable 'ejira-hourlog-entries)
       (setq-local ejira-hourlog-entries entries)
       (ejira-hourmarking--redraw ejira-hourlog-entries)
       (goto-char (point-min))
@@ -230,18 +235,42 @@ Limit entries to DATE-STR."
   (interactive)
   (ejira-hourlog--adjust-current-row (- ejira-hourmarking-step)))
 
+(defun ejira-hourlog--plans (entries)
+  "Return review plans adding a worklog for each of ENTRIES with time."
+  (delq nil
+        (mapcar
+         (lambda (entry)
+           (let ((key (plist-get entry :key))
+                 (start (format-time-string "%Y-%m-%dT%H:%M:%S.000%z"
+                                            (plist-get entry :start)))
+                 (duration (plist-get entry :duration-r))
+                 (comment (plist-get entry :title)))
+             (when (and key (> duration 0))
+               (list :op 'create
+                     :object 'worklog
+                     :label "worklog"
+                     :project (car (split-string key "-"))
+                     :parent-issue key
+                     :title (format "worklog on %s" key)
+                     :fields `(("title" ,comment)
+                               ("started" ,start)
+                               ("duration" ,(string-trim (ejira--format-h-m duration))))
+                     :payload (format "issue: %s\nstarted: %s\ntime spent (s): %d\ncomment: %s"
+                                      key start duration comment)
+                     :send (lambda ()
+                             (ejira--jira-write (format "add worklog on %s" key)
+                               (jiralib2-add-worklog key start duration comment)))))))
+         entries)))
+
 (defun ejira-hourlog-commit ()
-  "Confirm hourlog and push it to Tempo."
+  "Review the hourlog's worklogs; the confirmed ones are pushed to Tempo.
+Like every Jira write, worklogs go through the review buffer."
   (interactive)
-  (dolist (entry ejira-hourlog-entries)
-    (let ((key (plist-get entry :key))
-          (start (format-time-string "%Y-%m-%dT%H:%M:%S.000%z" (plist-get entry :start)))
-          (duration (plist-get entry :duration-r))
-          (comment (plist-get entry :title)))
-      (when (> duration 0)
-        (jiralib2-add-worklog key start duration comment))))
-  (ejira-hourlog-quit)
-  (message "Successfully updated worklog"))
+  (let ((plans (ejira-hourlog--plans ejira-hourlog-entries)))
+    (ejira-hourlog-quit)
+    (if plans
+        (ejira-confirm-show plans)
+      (message "ejira: no worklog with time to push"))))
 
 (defun ejira-hourlog-quit ()
   "Quit ejira-hourlog and close window."

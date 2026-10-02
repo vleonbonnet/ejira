@@ -16,6 +16,14 @@
 
 ;;; ── Helpers ──────────────────────────────────────────────────────────────────
 
+(defmacro ejira-test--as-confirmed (&rest body)
+  "Run BODY as the confirmed review buffer does: with Jira writes authorized.
+For tests that call a plan's :send directly instead of going through
+`ejira-confirm--execute'."
+  (declare (indent 0))
+  `(let ((ejira--jira-write-authorized t))
+     ,@body))
+
 (defmacro ejira-test--with-org-buf (content &rest body)
   "Evaluate BODY in a fresh org-mode temp buffer pre-filled with CONTENT."
   (declare (indent 1))
@@ -606,7 +614,7 @@ Comment body.
            (should (= 1 (length plans)))
            (should (equal "Low" (nth 2 (assoc "priority"
                                               (plist-get plan :changes)))))
-           (funcall (plist-get plan :send))
+           (ejira-test--as-confirmed (funcall (plist-get plan :send)))
            (should (equal '("TEST-1" (priority . ((id . "p3"))))
                           update-args))))))))
 
@@ -665,8 +673,9 @@ Comment body.
                                            (lambda (&rest _args) nil))
                                           ((symbol-function 'ejira--finalize-new-issue)
                                            (lambda (&rest _args) nil)))
-                                  (ejira--push-create-cascaded-child
-                                   "TEST-1" "Task" "TEST" child nil nil)
+                                  (ejira-test--as-confirmed
+                                    (ejira--push-create-cascaded-child
+                                     "TEST-1" "Task" "TEST" child nil nil))
                                   (should (equal "Cascaded body.\n" (nth 3 create-call)))
                                   (should (equal "p1"
                                                  (cdr (assoc 'id
@@ -849,7 +858,7 @@ Body for Jira.
                     (setq created-description description)
                     '((key . "PROJ-2"))))
                  ((symbol-function 'ejira--finalize-new-issue) (lambda (&rest _) nil)))
-         (funcall (plist-get plan :send)))
+         (ejira-test--as-confirmed (funcall (plist-get plan :send))))
        (should (equal "Body for Jira.\n" created-description))
        (org-with-point-at marker
          (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
@@ -904,7 +913,8 @@ heading became the default priority in Jira."
                   (lambda (&rest _) nil))
                  ((symbol-function 'ejira--update-task-or-hold)
                   (lambda (&rest _) t)))
-         (dolist (plan plans) (funcall (plist-get plan :send))))
+         (ejira-test--as-confirmed
+           (dolist (plan plans) (funcall (plist-get plan :send)))))
        (should (equal "p2" (cdr (assoc "New task" created))))
        (should (equal "p3" (cdr (assoc "New child" created))))
        (should (equal "p1" (cdr (assoc "Default task" created))))))))
@@ -963,7 +973,8 @@ Sibling body.
                  ((symbol-function 'ejira--finalize-new-issue)
                   (lambda (new-key &rest _) (ejira-test--rewrite-body-of new-key)))
                  ((symbol-function 'ejira--save-buffer-safe) #'ignore))
-         (dolist (plan plans) (funcall (plist-get plan :send))))
+         (ejira-test--as-confirmed
+           (dolist (plan plans) (funcall (plist-get plan :send)))))
        (dolist (title '("Parent task" "First child" "Second child" "Sibling task"))
          (goto-char (point-min))
          (re-search-forward (concat "^\\*+ \\(TODO\\|DONE\\) " title "$"))
@@ -2089,50 +2100,262 @@ confirmation buffer."
                                     (should-not shown)
                                     (setq ejira--auto-sync-queue nil)))))
 
-(ert-deftest ejira-auto-sync/execute-holds-conflicts-and-comment-edits ()
-  "Remote-changed plans, comment edits and comment deletions are held;
-everything else executes.  Creation follows `ejira-auto-sync-create'."
+(ert-deftest ejira-auto-sync/hold-never-sends ()
+  "An automatic cycle holds every push plan for review and sends none.
+Regression: local-only updates, comment drafts and transitions were
+pushed without confirmation; nothing may reach Jira unreviewed."
   ;; let*: the :send lambdas capture `sent', so `sent' must be bound
   ;; before the plans are built.
   (let* ((sent nil)
          (plans (list
-                 (list :op 'update :object 'issue :title "conflicted"
+                 (list :op 'update :object 'issue :title "TEST-1"
+                       :changes '(("summary" "a" "b") ("priority" "Low" "High"))
+                       :send (lambda () (push 'updated sent)))
+                 (list :op 'update :object 'issue :title "TEST-2"
                        :remote-changed t :send (lambda () (push 'conflict sent)))
-                 (list :op 'update :object 'comment :title "comment edit"
+                 (list :op 'update :object 'comment :title "TEST-1 comment 7"
+                       :changes '(("body" "x" "y"))
                        :send (lambda () (push 'comment-edit sent)))
-                 (list :op 'delete :object 'comment :title "comment delete"
+                 (list :op 'delete :object 'comment :title "delete comment on TEST-1"
                        :send (lambda () (push 'comment-del sent)))
-                 (list :op 'create :object 'issue :title "new issue"
-                       :send (lambda () (push 'created sent)))
-                 (list :op 'update :object 'issue :title "plain update"
-                       :send (lambda () (push 'updated sent))))))
-    (let ((ejira-auto-sync-create t))
-      (should (equal 3 (length (ejira--auto-sync-execute "test.org" plans)))))
-    (should (equal sent '(updated created)))
-    (setq sent nil)
-    ;; Held lines are returned, so the cycle counts creation holds too.
-    (let* ((ejira-auto-sync-create nil)
-           (held (ejira--auto-sync-execute "test.org" plans)))
-      (should (= 4 (length held)))
-      (should (cl-some (lambda (l) (string-match-p "new issue: creation held" l)) held)))
-    (should (equal sent '(updated)))))
+                 (list :op 'create :object 'comment :title "new comment on TEST-1"
+                       :send (lambda () (push 'comment-new sent)))
+                 (list :op 'create :object 'issue :title "new issue: X"
+                       :send (lambda () (push 'created sent)))))
+         (ejira--auto-sync-review-plans nil)
+         (held (ejira--auto-sync-hold "test.org" plans)))
+    (should (null sent))
+    (should (= 6 (length held)))
+    (should (equal (length plans) (length ejira--auto-sync-review-plans)))
+    (should (member "TEST-1: summary, priority awaiting review" held))
+    (should (member "TEST-2: changed remotely since last sync; held for review" held))
+    (should (member "new issue: X: creation awaiting review" held))
+    (should (member "delete comment on TEST-1: deletion awaiting review" held))))
 
-(ert-deftest ejira-auto-sync/execute-holds-everything-when-file-changed ()
-  "Plans built from a buffer whose file changed on disk are not executed.
-Regression: the stale-buffer check logged a hold and executed anyway."
+(ert-deftest ejira-auto-sync/hold-skips-review-when-file-changed ()
+  "Plans built from a buffer whose file changed on disk are neither sent
+nor offered for review: they describe stale content."
   (let* ((file (make-temp-file "ejira-exec-" nil ".org"))
          (sent nil)
+         (ejira--auto-sync-review-plans nil)
          (plans (list (list :op 'update :object 'issue :title "update"
                             :send (lambda () (push 'updated sent))))))
     (unwind-protect
         (let ((buf (find-file-noselect file t)))
           (with-temp-file file (insert "changed on disk\n"))
           (set-file-times file (time-add (current-time) 10))
-          (let ((held (ejira--auto-sync-execute file plans)))
+          (let ((held (ejira--auto-sync-hold file plans)))
             (should (null sent))
+            (should (null ejira--auto-sync-review-plans))
             (should (string-match-p "file changed on disk" (car held))))
           (kill-buffer buf))
       (delete-file file))))
+
+;;; ── Confirm-only invariant ──────────────────────────────────────────────────
+;;
+;; Nothing is ever sent to Jira without the user confirming it in the
+;; review buffer.  An agent once made the automatic cycle push updates
+;; unattended; these tests pin the invariant at three levels: the guard
+;; itself, every write call site in the sources, and a full cycle.
+
+(defconst ejira-test--source-dir
+  (file-name-directory (or load-file-name buffer-file-name))
+  "Directory holding the ejira sources under test.")
+
+(defconst ejira-test--jira-write-functions
+  '(jiralib2-create-issue jiralib2-update-issue
+                          jiralib2-update-summary-description jiralib2-assign-issue
+                          jiralib2-do-action jiralib2-set-issue-type
+                          jiralib2-add-comment jiralib2-edit-comment jiralib2-delete-comment
+                          jiralib2-add-worklog jiralib2-update-worklog jiralib2-delete-worklog)
+  "jiralib2 functions that change Jira.")
+
+(defun ejira-test--strings-in (form)
+  "Return every string found anywhere in FORM."
+  (cond ((stringp form) (list form))
+        ((consp form) (append (ejira-test--strings-in (car form))
+                              (ejira-test--strings-in (cdr form))))
+        (t nil)))
+
+(defun ejira-test--http-write-p (form)
+  "Return non-nil when FORM is an HTTP call with a writing method.
+POSTs to the search endpoint are reads."
+  (let ((method (cadr (memq :type form))))
+    (and (member method '("POST" "PUT" "DELETE"))
+         (not (cl-some (lambda (s) (string-match-p "/rest/api/2/search" s))
+                       (ejira-test--strings-in form))))))
+
+(defun ejira-test--unguarded-writes (form)
+  "Return the Jira writes in FORM not lexically inside `ejira--jira-write'."
+  (cond
+   ((and (consp form) (eq (car form) 'ejira--jira-write)) nil)
+   ((and (symbolp form) (memq form ejira-test--jira-write-functions))
+    (list form))
+   ((and (consp form)
+         (memq (car form) '(jiralib2-session-call request))
+         (ejira-test--http-write-p form))
+    (list form))
+   ((consp form)
+    (append (ejira-test--unguarded-writes (car form))
+            (ejira-test--unguarded-writes (cdr form))))
+   (t nil)))
+
+(defun ejira-test--source-forms (file)
+  "Read every top-level form of FILE."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (let (forms)
+      (condition-case nil
+          (while t (push (read (current-buffer)) forms))
+        (end-of-file nil))
+      (nreverse forms))))
+
+(ert-deftest ejira-write-guard/refuses-outside-review ()
+  "A Jira write outside the confirmed review signals before it runs."
+  (let ((ran nil))
+    (should-error (ejira--jira-write "test write" (setq ran t))
+                  :type 'ejira-unconfirmed-write)
+    (should-not ran)
+    (ejira-test--as-confirmed (ejira--jira-write "test write" (setq ran t)))
+    (should ran)))
+
+(ert-deftest ejira-write-guard/detector-sees-writes ()
+  "The source check below flags unguarded writes and accepts guarded ones."
+  (should (ejira-test--unguarded-writes '(lambda () (jiralib2-add-comment k b))))
+  (should (ejira-test--unguarded-writes '(apply #'jiralib2-create-issue args)))
+  (should (ejira-test--unguarded-writes
+           '(jiralib2-session-call "/rest/api/2/issue/X/transitions" :type "POST")))
+  (should-not (ejira-test--unguarded-writes
+               '(ejira--jira-write "x" (jiralib2-add-comment k b))))
+  (should-not (ejira-test--unguarded-writes
+               '(jiralib2-session-call "/rest/api/2/search" :type "POST")))
+  (should-not (ejira-test--unguarded-writes '(jiralib2-get-issue k))))
+
+(ert-deftest ejira-write-guard/every-jira-write-is-guarded ()
+  "Every Jira write in the ejira sources runs inside `ejira--jira-write'.
+A new write call site added without the guard fails here."
+  (let ((files (cl-remove-if
+                (lambda (f) (string-match-p "-\\(?:test\\|e2e-test\\|pkg\\)\\.el\\'" f))
+                (directory-files ejira-test--source-dir t
+                                 "\\`\\(?:helm-\\)?ejira.*\\.el\\'")))
+        violations)
+    (should (member (expand-file-name "ejira-push.el" ejira-test--source-dir) files))
+    (dolist (f files)
+      (dolist (form (ejira-test--source-forms f))
+        (dolist (w (ejira-test--unguarded-writes form))
+          (push (format "%s: %S" (file-name-nondirectory f) w) violations))))
+    (should (equal nil violations))))
+
+(ert-deftest ejira-confirm/execute-is-the-authorized-writer ()
+  "Confirmed items run with writes authorized, and each is logged.
+Authorization does not outlive the execution."
+  (when (get-buffer "*ejira sync log*")
+    (with-current-buffer "*ejira sync log*" (erase-buffer)))
+  (let* ((seen nil)
+         (items (list (list :label "ok"
+                            :data '(:title "TEST-1" :changes (("summary" "a" "b")))
+                            :execute (lambda () (push ejira--jira-write-authorized seen)))
+                      (list :label "bad" :data '(:title "TEST-2")
+                            :execute (lambda () (error "Boom")))
+                      (list :label "group node without a send"))))
+    (cl-letf (((symbol-function 'display-warning) #'ignore)
+              ((symbol-function 'ejira--auto-sync-files) (lambda () nil)))
+      (ejira-confirm--execute items))
+    (should (equal '(t) seen))
+    (should-not ejira--jira-write-authorized)
+    (with-current-buffer "*ejira sync log*"
+      (should (string-match-p "confirmed push" (buffer-string)))
+      (should (string-match-p "TEST-1 (summary): sent" (buffer-string)))
+      (should (string-match-p "TEST-2: FAILED" (buffer-string))))))
+
+(defun ejira-test--epic-item (summary)
+  "REST item for epic TEST-1 with SUMMARY, as Jira returns it."
+  `((key . "TEST-1")
+    (fields . ((summary . ,summary)
+               (description . "Epic body.")
+               (status . ((name . "Open")))
+               (issuetype . ((name . "Epic")))
+               (project . ((key . "TEST")))))))
+
+(ert-deftest ejira-auto-sync/cycle-never-writes-to-jira ()
+  "A full cycle with every kind of local change makes no Jira write.
+The edited issue, the new task and the comment draft all wait in the
+review buffer.  Regression: the cycle pushed updates unattended."
+  (ejira-test--with-project-dir
+   (concat ejira-test--discover-content
+           "*** Comments\n**** A new remark\n\nSome remark.\n"
+           "*** TODO Brand new task\n")
+   (let* ((file (file-truename (expand-file-name "TEST.org" ejira-org-directory)))
+          (buf (find-file-noselect file t))
+          (item (ejira-test--epic-item "The epic"))
+          (ejira-epic-field 'customfield_10857)
+          (ejira-todo-states-alist '(("Open" . 1)))
+          (ejira--auto-sync-queue nil)
+          (ejira--auto-sync-review-queue nil)
+          (ejira--auto-sync-held (make-hash-table :test 'equal))
+          (writes nil)
+          (attempts nil)
+          (shown nil))
+     ;; Edit the epic's title locally, on top of an acknowledged remote
+     ;; baseline: a clean push candidate.
+     (with-current-buffer buf
+       (goto-char (point-min))
+       (re-search-forward "^\\*\\* TODO The epic$")
+       (replace-match "** TODO The epic, edited")
+       (org-set-property "Remotehash" (md5 (ejira--remote-fields-identity item)))
+       (org-set-property "Pushhash" "stale")
+       (let ((ejira-push-on-save nil)) (save-buffer)))
+     (cl-letf* (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) (list item)))
+                ((symbol-function 'jiralib2-jql-search) (lambda (&rest _) (list item)))
+                ((symbol-function 'ejira--get-priority-scheme) (lambda (&rest _) nil))
+                ((symbol-function 'run-at-time)
+                 (lambda (_time _repeat fn &rest args) (apply fn args)))
+                ((symbol-function 'ejira-confirm-show)
+                 (lambda (plans) (setq shown (mapcar (lambda (p) (plist-get p :title)) plans)))))
+       (dolist (fn (cons 'jiralib2-session-call ejira-test--jira-write-functions))
+         (let ((fn fn))
+           (advice-add fn :override (lambda (&rest args) (push (cons fn args) writes))
+                       '((name . ejira-test-record-write)))))
+       ;; An attempted write counts even when the guard stops it: a
+       ;; cycle must not try to send anything at all.
+       (advice-add 'ejira--assert-jira-write-authorized :before
+                   (lambda (what) (push what attempts))
+                   '((name . ejira-test-record-attempt)))
+       (unwind-protect
+           (ejira--auto-sync-reconcile file t)
+         (advice-remove 'ejira--assert-jira-write-authorized 'ejira-test-record-attempt)
+         (dolist (fn (cons 'jiralib2-session-call ejira-test--jira-write-functions))
+           (advice-remove fn 'ejira-test-record-write))))
+     (should (equal nil attempts))
+     (should (equal nil writes))
+     (should (member "TEST-1" shown))
+     (should (member "new task: Brand new task" shown))
+     (should (member "new comment on TEST-1" shown))
+     (should (>= (ejira-auto-sync-held-count) 3)))))
+
+(ert-deftest ejira-hourlog/commit-goes-through-review ()
+  "Worklogs are offered in the review buffer, never sent directly."
+  (require 'ejira-hourmarking)
+  (let ((shown nil) (written nil))
+    (with-temp-buffer
+      (setq-local ejira-hourlog-entries
+                  (list (list :key "TEST-1" :start (current-time)
+                              :duration-r 1800 :title "Work")
+                        (list :key "TEST-2" :start (current-time)
+                              :duration-r 0 :title "Nothing logged")))
+      (cl-letf (((symbol-function 'ejira-hourlog-quit) #'ignore)
+                ((symbol-function 'ejira-confirm-show) (lambda (plans) (setq shown plans)))
+                ((symbol-function 'jiralib2-add-worklog)
+                 (lambda (&rest args) (push args written))))
+        (ejira-hourlog-commit)
+        (should (= 1 (length shown)))
+        (should-not written)
+        (should-error (funcall (plist-get (car shown) :send))
+                      :type 'ejira-unconfirmed-write)
+        (should-not written)
+        (ejira-test--as-confirmed (funcall (plist-get (car shown) :send)))
+        (should (equal "TEST-1" (car (car written))))))))
 
 (defconst ejira-test--discover-content
   "* Project\n:PROPERTIES:\n:ID:       TEST\n:TYPE:     ejira-project\n:END:\n\
@@ -2207,7 +2430,7 @@ an issue created in Jira under a synced epic never reached the file."
                                   (with-current-buffer buf
                                     (should-not (string-match-p "TEST-3\\|ejira new heading" (buffer-string))))
                                   (should (= 1 (ejira-auto-sync-held-count)))
-                                  (should (string-match-p "1 held" (ejira--auto-sync-mode-line)))
+                                  (should (string-match-p "1 to review" (ejira--auto-sync-mode-line)))
                                   (clrhash ejira--auto-sync-held)
                                   (should-not (ejira--auto-sync-mode-line)))))
 
@@ -2326,7 +2549,6 @@ An external change runs the same cycle without opening anything."
     (let* ((file (file-truename (expand-file-name "TEST.org" ejira-org-directory)))
            (buf (find-file-noselect file t))
            (ejira-auto-sync-files (list file))
-           (ejira-auto-sync-create nil)
            (ejira-epic-field 'customfield_10857)
            (ejira--auto-sync-queue nil)
            (ejira--auto-sync-review-queue nil)

@@ -34,7 +34,12 @@
   "Bound to t while ejira-push is executing a batch; inhibits re-scan on save.
 Defined in ejira-push.el; declared here so the executor can bind it.")
 
+(defvar ejira--jira-write-authorized nil
+  "Non-nil only while confirmed review items execute.
+Defined in ejira-core.el; declared here so the executor can bind it.")
+
 (declare-function ejira--find-heading "ejira-core" (id))
+(declare-function ejira--auto-sync-log "ejira-core" (header lines))
 (declare-function ejira--auto-sync-enqueue "ejira" (file &optional review))
 (declare-function ejira--auto-sync-files "ejira-core" ())
 
@@ -202,14 +207,39 @@ The issue's own update plan, when present, is the node itself."
 
 ;;; Entry point
 
+(defun ejira-confirm--log-line (item status)
+  "Return the `*ejira sync log*' line for executed ITEM with STATUS."
+  (let* ((plan (plist-get item :data))
+         (title (or (plist-get plan :title) (plist-get item :label) "?"))
+         (fields (mapcar #'car (plist-get plan :changes))))
+    (format "%s%s: %s" title
+            (if fields (format " (%s)" (string-join fields ", ")) "")
+            status)))
+
 (defun ejira-confirm--execute (items)
-  "Run the :send thunks of ITEMS with re-scan on save inhibited.
-Auto-sync files are then queued for a cycle, so baselines and the
-held-issue count reflect the pushes just made."
-  (let ((ejira--pushing t))
-    (org-sync-confirm-execute-items items 'ejira))
-  (dolist (file (ejira--auto-sync-files))
-    (ejira--auto-sync-enqueue file)))
+  "Run the :send thunks of the confirmed ITEMS with re-scan on save inhibited.
+This is the only place Jira writes are authorized: see
+`ejira--jira-write'.  Every executed item is logged in the
+`*ejira sync log*' buffer.  Auto-sync files are then queued for a
+cycle, so baselines and the review count reflect the pushes just made;
+that cycle never pushes anything itself."
+  (let* ((sendable (cl-remove-if-not (lambda (i) (plist-get i :execute)) items))
+         (failed (let ((ejira--pushing t)
+                       (ejira--jira-write-authorized t))
+                   (org-sync-confirm-execute-items items 'ejira))))
+    (ejira--auto-sync-log
+     "confirmed push"
+     (mapcar (lambda (item)
+               (ejira-confirm--log-line item (if (memq item failed) "FAILED" "sent")))
+             sendable))
+    (message "ejira: pushed %d change(s)%s"
+             (- (length sendable) (length failed))
+             (if failed (format ", %d failed" (length failed)) "")))
+  ;; ejira.el owns the auto-sync queue; a module used without it (the
+  ;; hourlog) has nothing to requeue.
+  (when (fboundp 'ejira--auto-sync-enqueue)
+    (dolist (file (ejira--auto-sync-files))
+      (ejira--auto-sync-enqueue file))))
 
 (defun ejira-confirm-show (plans)
   "Display the review buffer for pending push PLANS."

@@ -164,11 +164,10 @@ Ejira Push — 3 changes: 1 modified, 2 new
 *** Automatic reconciliation
 Every Org file ejira tracks reconciles itself: the project files in =ejira-org-directory=, the files in =ejira-extra-scan-files=, any other Org buffer holding an issue heading when it is saved, and extra files listed in =ejira-auto-sync-files=.  Set =ejira-auto-sync-tracked= to nil to limit this to =ejira-auto-sync-files=.  Start the idle worker with =ejira--start-auto-sync=.  Each cycle fetches every issue of the file and compares it with two baselines: the local one (=Pushhash=/=Statehash=, what was last pulled or pushed) and the remote one (=Remotehash=, what Jira held at that moment).
 
-- Remote-only changes are pulled; local-only changes are pushed without confirmation.
+- Remote-only changes are pulled.  Local changes are never pushed by the cycle: every one of them waits for the review buffer.  Nothing reaches Jira without confirmation; every Jira write runs inside =ejira--jira-write=, which refuses to run outside the confirmed items of the review buffer.
 - An issue changed on both sides, or edited locally while its remote baseline is unknown, is held.  So is an issue whose Jira markup cannot be converted to Org: ejira never stores raw Jira markup in an Org body.
-- Held issues are listed in the =*ejira sync log*= buffer and counted in the mode line (=Jira:N held=, =ejira-auto-sync-mode-line=).
-- Saving the file in Emacs runs the cycle at once and opens the review buffer for what it held and a push can resolve: new issues (with =ejira-auto-sync-create= nil), comment edits and deletions, and issues changed on both sides or without a remote baseline.  A cycle caused by an external change (git, another editor) only updates the count; =M-x ejira-auto-sync-review=, or =mouse-1= on the indicator, reviews them (=mouse-3= shows the log).
-- =ejira-auto-sync-create= set to nil keeps creations of new issues in the review buffer while updates still sync automatically.
+- Held items are listed in the =*ejira sync log*= buffer and counted in the mode line (=Jira:N to review=, =ejira-auto-sync-mode-line=).  Every confirmed push is logged there too.
+- Saving the file in Emacs runs the cycle at once and opens the review buffer for every local change and for issues changed on both sides or without a remote baseline.  A cycle caused by an external change (git, another editor, an agent) only updates the count; =M-x ejira-auto-sync-review=, or =mouse-1= on the indicator, reviews them (=mouse-3= shows the log).
 - =ejira-auto-sync-discover= (=unresolved= or =all=) imports Jira issues of =ejira-projects= whose epic or parent is an issue of the file but which the file does not contain yet, directly under their parent.
 - A TODO heading with no Jira ancestor is a local task: it is neither created nor counted as held.
 

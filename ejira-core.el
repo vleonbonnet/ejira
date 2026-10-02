@@ -659,6 +659,36 @@ Bound by `ejira--apply-sync' for shallow (auto-pull) syncs.")
 (defvar ejira--syncing nil
   "Non-nil during `ejira-update-project' to suppress per-op outline expand.")
 
+;;; Write authorization
+;;
+;; Invariant: nothing is ever sent to Jira without the user confirming it
+;; in the review buffer.  Every Jira write in ejira goes through
+;; `ejira--jira-write', which refuses to run unless the confirmed review
+;; items are executing (`ejira-confirm--execute' binds the flag).  Pulls,
+;; searches and metadata reads are not writes and are never gated.
+
+(defvar ejira--jira-write-authorized nil
+  "Non-nil only while confirmed review items are executing.
+Bound by `ejira-confirm--execute' around the execution of the items
+the user confirmed.  Never set it globally.")
+
+(define-error 'ejira-unconfirmed-write
+              "ejira: refusing to write to Jira without a confirmed review")
+
+(defun ejira--assert-jira-write-authorized (what)
+  "Signal `ejira-unconfirmed-write' for WHAT unless a review confirmed it."
+  (unless ejira--jira-write-authorized
+    (signal 'ejira-unconfirmed-write (list what))))
+
+(defmacro ejira--jira-write (what &rest body)
+  "Run BODY, a Jira write described by WHAT, only from a confirmed review.
+Outside the execution of confirmed review items this signals
+`ejira-unconfirmed-write' before BODY runs, so nothing reaches Jira."
+  (declare (indent 1) (debug (form body)))
+  `(progn
+     (ejira--assert-jira-write-authorized ,what)
+     ,@body))
+
 (defvar ejira--heading-cache nil
   "Hash table ID->marker, valid for the duration of one `ejira-update-project'.
 Avoids repeated linear file scans for the same heading.  Markers auto-update
@@ -742,13 +772,14 @@ something a background auto-pull should ever do."
                                  (md5 (ejira--heading-state-fields))))
            ((org-entry-get nil "Pushhash") (ejira--migrate-push-baseline))))))))
 
-(defun ejira--auto-sync-log (file lines)
-  "Append LINES for FILE to the `*ejira sync log*' buffer.
-The log buffer is never displayed automatically."
+(defun ejira--auto-sync-log (header lines)
+  "Append LINES under HEADER to the `*ejira sync log*' buffer.
+HEADER is the file a cycle reconciled, or what produced the lines
+\(\"confirmed push\").  The log buffer is never displayed automatically."
   (when lines
     (with-current-buffer (get-buffer-create "*ejira sync log*")
       (goto-char (point-max))
-      (insert (format-time-string "[%Y-%m-%d %H:%M:%S] ") file "\n")
+      (insert (format-time-string "[%Y-%m-%d %H:%M:%S] ") header "\n")
       (dolist (l lines)
         (insert "  " l "\n")))))
 
@@ -1886,8 +1917,9 @@ returns the existing one instead.  Callers reach here after a failed
 Tracked files are the project files in `ejira-org-directory', the files
 in `ejira-extra-scan-files', those in `ejira-auto-sync-files', and on
 save any Org buffer holding an ejira issue heading.  Saving one runs
-the pull-then-push cycle and opens the review buffer for what needs
-approval; an external change runs the cycle and counts what is held.
+the reconciliation cycle (pull, then hold every local change) and opens
+the review buffer for it; an external change runs the cycle and counts
+what is held.  Nothing is ever sent to Jira without confirmation.
 When nil, only `ejira-auto-sync-files' reconcile; other files keep the
 save-time push review."
   :group 'ejira

@@ -686,23 +686,23 @@ Added to `window-buffer-change-functions' by `ejira--start-auto-pull'."
 With `ejira-auto-sync-tracked' (the default) every tracked file already
 reconciles; list here only files ejira would not otherwise track.
 A save of (or external change to) one of these files schedules a full
-reconciliation cycle: remote-only changes are pulled and applied,
-local-only changes are pushed without confirmation, and issues changed
-on both sides since their last acknowledgment are held out of the cycle
-and reported in the `*ejira sync log*' buffer.  Files not listed keep
-the save-time push-review behavior.  List canonical paths only: git
-worktrees must not independently publish their own copy of a managed
-file."
+reconciliation cycle: remote-only changes are pulled and applied, and
+every local change is held for the review buffer -- nothing is ever
+sent to Jira without confirmation.  Issues changed on both sides since
+their last acknowledgment are held as conflicts and reported in the
+`*ejira sync log*' buffer.  Files not listed keep the save-time
+push-review behavior.  List canonical paths only: git worktrees must
+not independently publish their own copy of a managed file."
   :group 'ejira
   :type '(repeat file))
 
-(defcustom ejira-auto-sync-create t
-  "Whether the automatic sync creates Jira issues for new local TODOs.
-When nil, issue/subtask/epic creation plans are held for the normal
-save-time review; updates to existing issues, comment drafts and
-pending transitions still push automatically."
-  :group 'ejira
-  :type 'boolean)
+(defvar ejira-auto-sync-create nil
+  "Obsolete: the automatic sync never pushes anything by itself.
+Creations, like every other local change, wait for the review buffer.")
+(make-obsolete-variable
+ 'ejira-auto-sync-create
+ "every local change, creations included, waits for the review buffer."
+ "2026-10-02")
 
 (defcustom ejira-auto-sync-interval 3
   "Idle seconds between automatic reconciliation queue processing."
@@ -775,9 +775,10 @@ pushes; project headings and comments are excluded."
 ;;; Held-issue indicator
 
 (defcustom ejira-auto-sync-mode-line t
-  "When non-nil, show the number of held auto-sync issues in the mode line.
-Held issues (changed on both sides, without a remote baseline, blocked,
-or with unconvertible remote markup) only appear in the
+  "When non-nil, show the number of held auto-sync items in the mode line.
+Held items are local changes awaiting review, and issues that cannot
+sync (changed on both sides, without a remote baseline, blocked, or
+with unconvertible remote markup).  They only appear in the
 `*ejira sync log*' buffer otherwise, which is easy never to look at."
   :group 'ejira
   :type 'boolean)
@@ -811,8 +812,8 @@ cycle so the held count reflects what is left."
 
 (defun ejira-auto-sync-review ()
   "Reconcile the auto-sync files now and review what they hold.
-Opens the review buffer for held creations, comment edits and issues
-changed on both sides; see `ejira--auto-sync-reconcile'."
+Opens the review buffer for every local change awaiting confirmation
+and for issues changed on both sides; see `ejira--auto-sync-reconcile'."
   (interactive)
   (dolist (file (ejira--auto-sync-files))
     (ejira--auto-sync-enqueue file t))
@@ -833,9 +834,9 @@ changed on both sides; see `ejira--auto-sync-reconcile'."
   (when ejira-auto-sync-mode-line
     (let ((n (ejira-auto-sync-held-count)))
       (when (> n 0)
-        (propertize (format " Jira:%d held" n)
+        (propertize (format " Jira:%d to review" n)
                     'face 'warning
-                    'help-echo "ejira auto-sync held issues; mouse-1: review, mouse-3: show *ejira sync log*"
+                    'help-echo "ejira changes awaiting review; mouse-1: review, mouse-3: show *ejira sync log*"
                     'mouse-face 'mode-line-highlight
                     'local-map ejira--auto-sync-mode-line-map)))))
 
@@ -1149,59 +1150,54 @@ the `*ejira sync audit*' buffer and return the audit plists."
       (pop-to-buffer "*ejira sync audit*"))
     audits))
 
-(defun ejira--auto-sync-execute (file plans)
-  "Execute conflict-free PLANs for FILE without confirmation.
-Comment edits/deletions, creations while `ejira-auto-sync-create' is
-nil, and plans whose remote changed since the last acknowledgment are
-held for the review flow and collected in
-`ejira--auto-sync-review-plans'.  Return the held and failed lines, for
-the caller to log and count with the cycle's other held issues."
+(defun ejira--auto-sync-hold-line (plan)
+  "Return the held-item line describing push PLAN."
+  (let ((title (plist-get plan :title))
+        (fields (mapcar #'car (plist-get plan :changes))))
+    (cond
+     ((plist-get plan :remote-changed)
+      (format "%s: changed remotely since last sync; held for review" title))
+     ((eq (plist-get plan :op) 'create)
+      (format "%s: creation awaiting review" title))
+     ((eq (plist-get plan :op) 'delete)
+      (format "%s: deletion awaiting review" title))
+     (fields
+      (format "%s: %s awaiting review" title (string-join fields ", ")))
+     (t (format "%s: awaiting review" title)))))
+
+(defun ejira--auto-sync-hold (file plans)
+  "Hold every push PLAN of FILE for the review buffer; send nothing.
+Invariant: an automatic cycle never writes to Jira.  Every plan is
+collected in `ejira--auto-sync-review-plans' for the review buffer,
+where the user confirms what is sent (see `ejira--jira-write').
+Return the held lines, for the caller to log and count with the
+cycle's other held issues."
   (let ((buf (get-file-buffer file))
         held)
     (if (and buf (buffer-live-p buf) (not (verify-visited-file-modtime buf)))
         ;; The file changed on disk mid-cycle (another editor, git): the
-        ;; plans were built from stale in-memory content.  Hold everything.
+        ;; plans were built from stale in-memory content and must not be
+        ;; offered for review; the next cycle rebuilds them.
         (dolist (plan plans)
-          (push (format "%s: file changed on disk mid-cycle; held for review"
+          (push (format "%s: file changed on disk mid-cycle; held for the next cycle"
                         (plist-get plan :title))
                 held))
       (dolist (plan plans)
-        (let* ((op (plist-get plan :op))
-               (object (plist-get plan :object))
-               (send (plist-get plan :send))
-               (title (plist-get plan :title)))
-          (cond
-           ((plist-get plan :remote-changed)
-            (push plan ejira--auto-sync-review-plans)
-            (push (format "%s: changed remotely since last sync; held for review" title)
-                  held))
-           ((and (eq op 'update) (eq object 'comment))
-            (push plan ejira--auto-sync-review-plans)
-            (push (format "%s: comment edit held for review" title) held))
-           ((and (eq op 'delete) (eq object 'comment))
-            (push plan ejira--auto-sync-review-plans)
-            (push (format "%s: comment deletion held for review" title) held))
-           ((and (eq op 'create)
-                 (not (eq object 'comment))
-                 (not ejira-auto-sync-create))
-            (push plan ejira--auto-sync-review-plans)
-            (push (format "%s: creation held for review (ejira-auto-sync-create is nil)" title)
-                  held))
-           (send
-            (condition-case err
-                (funcall send)
-              (error (push (format "%s: push failed: %s"
-                                   title (error-message-string err))
-                           held))))))))
+        (push plan ejira--auto-sync-review-plans)
+        (push (ejira--auto-sync-hold-line plan) held)))
     (nreverse held)))
 
 (defun ejira--auto-sync-reconcile (file &optional review)
-  "Run one pull-then-push reconciliation cycle for FILE.
-With REVIEW (a save in Emacs, or `ejira-auto-sync-review'), open the
-review buffer for everything the cycle held that a push can resolve:
-creations, comment edits, and issues changed on both sides or without
-a remote baseline.  Duplicate identities and unconvertible markup are
-not reviewable pushes and stay in the log."
+  "Run one reconciliation cycle for FILE: pull, then hold pushes for review.
+Remote-only changes are pulled and applied.  Every local change is
+built into a push plan and held: the cycle itself never writes to
+Jira (see `ejira--jira-write').  With REVIEW (a save in Emacs, or
+`ejira-auto-sync-review'), open the review buffer for everything held
+that a push can resolve: every local change, and issues changed on
+both sides or without a remote baseline.  Without REVIEW (an external
+change) the held changes are only counted in the mode line.
+Duplicate identities and unconvertible markup are not reviewable
+pushes and stay in the log."
   (catch 'defer
     (when (not (file-exists-p file))
       (remhash file ejira--auto-sync-mtimes)
@@ -1311,7 +1307,7 @@ not reviewable pushes and stay in the log."
                          (when-let ((m (ejira--find-heading key)))
                            (org-with-point-at m
                              (ejira--store-remote-baseline item)))))))
-                 ;; ── push local-only changes ──
+                 ;; ── hold local changes for review; never push ──
                  (let* ((ops (ejira--with-pre-scan buf
                                (ejira--push-scan-buffer buf)))
                         (blocked (cl-remove-if-not
@@ -1329,10 +1325,12 @@ not reviewable pushes and stay in the log."
                                      (plist-get b :title)
                                      (plist-get b :reason))
                              conflicts)))
-                   ;; Issue-wide holds: an issue classified as conflicted
-                   ;; keeps its staged transitions, type changes and
-                   ;; cascade creations out of the cycle too — a plan
-                   ;; whose parent-issue is held runs unattended anyway.
+                   ;; Issue-wide holds: the plans of an issue classified
+                   ;; as conflicted (staged transitions, type changes,
+                   ;; cascade creations) are already reported by its
+                   ;; conflict line; offer them for review unless the
+                   ;; issue cannot be pushed at all (duplicate identity,
+                   ;; unconvertible markup).
                    (dolist (plan plans)
                      (let ((issue (plist-get plan :parent-issue)))
                        (when (and (member issue held-keys)
@@ -1343,16 +1341,19 @@ not reviewable pushes and stay in the log."
                           (lambda (plan)
                             (member (plist-get plan :parent-issue) held-keys))
                           plans))
+                   ;; Everything else waits for review too: an automatic
+                   ;; cycle never sends anything to Jira.
                    (when plans
                      (setq conflicts
-                           (append (reverse (ejira--auto-sync-execute file plans))
+                           (append (reverse (ejira--auto-sync-hold file plans))
                                    conflicts))))
                  (when notes
                    (ejira--auto-sync-log file (nreverse notes)))
                  (setq conflicts (nreverse conflicts))
                  (when conflicts
-                   (message "ejira auto-sync: %d issue(s) held back"
-                            (length conflicts))
+                   (message "ejira auto-sync: %d change(s) awaiting review%s"
+                            (length conflicts)
+                            (if review "" "; click Jira in the mode line to review"))
                    (ejira--auto-sync-log file conflicts))
                  (ejira--auto-sync-record-held file conflicts)
                  (ejira--save-buffer-safe)
