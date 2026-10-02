@@ -1879,13 +1879,136 @@ of the fixture come back as two."
                     "** Description\n\nNew body.\n\n** Comments\n:PROPERTIES:\n:ID: X-2\n:END:\n")))))
 
 (ert-deftest ejira-body-shape/canonical-p ()
-  "Boundary shape: exactly one blank line each side; empty bodies pass."
-  (should (ejira--body-shape-canonical-p "\n\nBody.\n\n"))
-  (should-not (ejira--body-shape-canonical-p "\n\n\nBody.\n\n"))
-  (should-not (ejira--body-shape-canonical-p "\n\nBody.\n"))
-  (should-not (ejira--body-shape-canonical-p "\n\nBody.\n\n\n"))
+  "Boundary shape of the stored region: one blank line each side.
+The region starts right after the metadata, so its first newline is
+the single leading blank line; an empty body is one blank line."
+  (should (ejira--body-shape-canonical-p "\nBody.\n\n"))
+  (should (ejira--body-shape-canonical-p "\n  - Indented item.\n\n"))
+  (should-not (ejira--body-shape-canonical-p "\n\nBody.\n\n"))
+  (should-not (ejira--body-shape-canonical-p "Body.\n\n"))
+  (should-not (ejira--body-shape-canonical-p "\nBody.\n"))
+  (should-not (ejira--body-shape-canonical-p "\nBody.\n\n\n"))
   (should (ejira--body-shape-canonical-p "\n"))
-  (should (ejira--body-shape-canonical-p "")))
+  (should-not (ejira--body-shape-canonical-p "\n\n"))
+  (should-not (ejira--body-shape-canonical-p "")))
+
+(ert-deftest ejira-body-shape/setter-output-is-canonical ()
+  "What the setters write is what the shape check accepts.
+The check used to read the stripped body value, so it rejected every
+freshly written body and could not see a doubled leading blank."
+  (dolist (contents '("Body." "\n\nBody.\n\n\n" "" "\n\n"))
+    (ejira-test--with-org-buf
+     "* TODO Task\n:PROPERTIES:\n:ID: X-1\n:END:\n** Description\n\n\n\nOld.\n** Comments\n"
+     (let ((d (progn (re-search-forward "^\\*\\* Description")
+                     (org-back-to-heading t)
+                     (point-marker))))
+       (ejira--set-heading-body d contents)
+       (should (ejira--body-shape-canonical-p (ejira--heading-body-raw d)))
+       (goto-char (point-min))
+       (should (ejira--body-shape-canonical-p (ejira--jira-description-raw)))
+       (should-not (string-match-p "\n\n\n" (buffer-string)))))))
+
+(ert-deftest ejira-trim-blank-lines/keeps-first-line-indentation ()
+  "Only blank lines and trailing whitespace are trimmed."
+  (should (equal "  - item\n  - other"
+                 (ejira--trim-blank-lines "\n \n  - item\n  - other\n\n  ")))
+  (should (equal "" (ejira--trim-blank-lines "\n\n  \n")))
+  (should (equal "" (ejira--trim-blank-lines nil))))
+
+(ert-deftest ejira-body-start/backs-up-over-blanks-only ()
+  "The body starts after all metadata, before the blank lines after it."
+  (ejira-test--with-org-buf
+   "* TODO Task\nDEADLINE: <2026-10-02 Fri>\n:PROPERTIES:\n:ID: X-1\n:END:\n:LOGBOOK:\n- note\n:END:\n\n\n** Comments\n"
+   (should (equal (ejira--body-start)
+                  (save-excursion (search-forward "- note\n:END:\n") (point)))))
+  ;; No metadata: never above the line after the heading.
+  (ejira-test--with-org-buf "* Task\n\n\nBody.\n"
+                            (should (= (ejira--body-start) (save-excursion (forward-line 1) (point)))))
+  ;; A blank line between two drawers stays part of the metadata.
+  (ejira-test--with-org-buf
+   "* Task\n:PROPERTIES:\n:ID: X-1\n:END:\n\n:LOGBOOK:\n- note\n:END:\n\nBody.\n"
+   (should (equal (ejira--body-start)
+                  (save-excursion (search-forward "- note\n:END:\n") (point))))))
+
+(defconst ejira-test--logbook-comments-task
+  "* Parent\n:PROPERTIES:\n:EJIRA_DESCRIPTION_IN_BODY: t\n:END:\n\n\
+** TODO Task\n:PROPERTIES:\n:ID:       X-1\n:END:\n:LOGBOOK:\n- note\n:END:\n%s\
+*** Comments\n\n** TODO Sibling\n:PROPERTIES:\n:ID:       X-2\n:END:\n"
+  "A body-mode task whose own body is empty: metadata, then Comments.
+The %s is the spacing between the LOGBOOK and the Comments heading.")
+
+(defun ejira-test--goto-task ()
+  "Move point to the X-1 task heading."
+  (goto-char (point-min))
+  (re-search-forward "^\\*\\* TODO Task")
+  (org-back-to-heading t))
+
+(ert-deftest ejira-description-set/empty-body-before-comments-is-stable ()
+  "Rewriting an empty description leaves one blank line before Comments.
+`org-end-of-meta-data' lands on the Comments heading, and the owned
+region used to start there: the old blank lines stayed and every
+rewrite added one more."
+  (dolist (spacing '("" "\n" "\n\n" "\n\n\n"))
+    (ejira-test--with-org-buf (format ejira-test--logbook-comments-task spacing)
+                              (let ((expected (format ejira-test--logbook-comments-task "\n")))
+                                (dotimes (_ 3)
+                                  (ejira-test--goto-task)
+                                  (ejira--set-task-description "")
+                                  (should (equal expected (buffer-string))))
+                                (ejira-test--goto-task)
+                                (should (equal "" (ejira--get-task-description)))
+                                (should (ejira--body-shape-canonical-p (ejira--task-description-raw)))))))
+
+(ert-deftest ejira-description-set/heading-first-body-is-stable ()
+  "A description opening with a heading keeps one blank line above it."
+  (ejira-test--with-org-buf (format ejira-test--logbook-comments-task "\n\n")
+                            (let ((expected (format ejira-test--logbook-comments-task
+                                                    "\n*** Outcome\n\nText.\n\n")))
+                              (dotimes (_ 3)
+                                (ejira-test--goto-task)
+                                (ejira--set-task-description "*** Outcome\n\nText.")
+                                (should (equal expected (buffer-string))))
+                              ;; From an accumulated shape too.
+                              (goto-char (point-min))
+                              (search-forward ":END:\n:LOGBOOK:\n- note\n:END:\n")
+                              (insert "\n\n")
+                              (ejira-test--goto-task)
+                              (ejira--set-task-description "*** Outcome\n\nText.")
+                              (should (equal expected (buffer-string))))))
+
+(ert-deftest ejira-description-set/empty-body-before-child-task ()
+  "Blank lines before a protected child task collapse to one; the task stays."
+  (let ((ejira-description-in-body t))
+    (ejira-test--with-org-buf
+     "* TODO Task\n:PROPERTIES:\n:ID: X-1\n:END:\n\n\n\n** TODO Child\n:PROPERTIES:\n:ID: X-2\n:END:\n\nChild body.\n"
+     (ejira--set-task-description "")
+     (should (equal "* TODO Task\n:PROPERTIES:\n:ID: X-1\n:END:\n\n** TODO Child\n:PROPERTIES:\n:ID: X-2\n:END:\n\nChild body.\n"
+                    (buffer-string))))))
+
+(ert-deftest ejira-new-issue-description/moved-body-leaves-canonical-spacing ()
+  "Moving a local body into Description leaves no doubled blank lines.
+The removed region used to start after the body's leading blank
+lines, which stayed behind next to the blank line the new heading
+brought; the untrimmed body tripled the blank lines after it."
+  (dolist (body '("\nBody.\n" "Body.\n" "\nBody.\n\n" "Body.\n\n" "\n\n\nBody.\n\n\n"))
+    (ejira-test--with-org-buf
+     (concat "* Parent\n\n** TODO Task\n:PROPERTIES:\n:ID:       X-1\n:END:\n:LOGBOOK:\n- note\n:END:\n"
+             body "** Next\n")
+     (ejira-test--goto-task)
+     (should (equal "Body." (string-trim (ejira--prepare-new-issue-description))))
+     (should (equal (concat "* Parent\n\n** TODO Task\n:PROPERTIES:\n:ID:       X-1\n:END:\n"
+                            ":LOGBOOK:\n- note\n:END:\n\n*** Description\n\nBody.\n\n** Next\n")
+                    (buffer-string))))))
+
+(ert-deftest ejira-new-issue-description/moved-body-before-child-task ()
+  "With a child task, one blank line is left between metadata and child."
+  (ejira-test--with-org-buf
+   "* TODO Task\n:PROPERTIES:\n:ID: X-1\n:END:\n\nBody.\n\n** TODO Child\n:PROPERTIES:\n:ID: X-2\n:END:\n\nChild body.\n"
+   (ejira--prepare-new-issue-description)
+   (should-not (string-match-p "\n\n\n" (buffer-string)))
+   (should (string-match-p ":ID: X-1\n:END:\n\n\\*\\* TODO Child\n" (buffer-string)))
+   (goto-char (point-min))
+   (should (equal "Body." (string-trim (ejira--jira-description))))))
 
 ;;; ── Body-as-description ownership ────────────────────────────────────────────
 

@@ -483,7 +483,11 @@ thousands of issues, and remote-only issues have nothing to repair."
                  ((eq expected :unconvertible) (push key dirty))
                  ((and (equal (string-trim (ejira-parser-inactivate-timestamps current))
                               (string-trim expected))
-                       (ejira--body-shape-canonical-p current))
+                       ;; The shape lives in the stored region: `current'
+                       ;; has its leading newline stripped.  A missing
+                       ;; description child has no shape to repair.
+                       (let ((raw (ejira--jira-description-raw m)))
+                         (or (null raw) (ejira--body-shape-canonical-p raw))))
                   (cl-incf unchanged))
                  (t
                   (push key repaired)
@@ -958,7 +962,7 @@ several keywords), so compare through `ejira-todo-states-alist' both
 ways rather than by index alone."
   (let* ((remote-index (funcall ejira-todo-state-fn status resolution))
          (local-index (1+ (or (cl-position local-state org-todo-keywords-1
-                                            :test #'equal)
+                                           :test #'equal)
                               -2))))
     (or (= remote-index local-index)
         (and (not (equal status "Closed"))

@@ -1267,39 +1267,94 @@ it."
             (throw 'done (line-beginning-position))))
         (point-max)))))
 
+(defun ejira--body-start ()
+  "Return where the body of the heading at point starts.
+
+That is the first line after the heading's own planning line and
+drawers, found with `org-end-of-meta-data'.  Searching the subtree for
+the drawer regexps instead would walk into a child heading that
+happens to have a drawer or a deadline line and silently discard the
+body before it.
+
+`org-end-of-meta-data' also skips the blank lines that follow the
+metadata, landing on the first content line -- or on the next heading
+when the body is empty.  The body starts before those blank lines
+instead: they belong to the body, so a rewrite replaces them rather
+than leaving them behind to accumulate one more on every write.
+Backing up only crosses blank lines, which metadata never contains,
+and never goes above the line after the heading.
+
+Every function that reads or rewrites a heading's body region must
+start it here.  Separate copies of this computation drifted apart
+once already: one skipped the backoff when the body was empty or
+opened with a heading, and every description write then added a
+blank line before the Comments heading."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((limit (line-beginning-position 2)))
+      (org-end-of-meta-data t)
+      (while (and (> (point) limit)
+                  (save-excursion
+                    (forward-line -1)
+                    (looking-at-p "[ \t]*$")))
+        (forward-line -1))
+      (point))))
+
+(defun ejira--trim-blank-lines (s)
+  "Return S without its leading blank lines and trailing whitespace.
+Unlike `string-trim', the indentation of the first content line is
+kept: a body opening with an indented list item or a fixed-width
+line must not lose it."
+  (let ((s (or s "")))
+    (when (string-match "\\`\\(?:[ \t\r]*\n\\)+" s)
+      (setq s (substring s (match-end 0))))
+    (if (string-match "[ \t\r\n]+\\'" s)
+        (substring s 0 (match-beginning 0))
+      s)))
+
+(defun ejira--body-shape-canonical-p (raw)
+  "Return non-nil when RAW body region has canonical blank-line boundaries.
+
+RAW is the region text as stored, starting right after the heading's
+metadata (see `ejira--body-start'), not a value returned by
+`ejira--get-heading-body', which strips the leading newline and so
+cannot tell one leading blank line from none.
+
+Canonical is what `ejira--set-heading-body' and
+`ejira--set-task-description' write: exactly one blank line between
+the metadata and the first content line, and exactly one between the
+last content line and the next heading -- or, for an empty body, a
+single blank line."
+  (or (equal raw "\n")
+      ;; The first content line may be indented (a list item): only
+      ;; a blank second line is a doubled leading blank.
+      (and (string-match-p "\\`\n[ \t]*[^ \t\r\n]" raw)
+           (string-match-p "[^ \t\r\n]\n\n\\'" raw))))
+
 (defmacro ejira--with-narrow-to-body (heading &rest body)
   "Execute BODY while the buffer is narrowed to the content under HEADING.
 
-Only HEADING's own planning line and drawers are skipped, via
-`org-end-of-meta-data'.  Searching the subtree for the drawer
-regexps instead would walk into a child heading that happens to have
-a drawer or a deadline line and silently discard the body before it.
-
-The subtree end is computed with point still on HEADING.  With
-`org-end-of-meta-data' called first, a body consisting only of blank
-lines would leave point on the *next* heading, and the subtree end
-would then be that heading's end -- deleting a sibling.
-
-`org-end-of-meta-data' also skips blank lines; the region starts at
-the first line after the metadata instead, so a body rewrite
-replaces the old leading blanks instead of leaving them behind to
-accumulate one more on every pull."
+The region starts at `ejira--body-start'.  The subtree end is
+computed with point still on HEADING.  With `org-end-of-meta-data'
+called first, a body consisting only of blank lines would leave point
+on the *next* heading, and the subtree end would then be that
+heading's end -- deleting a sibling."
   `(org-with-point-at ,heading
      (ejira--with-expand-all
        (goto-char ,heading)
        (org-back-to-heading t)
        (let ((end (save-excursion
-                    (ejira--true-subtree-end)))
-             (limit (line-beginning-position 2)))
-         (org-end-of-meta-data t)
-         (while (and (> (point) limit)
-                     (save-excursion
-                       (forward-line -1)
-                       (looking-at-p "^[ \t]*$")))
-           (forward-line -1))
-         (narrow-to-region (min (point) end) end))
+                    (ejira--true-subtree-end))))
+         (narrow-to-region (min (ejira--body-start) end) end))
        ,@body)))
 (function-put #'ejira--with-narrow-to-body 'lisp-indent-function 'defun)
+
+(defun ejira--heading-body-raw (heading)
+  "Return the body region of HEADING exactly as stored.
+The region starts at `ejira--body-start', so its leading blank lines
+are included; `ejira--body-shape-canonical-p' needs them."
+  (ejira--with-narrow-to-body heading
+    (buffer-substring-no-properties (point-min) (point-max))))
 
 (defun ejira--get-heading-body (heading)
   "Get body of HEADING."
@@ -1313,26 +1368,35 @@ accumulate one more on every pull."
       (set-text-properties 0 (length s) nil s)
       s)))
 
+(defun ejira--strip-leading-blank-lines (s)
+  "Return S without its leading blank lines."
+  (if (string-match "\\`\\(?:[ \t\r]*\n\\)+" s)
+      (substring s (match-end 0))
+    s))
+
 (defun ejira--heading-own-body-region ()
-  "Return bounds of the current heading's body before its first child."
+  "Return bounds of the current heading's body before its first child.
+The region starts at `ejira--body-start', blank lines included, so
+removing it leaves none of the old spacing behind."
   (org-with-wide-buffer
    (save-excursion
      (org-back-to-heading t)
-     (let ((heading (point-marker))
-           (begin (progn (org-end-of-meta-data t) (point))))
-       (let ((end (save-excursion
-                    (goto-char heading)
-                    (if (org-goto-first-child)
-                        (line-beginning-position)
-                      (ejira--true-subtree-end)))))
-         (cons begin end))))))
+     (let ((begin (ejira--body-start))
+           (end (save-excursion
+                  (if (org-goto-first-child)
+                      (line-beginning-position)
+                    (ejira--true-subtree-end)))))
+       (cons (min begin end) end)))))
 
 (defun ejira--get-heading-own-body (&optional heading)
-  "Return direct body text of HEADING, excluding child headings."
+  "Return direct body text of HEADING, excluding child headings.
+The text starts at its first content line: the leading blank lines of
+the region are spacing, not content."
   (if heading
       (org-with-point-at heading (ejira--get-heading-own-body))
     (let ((region (ejira--heading-own-body-region)))
-      (buffer-substring-no-properties (car region) (cdr region)))))
+      (ejira--strip-leading-blank-lines
+       (buffer-substring-no-properties (car region) (cdr region))))))
 
 (defun ejira--description-in-body-p ()
   "Return non-nil when the task at point stores its description in its body.
@@ -1393,52 +1457,45 @@ section, is not part of the owned region and stays local-only."
 
 (defun ejira--task-description-region ()
   "Return (BEGIN . END) of the description-owned region of the task at point.
-BEGIN sits right after the task's own metadata, consuming leading blank
-lines so a rewrite replaces rather than accumulates them; END is
-`ejira--description-boundary'."
+BEGIN is `ejira--body-start': the blank lines after the metadata are
+part of the region, so a rewrite replaces rather than accumulates
+them -- also when the body is empty or opens with a heading, where
+`org-end-of-meta-data' lands directly on that heading.  END is
+`ejira--description-boundary', which never lies above that heading
+when it is a protected first child (a task or the Comments
+container): the region then holds only the blank lines before it and
+a rewrite cannot swallow it."
   (save-excursion
     (org-back-to-heading t)
-    (let* ((limit (line-beginning-position 2))
-           (end (ejira--description-boundary))
-           (begin (progn
-                    (org-end-of-meta-data t)
-                    (if (org-at-heading-p)
-                        ;; Empty own body: `org-end-of-meta-data' has
-                        ;; landed on the first heading.  The owned region
-                        ;; must not start there -- a protected first child
-                        ;; (a task or the Comments container) would be
-                        ;; swallowed by the next rewrite.  Skip the
-                        ;; blank-line backoff: it could creep above the
-                        ;; heading into the metadata.
-                        (line-beginning-position)
-                      (while (and (> (point) limit)
-                                  (< (point) end)
-                                  (save-excursion
-                                    (forward-line -1)
-                                    (looking-at-p "^[ \t]*$")))
-                        (forward-line -1))
-                      (point)))))
+    (let ((end (ejira--description-boundary))
+          (begin (ejira--body-start)))
       (cons (min begin end) end))))
+
+(defun ejira--task-description-raw ()
+  "Return the description-owned region of the task at point as stored.
+Leading blank lines included; see `ejira--body-shape-canonical-p'."
+  (let ((region (ejira--task-description-region)))
+    (buffer-substring-no-properties (car region) (cdr region))))
 
 (defun ejira--get-task-description ()
   "Return the description-owned region text of the task at point."
-  (let* ((region (ejira--task-description-region))
-         (s (buffer-substring-no-properties (car region) (cdr region))))
+  (let ((s (ejira--task-description-raw)))
     ;; Mirror `ejira--get-heading-body': the leading newline is the
     ;; canonical blank separator and is stripped from the value.
     (when (and (> (length s) 0) (s-starts-with-p "\n" s))
       (setq s (substring s 1)))
-    (ejira--strip-properties s)))
+    s))
 
 (defun ejira--set-task-description (content)
   "Replace the description-owned region of the task at point with CONTENT.
 Only the owned region is rewritten: descendant task subtrees and the
-reserved Comments container are preserved in place.  CONTENT is trimmed
-and stored with canonical blank-line boundaries."
+reserved Comments container are preserved in place.  CONTENT is
+trimmed of surrounding blank lines (see `ejira--trim-blank-lines') and
+stored with canonical blank-line boundaries."
   (let* ((region (ejira--task-description-region))
          (begin (car region))
          (end (cdr region))
-         (content (string-trim (or content ""))))
+         (content (ejira--trim-blank-lines content)))
     (atomic-change-group
       (goto-char begin)
       (delete-region begin end)
@@ -1497,20 +1554,6 @@ body.  Normalized so the fingerprint ignores cosmetic whitespace changes."
               "\0"
               (ejira--push-normalize
                (or (org-get-todo-state) "")))))))
-
-(defun ejira--body-shape-canonical-p (raw)
-  "Return non-nil when RAW body has canonical blank-line boundaries.
-Canonical means exactly one blank line between the heading's
-metadata and the first content line, and exactly one between the
-last content line and the next heading.  Trimmed-empty bodies are
-canonical whatever their raw shape: `ejira--set-heading-body' writes
-them to a single blank line and the content comparison cannot see
-the difference."
-  (or (string-empty-p (string-trim raw))
-      (and (string-prefix-p "\n\n" raw)
-           (not (string-prefix-p "\n\n\n" raw))
-           (string-suffix-p "\n\n" raw)
-           (not (string-suffix-p "\n\n\n" raw)))))
 
 (defun ejira--heading-content-fields ()
   "Return the content fields of the ejira task at point.
@@ -1734,18 +1777,21 @@ full pull."
 
 (defun ejira--set-heading-body (heading contents)
   "Set the contents of item HEADING to CONTENTS."
-  (ejira--with-narrow-to-body heading
-    (when (> (point-max) (point-min))
-      (delete-region (point-min) (point-max)))
-    (if (and contents (> (length contents) 0))
-        ;; One blank line before and after body text: the narrow
-        ;; starts right after the heading's own newline, so one
-        ;; leading newline is the blank line, and the trailing two
-        ;; keep the next heading (the Comments child, say) from
-        ;; gluing to the last paragraph.
-        (insert (concat "\n" contents "\n\n"))
-      ;; No body: one blank line between drawer and next heading.
-      (insert "\n"))))
+  (let ((contents (ejira--trim-blank-lines contents)))
+    (ejira--with-narrow-to-body heading
+      (when (> (point-max) (point-min))
+        (delete-region (point-min) (point-max)))
+      (if (> (length contents) 0)
+          ;; One blank line before and after body text: the narrow
+          ;; starts right after the metadata, so one leading newline
+          ;; is the blank line, and the trailing two keep the next
+          ;; heading (the Comments child, say) from gluing to the
+          ;; last paragraph.  CONTENTS is trimmed of surrounding
+          ;; blank lines first, or the ones it carries would double
+          ;; these (a moved local body did).
+          (insert (concat "\n" contents "\n\n"))
+        ;; No body: one blank line between drawer and next heading.
+        (insert "\n")))))
 
 (defun ejira--set-todo-state (key state)
   "Set todo state of item KEY into STATE."
@@ -1802,6 +1848,27 @@ In body-as-description mode the description is the task's owned body region."
                   (ejira--find-child-heading ejira-description-heading-name)))
         (ejira--get-heading-body description))))))
 
+(defun ejira--jira-description-raw (&optional heading)
+  "Return HEADING's Jira-facing description region exactly as stored.
+Like `ejira--jira-description', but with the leading blank lines kept,
+for `ejira--body-shape-canonical-p'.  Nil when there is no
+description region (a projection or legacy heading without its
+description child)."
+  (if heading
+      (org-with-point-at heading (ejira--jira-description-raw))
+    (cond
+     ((ejira--jira-projection-p)
+      (when-let* ((description
+                   (ejira--find-child-heading
+                    ejira-jira-description-heading-name)))
+        (ejira--heading-body-raw description)))
+     ((ejira--description-in-body-p)
+      (ejira--task-description-raw))
+     (t
+      (when-let* ((description
+                   (ejira--find-child-heading ejira-description-heading-name)))
+        (ejira--heading-body-raw description))))))
+
 (defun ejira--new-issue-description (&optional heading)
   "Return the Jira description for a local heading not yet created in Jira.
 
@@ -1833,14 +1900,33 @@ into the same region."
             (ejira--find-child-heading ejira-description-heading-name))
         (or (ejira--jira-description) "")
       (let* ((region (ejira--heading-own-body-region))
-             (body (buffer-substring-no-properties (car region) (cdr region))))
+             (body (ejira--strip-leading-blank-lines
+                    (buffer-substring-no-properties (car region) (cdr region)))))
         (if (string-empty-p (string-trim body))
             ""
-          (let ((description
-                 (ejira--get-subheading (point-marker)
-                                        ejira-description-heading-name)))
-            (ejira--set-heading-body description body)
-            (delete-region (car region) (cdr region))
+          ;; Markers: creating the Description heading inserts text at
+          ;; the end of the subtree, which can be the region's end.
+          (let ((start (copy-marker (car region)))
+                (end (copy-marker (cdr region))))
+            (unwind-protect
+                (let ((description
+                       (ejira--get-subheading (point-marker)
+                                              ejira-description-heading-name)))
+                  (ejira--set-heading-body description body)
+                  ;; The region holds the body's surrounding blank lines
+                  ;; too; the heading insertion may have added its own
+                  ;; blank line right after it.  Leave exactly one
+                  ;; between the metadata and the next heading, the
+                  ;; shape `ejira--set-heading-body' gives an empty body.
+                  (save-excursion
+                    (delete-region start end)
+                    (goto-char start)
+                    (while (and (not (eobp)) (looking-at-p "[ \t]*$"))
+                      (delete-region (point) (min (point-max)
+                                                  (line-beginning-position 2))))
+                    (insert "\n")))
+              (set-marker start nil)
+              (set-marker end nil))
             body))))))
 
 (defun ejira--remote-body-for-diff (remote local)
