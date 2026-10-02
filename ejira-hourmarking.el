@@ -255,8 +255,6 @@ Limit entries to DATE-STR."
                      :fields `(("title" ,comment)
                                ("started" ,start)
                                ("duration" ,(string-trim (ejira--format-h-m duration))))
-                     :payload (format "issue: %s\nstarted: %s\ntime spent (s): %d\ncomment: %s"
-                                      key start duration comment)
                      :send (lambda ()
                              (ejira--jira-write (format "add worklog on %s" key)
                                (jiralib2-add-worklog key start duration comment)))))))

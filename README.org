@@ -151,13 +151,12 @@ Ejira Push — 3 changes: 1 modified, 2 new
 ▼ TEST  1 modified, 2 new
   ▼ [x] ✎ Fix the login page  summary, description, 1 new
       summary:      old title → new title
-      ▶ description:  -1 +2 lines, +80 chars
-      ▶ payload:      6 lines, sent as is
+      ▶ description:  -1 +2 lines, +14 words: login page now…
       ▶ [x] + subtask: TODO Write the tests  new
 #+END_EXAMPLE
 
 - Each write is an item with a =[x]= checkbox; =RET= unticks it and the heading stays dirty for the next save.
-- Fields expand with =TAB= to a word-refined diff; =payload= shows the Jira markup that will be sent.
+- Fields expand with =TAB= to a word-refined diff.  A collapsed field shows the lines removed and added, the change in word count and an excerpt of its first change.  New issues also list the issue type, epic link, parent and priority they are created with.
 - =Assign new issues to me= and the per-issue =assign to me= boxes control assignment of created issues.
 - =C-c C-c= pushes the ticked items; failures are collected into one warning and the other items still go through. =C-c C-k= cancels.
 

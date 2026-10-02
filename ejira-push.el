@@ -195,7 +195,7 @@ must already be recorded (via `ejira--record-new-issue-key')."
                                                       reviewed-summary reviewed-body)
   "Like `ejira--finalize-new-issue', then restore post-review local edits.
 
-The reviewed payload is what creation sent; edits made while the
+The reviewed fields are what creation sent; edits made while the
 confirmation was open were never sent, and the finalize pull must not
 swallow them.  Restoring them locally leaves the finalize-stamped
 baseline mismatched, so the heading stays dirty for the next reviewed
@@ -242,7 +242,7 @@ the child's Org cookie within PROJECT-KEY's policy.  BLOCKED-OPS are ops for TOD
 direct children: the native Jira hierarchy has no place for them, so
 they are reported instead of being silently flattened or lost.  The
 child bodies are prepared (moved into description position) here, at
-plan-build time, so the reviewed payload is exactly what creation sends."
+plan-build time, so the reviewed fields are exactly what creation sends."
   (let (children blocked)
     (org-with-wide-buffer
      (save-excursion
@@ -360,10 +360,18 @@ parent's assign-self cell."
             (jiralib2-assign-issue new-key my-name)))))
     (ejira--finalize-new-issue new-key child-marker orig-state todo-keywords)))
 
-(defun ejira--push-payload (&rest parts)
-  "Join the non-nil PARTS into a payload preview for the review buffer."
-  (let ((parts (delq nil parts)))
-    (when parts (string-join parts "\n"))))
+(defun ejira--push-priority-label (priority-id reference-key)
+  "Return the review label of new-issue PRIORITY-ID, or nil without one.
+The name comes from the cached priority scheme of REFERENCE-KEY: building
+the plan never calls the server for it.  An uncached scheme shows the id."
+  (when priority-id
+    (let* ((scheme (when (and reference-key
+                              (hash-table-p ejira--priority-scheme-cache))
+                     (gethash (ejira--priority-scheme-cache-key reference-key)
+                              ejira--priority-scheme-cache)))
+           (entry (ejira--priority-entry-by-id scheme priority-id)))
+      (or (plist-get entry :name)
+          (format "id %s" priority-id)))))
 
 (defun ejira--push-finalize (marker &optional reviewed-hash remote-identity
                                     priority)
@@ -860,20 +868,6 @@ the heading's Jira priority before re-baselining."
                             :parent-issue key
                             :changes changes
                             :remote-changed remote-changed-p
-                            :payload (ejira--push-payload
-                                      (when (or summary-changed desc-changed)
-                                        (format "summary: %s\ndescription (Jira markup):\n%s"
-                                                local-summary
-                                                (ejira-parser-org-to-jira local-desc-org
-                                                                          desc-level)))
-                                      (when assignee-changed
-                                        (format "assignee: %s" local-assignee))
-                                      (when (and priority-changed local-priority-id)
-                                        (format "priority id: %s" local-priority-id))
-                                      (when deadline-changed
-                                        (format "duedate: %s" (or local-deadline "")))
-                                      (when state-changed
-                                        (format "transition to org state: %s" local-state)))
                             :send (let ((key key) (marker marker)
                                         (local-summary local-summary)
                                         (local-desc-org local-desc-org)
@@ -965,7 +959,6 @@ the heading's Jira priority before re-baselining."
                                :title (format "%s comment %s" issue-key commid)
                                :parent-issue issue-key
                                :changes changes
-                               :payload (ejira-parser-org-to-jira local-body comment-level)
                                :send (let ((issue-key issue-key) (commid commid)
                                            (marker marker)
                                            (comment-level comment-level)
@@ -1037,7 +1030,7 @@ the heading's Jira priority before re-baselining."
                  (project-key (plist-get data :project-key))
                  (heading-title (org-with-point-at marker (ejira--jira-summary)))
                  ;; Prepare (and therefore capture) the description at
-                 ;; plan-build time: the reviewed payload must be exactly
+                 ;; plan-build time: the reviewed fields must be exactly
                  ;; what creation sends, not a re-read of later edits.
                  (local-body (or (org-with-point-at marker
                                    (ejira--prepare-new-issue-description))
@@ -1048,6 +1041,8 @@ the heading's Jira priority before re-baselining."
                                marker project-key parent-key))
                  (fields `(("title" ,heading-title)
                            ("state" ,local-state)
+                           ("priority" ,(ejira--push-priority-label
+                                         priority-id parent-key))
                            ("description" ,(or local-body ""))))
                  ;; One shared cell for the plan and the send: the review
                  ;; toggles the plan's list, and the send must read the
@@ -1061,13 +1056,6 @@ the heading's Jira priority before re-baselining."
                                                        0 (min 60 (length heading-title))))
                              :parent-issue parent-key
                              :fields fields
-                             :payload (ejira--push-payload
-                                       (format "summary: %s" heading-title)
-                                       (format "issue type: %s" ejira-subtask-type-name)
-                                       (format "parent: %s" parent-key)
-                                       (when priority-id (format "priority id: %s" priority-id))
-                                       "description (Jira markup):"
-                                       (ejira-parser-org-to-jira local-body))
                              :assign-self assign-self-cell
                              :send (let ((marker marker) (project-key project-key)
                                          (target-id (ejira--creation-target-id marker))
@@ -1138,7 +1126,7 @@ the heading's Jira priority before re-baselining."
                                        (plist-get op :parent-issue)))
                  (heading-title (org-with-point-at marker (ejira--jira-summary)))
                  ;; Prepare (and therefore capture) the description at
-                 ;; plan-build time: the reviewed payload must be exactly
+                 ;; plan-build time: the reviewed fields must be exactly
                  ;; what creation sends, not a re-read of later edits.
                  (local-body (or (org-with-point-at marker
                                    (ejira--prepare-new-issue-description))
@@ -1146,12 +1134,23 @@ the heading's Jira priority before re-baselining."
                  (desc-markup (ejira-parser-org-to-jira local-body))
                  (local-state (org-with-point-at marker
                                 (substring-no-properties (or (org-get-todo-state) ""))))
-                 (fields `(("title" ,heading-title)
-                           ("state" ,local-state)
-                           ("description" ,(or local-body ""))))
                  (is-epic (equal issue-type ejira-epic-type-name))
                  (priority-id (ejira--new-issue-priority-id
                                marker project-key parent-issue))
+                 ;; What creation sets besides the summary and the body;
+                 ;; empty values are left out of the review.
+                 (fields `(("title" ,heading-title)
+                           ("state" ,local-state)
+                           ("type" ,issue-type)
+                           ("epic link" ,parent-epic)
+                           ("parent" ,(when parent-initiative
+                                        (if ejira-parent-link-field
+                                            parent-initiative
+                                          (format "%s (not linked: ejira-parent-link-field is nil)"
+                                                  parent-initiative))))
+                           ("priority" ,(ejira--push-priority-label
+                                         priority-id parent-issue))
+                           ("description" ,(or local-body ""))))
                  (label (cond (is-epic "epic")
                               (parent-epic "task")
                               (t "issue"))))
@@ -1163,19 +1162,6 @@ the heading's Jira priority before re-baselining."
                              :parent-issue parent-issue
                              :fields fields
                              :children children
-                             :payload (ejira--push-payload
-                                       (format "summary: %s" heading-title)
-                                       (format "issue type: %s" issue-type)
-                                       (when parent-epic (format "epic link: %s" parent-epic))
-                                       (when parent-initiative
-                                         (format "parent initiative: %s%s"
-                                                 parent-initiative
-                                                 (if ejira-parent-link-field
-                                                     ""
-                                                   " (preview only — ejira-parent-link-field is nil)")))
-                                       (when priority-id (format "priority id: %s" priority-id))
-                                       "description (Jira markup):"
-                                       desc-markup)
                              :assign-self (list ejira--assign-new-issues)
                              :send (let ((marker marker) (project-key project-key)
                                          (target-id (ejira--creation-target-id marker))
@@ -1274,8 +1260,6 @@ the heading's Jira priority before re-baselining."
                              :title (format "new comment on %s" issue-key)
                              :parent-issue issue-key
                              :preview preview
-                             :payload (when (and body (> (length body) 0))
-                                        (ejira-parser-org-to-jira body))
                              :send (let ((marker marker) (issue-key issue-key)
                                          (body body))
                                      (lambda ()

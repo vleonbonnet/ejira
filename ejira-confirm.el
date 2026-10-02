@@ -18,8 +18,7 @@
 ;;   ▼ TEST  1 modified, 2 new
 ;;     ▼ [x] ✎ Fix the login page  summary, description, 1 new
 ;;         summary:      old title → new title
-;;         ▶ description:  -1 +2 lines, +80 chars
-;;         ▶ payload:      6 lines, sent as is
+;;         ▶ description:  -1 +2 lines, +14 words: login page now…
 ;;         ▶ [x] + subtask: TODO Write the tests  new
 ;;
 ;; C-c C-c pushes the ticked plans, C-c C-k aborts.
@@ -152,8 +151,7 @@ Without FIELDS, PREVIEW becomes a single body field."
 
 (defun ejira-confirm--plan-item (plan)
   "Return the review item for PLAN."
-  (let ((base (list :payload (plist-get plan :payload)
-                    :execute (plist-get plan :send)
+  (let ((base (list :execute (plist-get plan :send)
                     :data plan)))
     (append
      (pcase (plist-get plan :op)

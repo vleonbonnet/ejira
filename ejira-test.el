@@ -106,7 +106,7 @@ For tests that call a plan's :send directly instead of going through
   (let* ((send-a (lambda () 'a))
          (plans (list (list :op 'update :object 'issue :project "TEST" :title "TEST-1"
                             :parent-issue "TEST-1" :changes '(("summary" "Old" "New"))
-                            :payload "summary: New" :send send-a)
+                            :send send-a)
                       (list :op 'create :object 'subtask :project "TEST"
                             :title "new subtask: Child" :parent-issue "TEST-1"
                             :fields '(("title" "Child") ("state" "TODO") ("description" ""))
@@ -126,7 +126,6 @@ For tests that call a plan's :send directly instead of going through
     (should (eq 'modified (plist-get node :kind)))
     (should (equal '((:name "summary" :old "Old" :new "New")) (plist-get node :fields)))
     (should (eq send-a (plist-get node :execute)))
-    (should (equal "summary: New" (plist-get node :payload)))
     (should (= 2 (length children)))
     (should (equal "subtask: TODO Child" (plist-get (car children) :label)))
     (should (eq 'new (plist-get (car children) :kind)))
@@ -1006,8 +1005,7 @@ heading became the default priority in Jira."
             (creates (cl-remove-if-not
                       (lambda (op) (eq 'create (plist-get op :op))) ops))
             (plans (ejira--push-build-plans creates)))
-       (should (string-match-p "priority id: p2"
-                               (plist-get (car plans) :payload)))
+       (should (equal "id p2" (cadr (assoc "priority" (plist-get (car plans) :fields)))))
        (cl-letf (((symbol-function 'jiralib2-create-issue)
                   (lambda (_project _type summary _description &rest args)
                     (push (cons summary
@@ -1027,6 +1025,21 @@ heading became the default priority in Jira."
        (should (equal "p2" (cdr (assoc "New task" created))))
        (should (equal "p3" (cdr (assoc "New child" created))))
        (should (equal "p1" (cdr (assoc "Default task" created))))))))
+
+(ert-deftest ejira-push--priority/label-from-cached-scheme ()
+  "A new issue's priority is reviewed by name when the scheme is cached,
+by id otherwise, and building the label never calls the server."
+  (let ((ejira--priority-scheme-cache (make-hash-table :test #'equal))
+        (jiralib2-url "https://jira.test")
+        (jiralib2--session nil))
+    (cl-letf (((symbol-function 'jiralib2-session-call)
+               (lambda (&rest _) (error "No server call expected"))))
+      (should (equal "id p2" (ejira--push-priority-label "p2" "TEST-1")))
+      (puthash (ejira--priority-scheme-cache-key "TEST-1")
+               ejira-test--priority-scheme ejira--priority-scheme-cache)
+      (should (equal "Medium" (ejira--push-priority-label "p2" "TEST-1")))
+      (should (equal "id p2" (ejira--push-priority-label "p2" nil)))
+      (should (null (ejira--push-priority-label nil "TEST-1"))))))
 
 (defun ejira-test--rewrite-body-of (key)
   "Rewrite the body of the heading whose ID is KEY, as a finalize pull does."
