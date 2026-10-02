@@ -26,7 +26,8 @@
 ;;; Commentary:
 
 ;; Two-directional parser for JIRA markup. For translating org-mode string to
-;; JIRA-format, the ox-jira -module is used directly. Translation in the other
+;; JIRA-format, ox-jira is used through the derived `ejira-jira' backend, which
+;; only overrides what must round-trip (timestamps). Translation in the other
 ;; direction is regexp-based: protected regions (block macros, verbatim) are
 ;; replaced with unique tokens first and restored afterwards, so later rules
 ;; cannot rewrite literal content.
@@ -39,9 +40,185 @@
 (require 'cl-lib)
 (require 'language-detection)
 (require 's)
+(require 'time-date)
 
 (defvar ejira-parser-export-process-underscores t
   "If nil, the parser will not make underscores into anchors.")
+
+;;; Timestamps
+;;
+;; JIRA wiki markup has no date element, so Org timestamps travel as
+;; text in JIRA's own date format -- the one jira.mongodb.org-style
+;; servers show for date fields: `08/Oct/2026', `23/Jun/2026 4:50 PM'.
+;; Ranges join their ends with ` -- ', which JIRA renders as an en dash.
+;; The import turns exactly this format back into inactive Org
+;; timestamps (JIRA cannot tell active from inactive).  Timestamps JIRA
+;; cannot express -- repeaters, warning delays, diary sexps -- travel as
+;; their Org text, brackets escaped, and import back unchanged.
+
+(defconst ejira-parser--jira-months
+  ["Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"]
+  "Month abbreviations of JIRA's date format, independent of the locale.")
+
+(defconst ejira-parser--jira-date-re
+  (concat "[0-3][0-9]/"
+          (regexp-opt (append ejira-parser--jira-months nil))
+          "/[0-9]\\{4\\}")
+  "Regexp matching a JIRA date such as 08/Oct/2026.")
+
+(defconst ejira-parser--jira-time-re
+  "[01]?[0-9]:[0-5][0-9] [AP]M"
+  "Regexp matching a JIRA time of day such as 4:50 PM.")
+
+(defconst ejira-parser--jira-timestamp-re
+  (let ((date ejira-parser--jira-date-re)
+        (time ejira-parser--jira-time-re))
+    (concat "\\b" date "\\(?: " time "\\)?"
+            "\\(?: -- \\(?:" date "\\(?: " time "\\)?\\|" time "\\)\\)?"
+            "\\b"))
+  "Regexp matching a JIRA date, date and time, or range of them.")
+
+(defun ejira-parser--jira-time (hour minute)
+  "Format HOUR and MINUTE as a JIRA time of day: 4:50 PM."
+  (format "%d:%02d %s"
+          (let ((h (% hour 12))) (if (= h 0) 12 h))
+          minute
+          (if (< hour 12) "AM" "PM")))
+
+(defun ejira-parser--jira-date (year month day &optional hour minute)
+  "Format YEAR MONTH DAY, and HOUR MINUTE when given, as a JIRA date."
+  (concat (format "%02d/%s/%04d" day (aref ejira-parser--jira-months (1- month)) year)
+          (when hour (concat " " (ejira-parser--jira-time hour minute)))))
+
+(defun ejira-parser--export-timestamp (timestamp _contents _info)
+  "Transcode the Org TIMESTAMP object into JIRA's date format.
+See the Timestamps section of ejira-parser.el."
+  (let ((type (org-element-property :type timestamp)))
+    (if (or (eq type 'diary)
+            (org-element-property :repeater-type timestamp)
+            (org-element-property :warning-type timestamp))
+        ;; No JIRA equivalent: the Org text, with `[' escaped so JIRA
+        ;; never reads it as a link; the import consumes the escape.
+        (replace-regexp-in-string
+         "\\[" "\\[" (org-element-property :raw-value timestamp) t t)
+      (let* ((get (lambda (p) (org-element-property p timestamp)))
+             (start (list (funcall get :year-start) (funcall get :month-start)
+                          (funcall get :day-start)))
+             (end (list (funcall get :year-end) (funcall get :month-end)
+                        (funcall get :day-end)))
+             (start-text (apply #'ejira-parser--jira-date
+                                (append start
+                                        (when (funcall get :hour-start)
+                                          (list (funcall get :hour-start)
+                                                (funcall get :minute-start)))))))
+        (cond
+         ((not (memq type '(active-range inactive-range)))
+          start-text)
+         ;; Same-day time range: 08/Oct/2026 10:00 AM -- 11:00 AM.
+         ((and (equal start end) (funcall get :hour-end))
+          (concat start-text " -- "
+                  (ejira-parser--jira-time (funcall get :hour-end)
+                                           (funcall get :minute-end))))
+         (t
+          (concat start-text " -- "
+                  (apply #'ejira-parser--jira-date
+                         (append end
+                                 (when (funcall get :hour-end)
+                                   (list (funcall get :hour-end)
+                                         (funcall get :minute-end))))))))))))
+
+(defun ejira-parser--parse-jira-date (s)
+  "Parse the JIRA date S (08/Oct/2026) into (YEAR MONTH DAY), or nil.
+Return nil for a date that does not exist, such as 31/Feb/2026."
+  (when (string-match "\\`\\([0-9]+\\)/\\([A-Za-z]+\\)/\\([0-9]+\\)\\'" s)
+    (let ((day (string-to-number (match-string 1 s)))
+          (month (1+ (or (cl-position (match-string 2 s) ejira-parser--jira-months
+                                      :test #'equal)
+                         -1)))
+          (year (string-to-number (match-string 3 s))))
+      (when (and (>= month 1) (>= day 1)
+                 (<= day (date-days-in-month year month)))
+        (list year month day)))))
+
+(defun ejira-parser--parse-jira-time (s)
+  "Parse the JIRA time S (4:50 PM) into (HOUR MINUTE), or nil."
+  (when (string-match "\\`\\([0-9]+\\):\\([0-9]+\\) \\([AP]M\\)\\'" s)
+    (let ((hour (string-to-number (match-string 1 s)))
+          (minute (string-to-number (match-string 2 s)))
+          (pm (equal (match-string 3 s) "PM")))
+      (when (<= 1 hour 12)
+        (list (+ (% hour 12) (if pm 12 0)) minute)))))
+
+(defun ejira-parser--org-date (date &optional time)
+  "Return the Org date text for DATE (YEAR MONTH DAY) and TIME (HOUR MINUTE).
+Without brackets: `2026-10-08 Thu' or `2026-10-08 Thu 16:50'."
+  (pcase-let ((`(,year ,month ,day) date))
+    (concat (format-time-string "%Y-%m-%d %a"
+                                (encode-time (list 0 0 12 day month year nil nil nil)))
+            (when time (apply #'format " %02d:%02d" time)))))
+
+(defun ejira-parser--jira-timestamp-to-org (text)
+  "Convert the JIRA date or range TEXT into an inactive Org timestamp.
+Return TEXT unchanged when it names a date that does not exist."
+  (let* ((halves (split-string text " -- "))
+         (parse (lambda (half)
+                  ;; (DATE TIME), either possibly nil.
+                  (if (string-match (concat "\\`\\(" ejira-parser--jira-date-re "\\)"
+                                            "\\(?: \\(.*\\)\\)?\\'")
+                                    half)
+                      (let ((time-text (match-string 2 half)))
+                        (list (ejira-parser--parse-jira-date (match-string 1 half))
+                              (and time-text (ejira-parser--parse-jira-time time-text))))
+                    (list nil (ejira-parser--parse-jira-time half)))))
+         (start (funcall parse (car halves)))
+         (end (and (cdr halves) (funcall parse (cadr halves)))))
+    (cond
+     ((null (car start)) text)
+     ((null end)
+      (format "[%s]" (ejira-parser--org-date (car start) (cadr start))))
+     ;; Same-day time range: [2026-10-08 Thu 10:00-11:00].
+     ((and (null (car end)) (cadr start) (cadr end))
+      (format "[%s-%02d:%02d]"
+              (ejira-parser--org-date (car start) (cadr start))
+              (car (cadr end)) (cadr (cadr end))))
+     ((car end)
+      (format "[%s]--[%s]"
+              (ejira-parser--org-date (car start) (cadr start))
+              (ejira-parser--org-date (car end) (cadr end))))
+     (t text))))
+
+(defun ejira-parser-inactivate-timestamps (s)
+  "Return Org text S with its active timestamps made inactive.
+Only the timestamps that travel as JIRA dates are changed (repeaters,
+warning delays and diary sexps travel as their Org text and keep their
+brackets).  JIRA cannot tell active from inactive, so a body compares
+equal to its JIRA copy exactly when the two agree after this."
+  (if (not (string-match-p "<[0-9]\\{4\\}-" s))
+      s
+    (with-temp-buffer
+      (let ((tab-width 8))
+        (insert s)
+        (delay-mode-hooks (org-mode))
+        (let (stamps)
+          (org-element-map (org-element-parse-buffer) 'timestamp
+            (lambda (ts)
+              (when (and (memq (org-element-property :type ts) '(active active-range))
+                         (not (org-element-property :repeater-type ts))
+                         (not (org-element-property :warning-type ts)))
+                (push ts stamps))))
+          ;; Last first, so earlier positions stay valid.
+          (dolist (ts stamps)
+            (let* ((beg (org-element-property :begin ts))
+                   (raw (org-element-property :raw-value ts))
+                   (end (+ beg (length raw))))
+              (goto-char beg)
+              (delete-region beg end)
+              (insert (replace-regexp-in-string
+                       ">" "]" (replace-regexp-in-string "<" "[" raw t t) t t)))))
+        (buffer-string)))))
+
+(org-export-define-derived-backend 'ejira-jira 'jira
+  :translate-alist '((timestamp . ejira-parser--export-timestamp)))
 
 (defvar ejira-parser-failure-function #'ejira-parser--report-failure
   "Function called with the original JIRA markup when conversion fails.
@@ -323,6 +500,13 @@ new top-level construct.  Indented continuation lines do not reset."
                (match-string 0)
              (concat "=" content "=")))))
 
+    ;; JIRA date, date and time, or a range of them: an inactive Org
+    ;; timestamp.  After inline verbatim, so dates in code spans stay
+    ;; literal.  See the Timestamps section above.
+    (ejira-parser--jira-timestamp-re
+     . (lambda ()
+         (ejira-parser--jira-timestamp-to-org (match-string 0))))
+
     ;; JIRA checkbox emoticons, before the list rule can eat the marker.
     ;; ox-jira writes (/) for checked, (i) for partial, (x) for unchecked.
     ("^ ?\\([#*]+\\) \\(([/x!i?])\\|(on)\\|(off)\\|(\\*)\\) "
@@ -447,7 +631,8 @@ new top-level construct.  Indented continuation lines do not reset."
      . (lambda () "-----"))
 
     )
-  "Regular expression - replacement pairs used in parsing JIRA markup.")
+  "Regular expression - replacement pairs used in parsing JIRA markup.
+A pattern is a regexp string, or a variable whose value is one.")
 
 (defun ejira-parser-org-to-jira (s &optional level)
   "Transform org-style string S into JIRA format.
@@ -465,10 +650,10 @@ files or run local code into a JIRA field."
         (ox-jira-override-headline-offset
          (if (numberp level) (- level) ox-jira-override-headline-offset)))
     (if ejira-parser-export-process-underscores
-        (org-export-string-as (ejira-parser--strip-include-keywords s) 'jira t)
+        (org-export-string-as (ejira-parser--strip-include-keywords s) 'ejira-jira t)
       (org-export-string-as
        (concat "#+OPTIONS: ^:nil\n" (ejira-parser--strip-include-keywords s))
-       'jira t))))
+       'ejira-jira t))))
 
 (defun ejira-parser--strip-include-keywords (s)
   "Remove #+INCLUDE keywords from S."
@@ -525,7 +710,10 @@ case `ejira-parser-error' is signalled instead."
             (cl-loop
              for (pattern . replacement) in ejira-parser-patterns do
              (goto-char (point-min))
-             (while (re-search-forward pattern nil t)
+             (while (re-search-forward (if (symbolp pattern)
+                                           (symbol-value pattern)
+                                         pattern)
+                                       nil t)
                (let ((identifier (random-identifier 32))
                      ;; A replacement function may search or match
                      ;; strings; the `replace-match' below needs this

@@ -176,6 +176,8 @@ Shallow pulls (=ejira-auto-pull-shallow=) only ever acknowledge the state they f
 
 =M-x ejira-sync-audit= compares each auto-sync file with Jira without changing anything: summary, description, state, priority and comments of every issue, classified as identical, local-newer, remote-newer, both-changed, unknown-baseline, unconvertible or missing-in-jira, plus Jira children missing locally and TODO headings with no Jira identity.  Use it after any bulk change and as a periodic health check.
 
+Org timestamps travel as JIRA dates, the format JIRA shows for date fields: =[2026-10-08 Thu]= exports as =08/Oct/2026=, =[2026-06-23 Tue 16:50]= as =23/Jun/2026 4:50 PM=, and a range joins its ends with =--= (rendered as an en dash).  Exactly that format imports back as inactive timestamps; JIRA cannot tell active from inactive, so comparisons ignore the difference.  Repeaters, warning delays and diary sexps have no JIRA equivalent and travel as their Org text.  Other date spellings in JIRA (=2026-10-08=, =Oct 8, 2026=) are left as written.
+
 =ejira-parser-browse-links-as-id= imports =[label|<jiralib2-url>/browse/KEY]= links as =[[id:KEY][label]]=, for Org files that reference issues by their ejira heading IDs; pair it with an exporter that writes those links back as browse URLs.
 
 *** Agenda & Boards

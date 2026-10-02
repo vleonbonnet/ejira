@@ -481,7 +481,8 @@ thousands of issues, and remote-only issues have nothing to repair."
                  ;; Never re-render into raw markup: report it as dirty
                  ;; (needs attention) instead.
                  ((eq expected :unconvertible) (push key dirty))
-                 ((and (equal (string-trim current) (string-trim expected))
+                 ((and (equal (string-trim (ejira-parser-inactivate-timestamps current))
+                              (string-trim expected))
                        (ejira--body-shape-canonical-p current))
                   (cl-incf unchanged))
                  (t
@@ -972,9 +973,10 @@ ways rather than by index alone."
 Drops what the Jira export cannot carry or renders equivalently, so the
 audit reports content differences only: drawers (a LOGBOOK under a
 description subheading is never exported), blank lines (the exporter
-separates every element with one), and the brackets of a bare link
-\\=(a plain URL exports as [url] and imports as [[url]])."
-  (let ((s (ejira--push-normalize s)))
+separates every element with one), the brackets of a bare link
+\\=(a plain URL exports as [url] and imports as [[url]]), and whether a
+timestamp is active (JIRA dates import as inactive timestamps)."
+  (let ((s (ejira--push-normalize (ejira-parser-inactivate-timestamps (or s "")))))
     (setq s (replace-regexp-in-string
              "^[ \t]*:[A-Za-z_]+:[ \t]*\n\\(?:.*\n\\)*?[ \t]*:END:[ \t]*$" "" s))
     (setq s (replace-regexp-in-string "\\[\\[\\(https?://[^]\n]+\\)\\]\\]" "\\1" s))

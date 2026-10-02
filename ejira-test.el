@@ -1587,6 +1587,78 @@ line indent; emitting it would make every saved body compare modified."
   "JIRA's four-dash rule becomes Org's five-dash rule."
   (should (equal "-----" (ejira-test--parse "----"))))
 
+(ert-deftest ejira-parser/timestamps-export-as-jira-dates ()
+  "Org timestamps export in JIRA's date format, ranges joined by ` -- '.
+Regression: ox-jira wrote `_\\[2026-10-08 Thu] _', a broken italic span
+whose range half rendered as a dead link."
+  (dolist (case '(("[2026-10-08 Thu]" . "08/Oct/2026")
+                  ("<2026-10-08 Thu>" . "08/Oct/2026")
+                  ("[2026-06-23 Tue 16:50]" . "23/Jun/2026 4:50 PM")
+                  ("[2026-06-23 Tue 00:05]" . "23/Jun/2026 12:05 AM")
+                  ("[2026-06-23 Tue 12:00]" . "23/Jun/2026 12:00 PM")
+                  ("[2026-09-24 Thu]--[2026-10-08 Thu]" . "24/Sep/2026 -- 08/Oct/2026")
+                  ("[2026-09-24 Thu 09:00]--[2026-10-08 Thu 17:30]"
+                   . "24/Sep/2026 9:00 AM -- 08/Oct/2026 5:30 PM")
+                  ("<2026-10-08 Thu 10:00-11:00>" . "08/Oct/2026 10:00 AM -- 11:00 AM")
+                  ;; No JIRA equivalent: the Org text, `[' escaped.
+                  ("<2026-10-08 Thu +1w>" . "<2026-10-08 Thu +1w>")
+                  ("[2026-10-08 Thu -2d]" . "\\[2026-10-08 Thu -2d]")
+                  ("<%%(diary-float t 4 2)>" . "<%%(diary-float t 4 2)>")))
+    (should (equal (cdr case)
+                   (string-trim (ejira-parser-org-to-jira (car case))))))
+  ;; Surrounding text keeps its spacing: no blank inside or lost after.
+  (should (equal "Proposed checkpoint 08/Oct/2026 following observation 24/Sep/2026 -- 08/Oct/2026."
+                 (string-trim
+                  (ejira-parser-org-to-jira
+                   "Proposed checkpoint [2026-10-08 Thu] following observation [2026-09-24 Thu]--[2026-10-08 Thu].")))))
+
+(ert-deftest ejira-parser/jira-dates-import-as-timestamps ()
+  "JIRA-format dates import as inactive Org timestamps; nothing else does."
+  (dolist (case '(("08/Oct/2026" . "[2026-10-08 Thu]")
+                  ("23/Jun/2026 4:50 PM" . "[2026-06-23 Tue 16:50]")
+                  ("23/Jun/2026 12:05 AM" . "[2026-06-23 Tue 00:05]")
+                  ("24/Sep/2026 -- 08/Oct/2026" . "[2026-09-24 Thu]--[2026-10-08 Thu]")
+                  ("24/Sep/2026 9:00 AM -- 08/Oct/2026 5:30 PM"
+                   . "[2026-09-24 Thu 09:00]--[2026-10-08 Thu 17:30]")
+                  ("08/Oct/2026 10:00 AM -- 11:00 AM" . "[2026-10-08 Thu 10:00-11:00]")
+                  ;; Raw Org text of a repeater comes back unchanged.
+                  ("\\[2026-10-08 Thu -2d]" . "[2026-10-08 Thu -2d]")
+                  ;; Not JIRA's format, or not a date: left as written.
+                  ("2026-10-08" . "2026-10-08")
+                  ("Oct 8, 2026" . "Oct 8, 2026")
+                  ("31/Feb/2026" . "31/Feb/2026")
+                  ("x08/Oct/2026" . "x08/Oct/2026")
+                  ("{{08/Oct/2026}}" . "=08/Oct/2026=")))
+    (should (equal (cdr case) (string-trim (ejira-test--parse (car case)))))))
+
+(ert-deftest ejira-parser/timestamps-roundtrip ()
+  "An Org body with timestamps survives export and import unchanged,
+active timestamps coming back inactive."
+  (let ((org "Proposed checkpoint [2026-10-08 Thu] following actual pilot observation [2026-09-24 Thu]--[2026-10-08 Thu].\n\nCall at [2026-06-23 Tue 16:50], meeting [2026-10-08 Thu 10:00-11:00], weekly <2026-10-08 Thu +1w>.\n"))
+    (should (equal (string-trim org)
+                   (string-trim (ejira-parser-jira-to-org
+                                 (ejira-parser-org-to-jira org))))))
+  (should (equal "[2026-10-08 Thu]"
+                 (string-trim (ejira-parser-jira-to-org
+                               (ejira-parser-org-to-jira "<2026-10-08 Thu>"))))))
+
+(ert-deftest ejira-parser/inactivate-timestamps ()
+  "Active timestamps that travel as JIRA dates become inactive; the rest stay."
+  (should (equal "a [2026-10-08 Thu] b [2026-10-08 Thu 10:00-11:00] c [2026-09-24 Thu]--[2026-10-08 Thu] d <2026-10-08 Thu +1w> e [2026-10-09 Fri]"
+                 (ejira-parser-inactivate-timestamps
+                  "a <2026-10-08 Thu> b <2026-10-08 Thu 10:00-11:00> c <2026-09-24 Thu>--<2026-10-08 Thu> d <2026-10-08 Thu +1w> e [2026-10-09 Fri]")))
+  (should (equal "no stamp" (ejira-parser-inactivate-timestamps "no stamp"))))
+
+(ert-deftest ejira-push/active-timestamp-is-not-a-description-change ()
+  "A body whose only difference from Jira is an active timestamp (which
+JIRA cannot carry) builds no description change."
+  (should (equal "Due <2026-10-08 Thu>."
+                 (ejira--remote-body-for-diff "Due [2026-10-08 Thu]." "Due <2026-10-08 Thu>.")))
+  (should (equal "Due [2026-10-09 Fri]."
+                 (ejira--remote-body-for-diff "Due [2026-10-09 Fri]." "Due <2026-10-08 Thu>.")))
+  (should (equal (ejira--audit-normalize "Due [2026-10-08 Thu].")
+                 (ejira--audit-normalize "Due <2026-10-08 Thu>."))))
+
 (ert-deftest ejira-parser/unwraps-prose-paragraphs ()
   "JIRA's hard-wrapped prose becomes long Org lines.
 A prose guard rejects wrapped paragraphs on commit, and ox-jira

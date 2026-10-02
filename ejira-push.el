@@ -788,7 +788,9 @@ the heading's Jira priority before re-baselining."
                  (changes (let ((base-changes
                                  (ejira-confirm-field-changes
                                   `(("summary"     ,remote-summary ,local-summary)
-                                    ("description" ,(or remote-desc-org "") ,local-desc-org)
+                                    ("description" ,(ejira--remote-body-for-diff
+                                                     (or remote-desc-org "") local-desc-org)
+                                     ,local-desc-org)
                                     ("assignee"    ,remote-assignee ,local-assignee)
                                     ("deadline"    ,(or remote-deadline "") ,(or local-deadline ""))
                                     ,@(when (and local-state remote-status-name
@@ -949,7 +951,9 @@ the heading's Jira priority before re-baselining."
                  (reviewed-hash (org-with-point-at marker
                                   (md5 (ejira--heading-reviewed-hash))))
                  (changes (ejira-confirm-field-changes
-                           `(("body" ,(or remote-org "") ,local-body)))))
+                           `(("body" ,(ejira--remote-body-for-diff
+                                       (or remote-org "") local-body)
+                              ,local-body)))))
             (when changes
               (setq plan (list :op 'update
                                :object 'comment

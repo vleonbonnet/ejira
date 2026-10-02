@@ -1843,6 +1843,17 @@ into the same region."
             (delete-region (car region) (cdr region))
             body))))))
 
+(defun ejira--remote-body-for-diff (remote local)
+  "Return REMOTE, or LOCAL when they differ only in what JIRA cannot carry.
+REMOTE is a JIRA body converted to Org, LOCAL the Org body.  JIRA
+cannot tell active timestamps from inactive ones, so a LOCAL active
+timestamp that comes back inactive is not a change to push."
+  (let ((norm (lambda (s) (string-trim (replace-regexp-in-string "\r" "" (or s ""))))))
+    (if (equal (funcall norm (ejira-parser-inactivate-timestamps (or local "")))
+               (funcall norm remote))
+        local
+      remote)))
+
 (defun ejira--expected-jira-description (heading content)
   "Return local Org text expected from Jira markup CONTENT at HEADING.
 
