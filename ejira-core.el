@@ -572,6 +572,22 @@ Jira identity so a later refresh can retry the mapping safely."
       (org-delete-property ejira-priority-name-property)
       (org-delete-property ejira-priority-rank-property))))
 
+(defun ejira--record-priority-identity (priority)
+  "Record PRIORITY as the Jira priority of the heading at point.
+PRIORITY is a plist with :id, :name and :rank, the priority Jira holds
+once a push has succeeded.  The Org cookie is left as it is: it is the
+local edit that produced PRIORITY.  Without this, a pushed cookie edit
+keeps disagreeing with the stored rank and the heading stays dirty
+forever (see `ejira--priority-cookie-modified-p')."
+  (when-let* ((id (plist-get priority :id)))
+    (org-set-property ejira-priority-id-property (ejira--priority-id-string id))
+    (if-let* ((name (plist-get priority :name)))
+        (org-set-property ejira-priority-name-property name)
+      (org-delete-property ejira-priority-name-property))
+    (if-let* ((rank (plist-get priority :rank)))
+        (org-set-property ejira-priority-rank-property (number-to-string rank))
+      (org-delete-property ejira-priority-rank-property))))
+
 (defun ejira--local-priority-entry (marker scheme &optional project)
   "Return the Jira priority entry represented by MARKER, or nil.
 Headings without `JiraPriorityId' are legacy data and deliberately do not

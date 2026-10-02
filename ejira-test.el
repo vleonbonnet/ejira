@@ -618,6 +618,73 @@ Comment body.
            (should (equal '("TEST-1" (priority . ((id . "p3"))))
                           update-args))))))))
 
+(defmacro ejira-test--with-cookie-edit (remote-priority &rest body)
+  "Run BODY on a clean TEST-1 heading whose cookie was edited to [#1].
+The heading's stored Jira priority is Low (p3, rank 3); Jira holds
+REMOTE-PRIORITY.  Binds MARKER and PLANS (built from the heading)."
+  (declare (indent 1))
+  `(let ((org-priority-highest 1)
+         (org-priority-lowest 8)
+         (org-lowest-priority 8)
+         (ejira-priority-policies ejira-test--priority-policies)
+         (ejira-todo-states-alist '(("Open" . 1)))
+         (remote-item
+          '((key . "TEST-1")
+            (fields . ((summary . "Issue")
+                       (description . "")
+                       (assignee . nil)
+                       (priority . ,remote-priority)
+                       (duedate . nil)
+                       (status . ((name . "Open"))))))))
+     (ejira-test--with-org-buf
+      "* TODO [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:JiraPriorityId: p3\n:JiraPriorityName: Low\n:JiraPriorityRank: 3\n:Status: Open\n:END:\n** Description\n"
+      (let ((marker (progn (goto-char (point-min))
+                           (re-search-forward org-heading-regexp)
+                           (point-marker))))
+        (org-with-point-at marker
+          (ejira--migrate-push-baseline)
+          (should-not (ejira--locally-modified-p))
+          (org-priority 1)
+          (should (ejira--locally-modified-p)))
+        (cl-letf (((symbol-function 'jiralib2-jql-search)
+                   (lambda (&rest _args) (list remote-item)))
+                  ((symbol-function 'ejira--get-priority-scheme)
+                   (lambda (&rest _args) ejira-test--priority-scheme))
+                  ((symbol-function 'ejira--save-buffer-safe) #'ignore))
+          (let ((plans (ejira--push-build-plans
+                        (list (list :op 'update :object 'issue :key "TEST-1"
+                                    :project "TEST" :parent-issue "TEST-1"
+                                    :marker marker :data nil)))))
+            ,@body))))))
+
+(ert-deftest ejira-push--priority/pushed-cookie-edit-is-acknowledged ()
+  "After a pushed cookie edit the heading records Jira's new priority and
+is clean.  Regression: the stored rank kept the old value, so the
+heading stayed dirty forever and every later remote edit was held as a
+conflict."
+  (ejira-test--with-cookie-edit ((id . "p3") (name . "Low"))
+    (let ((sent nil))
+      (should (= 1 (length plans)))
+      (cl-letf (((symbol-function 'jiralib2-update-issue)
+                 (lambda (key &rest args) (push (cons key args) sent))))
+        (ejira-test--as-confirmed (funcall (plist-get (car plans) :send))))
+      (should (equal '(("TEST-1" (priority . ((id . "p1"))))) sent))
+      (org-with-point-at marker
+        (should (equal "p1" (org-entry-get nil "JiraPriorityId")))
+        (should (equal "High" (org-entry-get nil "JiraPriorityName")))
+        (should (equal "1" (org-entry-get nil "JiraPriorityRank")))
+        (should-not (ejira--locally-modified-p))))))
+
+(ert-deftest ejira-push--priority/cookie-edit-matching-jira-is-acknowledged ()
+  "A cookie edit Jira already matches builds no plan and leaves the
+heading clean, with Jira's priority recorded."
+  (ejira-test--with-cookie-edit ((id . "p1") (name . "High"))
+    (should (null plans))
+    (org-with-point-at marker
+      (should (equal "p1" (org-entry-get nil "JiraPriorityId")))
+      (should (equal "1" (org-entry-get nil "JiraPriorityRank")))
+      (should-not (ejira--locally-modified-p)))))
+
 (ert-deftest ejira-push--priority/legacy-cookie-is-not-inferred ()
   "A dirty legacy heading can still push state without an inferred priority."
   (let ((org-priority-highest 1)

@@ -365,14 +365,17 @@ parent's assign-self cell."
   (let ((parts (delq nil parts)))
     (when parts (string-join parts "\n"))))
 
-(defun ejira--push-finalize (marker &optional reviewed-hash remote-identity)
+(defun ejira--push-finalize (marker &optional reviewed-hash remote-identity
+                                    priority)
   "Refresh MARKER's push baseline after a successful push and save its buffer.
 
 With REVIEWED-HASH, re-baseline only when the heading still matches the
 state that was reviewed and sent; content edited while the confirmation
 was open was never sent, and keeps the heading dirty so the next save
 re-reviews it.  With REMOTE-IDENTITY, also record the acknowledged
-remote field state for three-way reconciliation."
+remote field state for three-way reconciliation.  With PRIORITY, a
+plist (:id :name :rank) of the priority Jira now holds, record it as
+the heading's Jira priority before re-baselining."
   (org-with-point-at marker
     (if (and reviewed-hash
              (not (equal reviewed-hash
@@ -382,6 +385,8 @@ remote field state for three-way reconciliation."
       (when remote-identity
         (org-set-property ejira-remote-hash-property
                           (md5 remote-identity)))
+      (when priority
+        (ejira--record-priority-identity priority))
       (ejira--update-push-baseline)))
   (let ((ejira--pushing t))
     (with-current-buffer (marker-buffer marker)
@@ -730,6 +735,16 @@ remote field state for three-way reconciliation."
                   (ejira--local-priority-entry marker priority-scheme project))
                  (local-priority-id (plist-get local-priority-entry :id))
                  (local-priority-name (plist-get local-priority-entry :name))
+                 ;; The priority Jira holds after a successful push (sent
+                 ;; or already equal), recorded on the heading by
+                 ;; finalization so a pushed cookie edit stops looking dirty.
+                 (local-priority
+                  (when local-priority-id
+                    (list :id local-priority-id
+                          :name local-priority-name
+                          :rank (ejira--priority-rank priority-scheme
+                                                      local-priority-id
+                                                      project))))
                  (local-deadline (when-let ((d (org-get-deadline-time marker)))
                                    (format-time-string "%Y-%m-%d" d)))
                  (remote-summary (when item (ejira--alist-get item 'fields 'summary)))
@@ -857,6 +872,7 @@ remote field state for three-way reconciliation."
                                         (desc-level desc-level)
                                         (local-assignee local-assignee)
                                         (local-priority-id local-priority-id)
+                                        (local-priority local-priority)
                                         (local-deadline local-deadline)
                                         (local-state local-state)
                                         (todo-kws todo-kws)
@@ -891,13 +907,17 @@ remote field state for three-way reconciliation."
                                       (when state-changed
                                         (ejira--transition-to-org-state key local-state todo-kws))
                                       (ejira--push-finalize marker reviewed-hash
-                                                            sent-identity))))
+                                                            sent-identity local-priority))))
                       plans)
               ;; No changes vs remote — re-baseline to clear the dirty hash
               ;; and record the remote fields as the new acknowledged state.
+              ;; A cookie edit that already matches Jira's priority is
+              ;; acknowledged too, or the heading would stay dirty.
               (when item
                 (org-with-point-at marker
                   (ejira--store-remote-baseline item)
+                  (when local-priority
+                    (ejira--record-priority-identity local-priority))
                   (ejira--migrate-push-baseline))))))))
     (dolist (op (nreverse other-ops))
       (let* ((op-type (plist-get op :op))
