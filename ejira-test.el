@@ -2401,6 +2401,30 @@ review buffer.  Regression: the cycle pushed updates unattended."
      (should (member "new comment on TEST-1" shown))
      (should (>= (ejira-auto-sync-held-count) 3)))))
 
+(ert-deftest ejira-projects/only-listed-projects-sync ()
+  "Headings of projects outside `ejira-projects' are neither reconciled,
+discovered nor pushed, wherever they live.
+Regression: removing a project from the list left its headings syncing
+whenever their file was saved."
+  (let ((ejira-projects '("TEST")))
+    (should (ejira--synced-key-p "TEST-1"))
+    (should-not (ejira--synced-key-p "OTHER-1"))
+    (ejira-test--with-org-buf
+     (concat "* TODO Synced\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n:Pushhash: stale\n:END:\n"
+             "* TODO Not synced\n:PROPERTIES:\n:ID:       OTHER-1\n:TYPE:     ejira-issue\n:Pushhash: stale\n:END:\n"
+             "** TODO New child of an unsynced issue\n"
+             "** Comments\n*** A remark on an unsynced issue\n")
+     (should (equal '("TEST-1") (ejira--buffer-issue-keys)))
+     (should (equal '(("TEST-1" . "ejira-issue")) (ejira--buffer-issue-types)))
+     (let ((pushes (cl-remove-if (lambda (op) (eq (plist-get op :op) 'blocked))
+                                 (ejira-test--scan-current))))
+       (should (equal '(("TEST-1" . "TEST"))
+                      (mapcar (lambda (op) (cons (plist-get op :key) (plist-get op :project)))
+                              pushes))))))
+  ;; Without a list, every project syncs.
+  (let ((ejira-projects nil))
+    (should (ejira--synced-key-p "OTHER-1"))))
+
 (ert-deftest ejira-hourlog/commit-goes-through-review ()
   "Worklogs are offered in the review buffer, never sent directly."
   (require 'ejira-hourmarking)

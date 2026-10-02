@@ -170,6 +170,7 @@ Every Org file ejira tracks reconciles itself: the project files in =ejira-org-d
 - Saving the file in Emacs runs the cycle at once and opens the review buffer for every local change and for issues changed on both sides or without a remote baseline.  A cycle caused by an external change (git, another editor, an agent) only updates the count; =M-x ejira-auto-sync-review=, or =mouse-1= on the indicator, reviews them (=mouse-3= shows the log).
 - =ejira-auto-sync-discover= (=unresolved= or =all=) imports Jira issues of =ejira-projects= whose epic or parent is an issue of the file but which the file does not contain yet, directly under their parent.
 - A TODO heading with no Jira ancestor is a local task: it is neither created nor counted as held.
+- Only issues of =ejira-projects= sync.  A heading of another project is neither pulled, pushed nor used for discovery, wherever it lives; removing a project from the list stops its sync even in files that still hold its headings.
 
 Shallow pulls (=ejira-auto-pull-shallow=) only ever acknowledge the state they fetched, and leave a heading with pending local edits untouched.
 

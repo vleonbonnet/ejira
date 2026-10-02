@@ -747,7 +747,8 @@ Callers decide that FILE auto-syncs (`ejira--auto-sync-file-p')."
   "Return the issue keys of all ejira-managed headings in the buffer.
 Unlike `ejira--local-todo-keys' this covers every outline depth and
 also terminal issues (DONE/CANCELED), which can still carry local
-pushes; project headings and comments are excluded."
+pushes; project headings and comments are excluded.  So are issues
+of projects outside `ejira-projects': ejira does not sync them."
   (let (keys)
     (org-with-wide-buffer
      (goto-char (point-min))
@@ -755,6 +756,7 @@ pushes; project headings and comments are excluded."
        (let ((id (org-entry-get nil "ID")))
          (when (and id
                     (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" id)
+                    (ejira--synced-key-p id)
                     (not (equal (org-entry-get nil "TYPE") "ejira-comment")))
            (push id keys)))))
     (nreverse (delete-dups keys))))
@@ -861,7 +863,8 @@ file already holds.
                  (const :tag "All children" all)))
 
 (defun ejira--buffer-issue-types ()
-  "Return an alist (KEY . TYPE) of the ejira issue headings in the buffer."
+  "Return an alist (KEY . TYPE) of the ejira issue headings in the buffer.
+Issues of projects outside `ejira-projects' are left out."
   (let (res)
     (org-with-wide-buffer
      (goto-char (point-min))
@@ -870,6 +873,7 @@ file already holds.
              (type (org-entry-get nil "TYPE")))
          (when (and id type
                     (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" id)
+                    (ejira--synced-key-p id)
                     (member type '("ejira-issue" "ejira-story"
                                    "ejira-subtask" "ejira-epic")))
            (push (cons id type) res)))))

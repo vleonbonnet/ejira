@@ -2050,11 +2050,18 @@ runs first."
           m))))
 
 
-(defun ejira--synced-key-p (key)
-  "Return non-nil when issue KEY belongs to one of `ejira-projects'.
+(defun ejira--synced-project-p (project)
+  "Return non-nil when PROJECT is one of `ejira-projects'.
 With no `ejira-projects' configured every project counts as synced."
   (or (null ejira-projects)
-      (member (car (split-string key "-")) ejira-projects)))
+      (and project (member project ejira-projects) t)))
+
+(defun ejira--synced-key-p (key)
+  "Return non-nil when issue KEY belongs to one of `ejira-projects'.
+With no `ejira-projects' configured every project counts as synced.
+Issues of other projects are neither pulled, pushed nor discovered,
+wherever their headings live."
+  (ejira--synced-project-p (car (split-string key "-"))))
 
 (defun ejira--issue-known-p (key)
   "Return non-nil when issue KEY has a local heading.

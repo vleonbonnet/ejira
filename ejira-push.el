@@ -675,7 +675,13 @@ the heading's Jira priority before re-baselining."
                                    :data (list :issue-key issue-key))
                              ops))))))
              (goto-char (line-end-position))))
-         (nreverse ops))))))
+         ;; Only projects ejira syncs: a heading of another project is
+         ;; never pushed, wherever it lives.  Blocked ops carry no project
+         ;; and are kept for reporting.
+         (cl-remove-if (lambda (op)
+                         (and (not (eq (plist-get op :op) 'blocked))
+                              (not (ejira--synced-project-p (plist-get op :project)))))
+                       (nreverse ops)))))))
 
 (defun ejira--push-scan-all ()
   "Scan all ejira-managed org files for pending operations."
