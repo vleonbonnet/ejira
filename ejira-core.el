@@ -855,6 +855,10 @@ converted to Org; callers hold the issue and report it."
                                         (ejira--parse-item
                                          (jiralib2-get-issue issue-key)))
 
+    ;; The fetch above may have waited on Jira while a file changed.
+    (unless (ejira-task-p issue-key)
+      (ejira--refresh-buffers))
+
     (let ((org-type (cond ((equal type ejira-epic-type-name) 'ejira-epic)
                           ((equal type ejira-story-type-name) 'ejira-story)
                           ((equal type ejira-subtask-type-name) 'ejira-subtask)
@@ -2203,20 +2207,317 @@ stale index misses, through `ejira--find-heading'."
         (dolist (id stale-ids)
           (remhash id ejira--heading-cache))))))
 
-(defun ejira--save-buffer-safe ()
-  "Save the current buffer unless the file changed on disk since it was visited.
+;;; Durable sync edits
+;;
+;; Invariant: every edit ejira makes to a file either reaches the file
+;; or is discarded on purpose because the next sync recomputes it from
+;; Jira.  ejira never leaves a buffer holding its own unsaved edits.  A
+;; buffer left like that blocks every later cycle (they wait for a
+;; buffer with unsaved edits to be saved).  Its edits are also lost the
+;; moment the file changes under it and the buffer is reverted, and when
+;; the lost edit was a created issue's key the next pull duplicates the
+;; issue.
+;;
+;; A plain save is refused in one case only: the file changed on disk
+;; since the buffer last read it (another editor, git, an agent).
+;; Ownership decides what happens next.  A buffer that held no unsaved
+;; edits when the sync operation began holds only ejira's, so it is
+;; reloaded from the file.  An edit that cannot be recomputed is then
+;; applied again and saved.  A buffer holding the user's edits is never
+;; reverted; such an edit is written into the file as well as into the
+;; buffer, so it survives whichever version the user keeps.  Edits that
+;; cannot be recomputed find their heading by identity (a property
+;; value), never by position, so they apply to any version of the file.
 
-A conflicting file is left unsaved so the user can reconcile the two
-versions; forcing the save would silently discard the external change.
-Every save in the sync path goes through here instead of overriding
-`verify-visited-file-modtime' globally.  Buffers without a file (test
-buffers, scratch) are left alone."
+(cl-defstruct (ejira--txn (:constructor ejira--txn-make) (:copier nil))
+  "One sync operation: a pull, a reconciliation cycle or a confirmed push."
+  (user-dirty nil :documentation "Buffers that held unsaved edits when it began.")
+  (refused nil :documentation "Buffers whose save was refused: the file changed on disk.")
+  (dropped nil :documentation "Files whose unsaved ejira edits a reload discarded."))
+
+(defvar ejira--txn nil
+  "The running sync operation, an `ejira--txn', or nil outside one.")
+
+(defconst ejira--sync-properties
+  '("ID" "ORIG_ID" "TYPE" "CommId" "Author" "Status" "Reporter" "Assignee"
+    "Issuetype" "Created" "Modified" "Effort" "Left" "Pushhash" "Statehash"
+    "Remotehash" "JiraPriorityId" "JiraPriorityName" "JiraPriorityRank")
+  "Properties ejira writes as sync metadata.
+`ejira--commit-heading' carries the values the heading holds to the file.")
+
+(defconst ejira--transient-properties
+  '("Creating" "PendingTransition" "PendingIssuetype" "PendingEpic"
+    "PendingDelete")
+  "Properties a finished send removes: the creation journal, staged changes.
+`ejira--commit-heading' removes them from the file when the heading no
+longer has them.  No other property is ever removed that way: an absent
+value can be one another writer has just added.")
+
+(defun ejira--tracked-buffers ()
+  "Return the live buffers visiting a file ejira reconciles."
+  (delq nil (mapcar #'find-buffer-visiting (ejira--auto-sync-files))))
+
+(defun ejira--file-changed-p (&optional buffer)
+  "Return non-nil when BUFFER's file changed on disk since BUFFER read it."
+  (let ((buffer (or buffer (current-buffer))))
+    (and (buffer-file-name buffer)
+         (not (verify-visited-file-modtime buffer)))))
+
+(defun ejira--user-edits-p (&optional buffer)
+  "Return non-nil when BUFFER may hold unsaved edits that are not ejira's.
+Inside a sync operation, those are the edits BUFFER already held when the
+operation began.  Outside one, any unsaved edit counts."
+  (let ((buffer (or buffer (current-buffer))))
+    (and (buffer-modified-p buffer)
+         (or (null ejira--txn)
+             (memq buffer (ejira--txn-user-dirty ejira--txn))))))
+
+(defun ejira--forget-buffer-markers (buffer)
+  "Drop the cached heading markers into BUFFER, whose text was replaced."
+  (when (hash-table-p ejira--heading-cache)
+    (let (stale)
+      (maphash (lambda (id m)
+                 (when (and (markerp m) (eq (marker-buffer m) buffer))
+                   (push id stale)))
+               ejira--heading-cache)
+      (dolist (id stale) (remhash id ejira--heading-cache)))))
+
+(defun ejira--save-current-buffer ()
+  "Save the current buffer as ejira: no review is started for the save."
+  (let ((ejira--syncing t))
+    (save-buffer)))
+
+(defun ejira--reload-buffer (buffer)
+  "Replace BUFFER's text with its file's.  BUFFER holds no user edits.
+Unsaved ejira edits are discarded; inside a sync operation their file
+is recorded so the operation queues it for a fresh cycle."
+  (with-current-buffer buffer
+    (when (and buffer-file-name (file-exists-p buffer-file-name))
+      (when (and (buffer-modified-p) ejira--txn)
+        (push buffer-file-name (ejira--txn-dropped ejira--txn)))
+      (let ((inhibit-message t))
+        (revert-buffer t t t))
+      (ejira--forget-buffer-markers buffer))))
+
+(defun ejira--refresh-buffers (&optional buffers)
+  "Reload each clean buffer of BUFFERS whose file changed on disk.
+BUFFERS defaults to the tracked buffers.  Called after waiting on Jira
+and before editing.  The first modification of a clean buffer whose
+file changed makes Emacs ask whether to edit it anyway (the supersession
+prompt), and a sync must never ask.  Editing the current version also
+keeps the other writer's change."
+  (dolist (b (or buffers (ejira--tracked-buffers)))
+    (when (and (buffer-live-p b)
+               (not (buffer-modified-p b))
+               (ejira--file-changed-p b))
+      (ejira--reload-buffer b))))
+
+(define-error 'ejira-stale-buffer
+              "ejira: file changed on disk; not editing its stale buffer")
+
+(defun ejira--refuse-supersession (file)
+  "Stand-in for the supersession prompt while a sync operation runs.
+The operation edits only buffers it has refreshed (see
+`ejira--refresh-buffers').  An edit reaching a stale buffer anyway fails
+here instead of asking the user whether to edit it."
+  (signal 'ejira-stale-buffer (list file)))
+
+(defun ejira--txn-begin ()
+  "Start a sync operation and return its `ejira--txn'.
+Buffers already holding unsaved edits are recorded as the user's.  Every
+other buffer of a tracked file is reloaded when its file changed on
+disk, so the operation edits the current version of the file."
+  (let ((ejira--txn
+         (ejira--txn-make
+          :user-dirty (cl-remove-if-not
+                       (lambda (b) (and (buffer-file-name b) (buffer-modified-p b)))
+                       (buffer-list)))))
+    (ejira--refresh-buffers)
+    ejira--txn))
+
+(defun ejira--txn-settle (txn)
+  "End the sync operation TXN: no buffer may keep unsaved ejira edits.
+Each tracked or refused buffer that holds only ejira's edits is saved,
+or reloaded when its file changed on disk; the reload discards edits
+the next cycle recomputes, and that file is queued for one.  A buffer
+holding the user's edits over a changed file is left alone and reported."
+  (let ((ejira--txn txn))
+    (dolist (buf (delete-dups (append (ejira--txn-refused txn)
+                                      (ejira--tracked-buffers))))
+      (when (and (buffer-live-p buf)
+                 (buffer-file-name buf)
+                 (buffer-modified-p buf))
+        (with-current-buffer buf
+          (with-demoted-errors "ejira: %S"
+            (cond
+             ((memq buf (ejira--txn-user-dirty txn))
+              (when (and (memq buf (ejira--txn-refused txn))
+                         (ejira--file-changed-p buf))
+                (message "ejira: %s has unsaved edits and changed on disk; save or revert it to resume syncing"
+                         (abbreviate-file-name buffer-file-name))))
+             ((ejira--file-changed-p buf) (ejira--reload-buffer buf))
+             (t (ejira--save-current-buffer)))))))
+    (when (fboundp 'ejira--auto-sync-enqueue)
+      (let ((auto (ejira--auto-sync-files)))
+        (dolist (file (delete-dups (ejira--txn-dropped txn)))
+          (when (member (file-truename file) auto)
+            (ejira--auto-sync-enqueue file)))))))
+
+(defmacro ejira--with-transaction (&rest body)
+  "Run BODY as one sync operation; see `ejira--txn-begin' and `ejira--txn-settle'.
+Nested uses join the running operation.  While it runs, an edit of a
+stale buffer fails instead of asking (`ejira--refuse-supersession')."
+  (declare (indent 0) (debug t))
+  (let ((txn (make-symbol "txn")))
+    `(if ejira--txn
+         (progn ,@body)
+       (cl-letf (((symbol-function 'userlock--ask-user-about-supersession-threat)
+                  #'ejira--refuse-supersession))
+         (let* ((,txn (ejira--txn-begin))
+                (ejira--txn ,txn))
+           (unwind-protect
+               (progn ,@body)
+             (ejira--txn-settle ,txn)))))))
+
+(defun ejira--save-buffer-safe ()
+  "Save the current buffer unless its file changed on disk since it was read.
+Return non-nil when the buffer was saved.
+
+A refused save never overwrites the external change, and never asks.
+Inside a sync operation the buffer is handed to `ejira--txn-settle',
+which reloads it when it holds only ejira's edits.  Outside one, the
+buffer is left as it is.  Every save in the sync path goes through here
+instead of overriding `verify-visited-file-modtime' globally.  Buffers
+without a file (test buffers, scratch) are left alone."
   (cond
    ((not (buffer-modified-p)) nil)
    ((not (buffer-file-name)) nil)
-   ((verify-visited-file-modtime (current-buffer)) (save-buffer))
+   ((not (ejira--file-changed-p)) (save-buffer) t)
+   (ejira--txn
+    (cl-pushnew (current-buffer) (ejira--txn-refused ejira--txn))
+    nil)
    (t (message "ejira: %s changed on disk; leaving local edits unsaved"
-               (buffer-file-name)))))
+               (buffer-file-name))
+      nil)))
+
+(defun ejira--locate-heading (locators)
+  "Return the start of the first heading LOCATORS identify, or nil.
+LOCATORS is a list of (PROPERTY . VALUE) tried in order.  A heading
+matches when its own property drawer sets PROPERTY to VALUE.  Entries
+whose VALUE is nil are skipped."
+  (org-with-wide-buffer
+   (cl-some
+    (lambda (loc)
+      (let ((re (format "^[ \t]*:%s:[ \t]+%s[ \t]*$"
+                        (regexp-quote (car loc)) (regexp-quote (cdr loc))))
+            found)
+        (goto-char (point-min))
+        (while (and (not found) (re-search-forward re nil t))
+          (let ((next (point)))
+            (save-excursion
+              (when (and (ignore-errors (org-back-to-heading t) t)
+                         (equal (cdr loc) (org-entry-get (point) (car loc))))
+                (setq found (point))))
+            (goto-char next)))
+        found))
+    (cl-remove-if-not #'cdr locators))))
+
+(defun ejira--apply-heading-patch (locators patch)
+  "Apply PATCH to the heading LOCATORS identify in the current buffer.
+PATCH is an alist of (PROPERTY . VALUE): a string VALUE sets PROPERTY
+and nil removes it.  The symbol `cut' deletes the heading's subtree
+instead.  Return non-nil when the heading was found."
+  (when-let ((pos (ejira--locate-heading locators)))
+    (org-with-wide-buffer
+     (goto-char pos)
+     (if (eq patch 'cut)
+         (delete-region pos (save-excursion (org-end-of-subtree t t) (point)))
+       (pcase-dolist (`(,prop . ,value) patch)
+         (unless (equal value (org-entry-get (point) prop))
+           (if value
+               (org-entry-put (point) prop value)
+             (org-entry-delete (point) prop))))))
+    t))
+
+(defun ejira--heading-locators ()
+  "Return locators (see `ejira--locate-heading') for the heading at point.
+Its comment id, its ID, and the ID it had before an issue key replaced it."
+  (delq nil
+        (list (when-let ((c (org-entry-get (point) "CommId"))) (cons "CommId" c))
+              (when-let ((i (org-entry-get (point) "ID"))) (cons "ID" i))
+              (when-let ((o (org-entry-get (point) "ORIG_ID"))) (cons "ID" o)))))
+
+(defun ejira--edit-file (file edit coding)
+  "Apply EDIT to FILE on disk, bypassing any buffer visiting it.
+CODING is the coding system the file is read and written with.  Return
+non-nil when EDIT found its target in the file."
+  (with-temp-buffer
+    (let ((coding-system-for-read coding))
+      (insert-file-contents file))
+    (set-buffer-modified-p nil)
+    (delay-mode-hooks (org-mode))
+    (when (funcall edit)
+      (when (buffer-modified-p)
+        (let ((coding-system-for-write coding))
+          (write-region nil nil file nil 'silent)))
+      t)))
+
+(defun ejira--commit-edit (buffer edit)
+  "Apply the edit EDIT to BUFFER and make it durable in BUFFER's file.
+EDIT is a function called with a buffer holding a version of the file
+current.  It finds what it changes by identity, applies the change
+there, and returns non-nil when it found its target.  Applying it to a
+version that already has the change changes nothing.
+
+Return `saved' when BUFFER was saved with the change (reloaded first
+when it held only ejira's edits over a file changed on disk; saved with
+any unsaved user edits when the file did not change, as every save of a
+confirmed push does).  Return
+`written' when BUFFER holds user edits over a changed file: the change
+went into the file and into BUFFER separately, and the user's unsaved
+edits are left for the user.  Return `applied' for a buffer without a
+file.  Return nil when EDIT found no target in the file."
+  (with-current-buffer buffer
+    (cond
+     ((not (buffer-file-name))
+      (and (funcall edit) 'applied))
+     ((and (ejira--file-changed-p) (ejira--user-edits-p))
+      (let ((in-file (ejira--edit-file (buffer-file-name) edit
+                                       buffer-file-coding-system)))
+        (funcall edit)
+        (when in-file
+          (message "ejira: %s has unsaved edits and changed on disk; ejira's change went into both"
+                   (abbreviate-file-name (buffer-file-name))))
+        (and in-file 'written)))
+     (t
+      (when (ejira--file-changed-p)
+        (ejira--reload-buffer buffer))
+      (when (funcall edit)
+        (when (buffer-modified-p)
+          (ejira--save-current-buffer))
+        'saved)))))
+
+(defun ejira--commit-heading (marker)
+  "Make the sync metadata of the heading at MARKER durable in its file.
+The metadata are the `ejira--sync-properties' the heading holds now, and
+the `ejira--transient-properties' it no longer holds; see
+`ejira--commit-edit' for the return value.  Content ejira wrote besides
+them (a pulled body, a heading title) reaches the file with a plain save.
+It is not carried over when the file changed on disk: the file's
+version of the content is kept, and a difference from the baselines
+shows up as a local change for the next review."
+  (let ((locators (org-with-point-at marker (ejira--heading-locators)))
+        (patch (org-with-point-at marker
+                 (append
+                  (delq nil
+                        (mapcar (lambda (p)
+                                  (when-let ((v (org-entry-get (point) p)))
+                                    (cons p v)))
+                                ejira--sync-properties))
+                  (mapcar (lambda (p) (cons p (org-entry-get (point) p)))
+                          ejira--transient-properties)))))
+    (ejira--commit-edit (marker-buffer marker)
+                        (lambda () (ejira--apply-heading-patch locators patch)))))
 
 (defun ejira--set-property (id property value)
   "Set PROPERTY of item ID into VALUE."

@@ -28,6 +28,9 @@
 (require 'cl-lib)
 (require 'org)
 (require 'org-sync-confirm)
+;; `ejira--with-transaction' must be defined before the executor below
+;; is read.
+(require 'ejira-core)
 
 (defvar ejira--pushing nil
   "Bound to t while ejira-push is executing a batch; inhibits re-scan on save.
@@ -222,9 +225,12 @@ This is the only place Jira writes are authorized: see
 cycle, so baselines and the review count reflect the pushes just made;
 that cycle never pushes anything itself."
   (let* ((sendable (cl-remove-if-not (lambda (i) (plist-get i :execute)) items))
+         ;; One sync operation: whatever the sends leave in a buffer
+         ;; reaches its file when they are done (`ejira--txn-settle').
          (failed (let ((ejira--pushing t)
                        (ejira--jira-write-authorized t))
-                   (org-sync-confirm-execute-items items 'ejira))))
+                   (ejira--with-transaction
+                     (org-sync-confirm-execute-items items 'ejira)))))
     (ejira--auto-sync-log
      "confirmed push"
      (mapcar (lambda (item)

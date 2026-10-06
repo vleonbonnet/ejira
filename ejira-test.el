@@ -3596,5 +3596,464 @@ flattened under the grandparent."
      ;; stored rank 2 (=[#2]); the cookie says 3 → modified
      (should (ejira--priority-cookie-modified-p)))))
 
+;;; ── Durable sync edits ──────────────────────────────────────────────────────
+;;
+;; Every edit ejira makes reaches the file, or is dropped on purpose
+;; because the next sync recomputes it.  Regression: a confirmed creation
+;; wrote the new issue key into the buffer and never saved it.  Every
+;; later cycle then waited for that unsaved buffer to be saved.  An agent
+;; wrote the file meanwhile, the buffer was reverted, the key was lost,
+;; and the next pull imported the issue a second time.
+
+(defun ejira-test--file-string (file)
+  "Return FILE's text on disk."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (buffer-string)))
+
+(defun ejira-test--write-externally (file edit)
+  "Change FILE on disk behind its buffer, as another writer does.
+EDIT is called in a buffer holding the file's text."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (funcall edit)
+    (write-region nil nil file nil 'silent))
+  ;; Unmistakably newer than the buffer's record of the file.
+  (set-file-times file (time-add (current-time) 5)))
+
+(defun ejira-test--append-externally (file text)
+  "Append TEXT to FILE on disk behind its buffer."
+  (ejira-test--write-externally file (lambda () (goto-char (point-max)) (insert text))))
+
+(defun ejira-test--confirm (plans)
+  "Run PLANS as the confirmed review buffer does; return its warnings."
+  (let (warnings)
+    (cl-letf (((symbol-function 'display-warning)
+               (lambda (_type msg &rest _) (push msg warnings))))
+      (ejira-confirm--execute
+       (mapcar (lambda (p) (list :label (plist-get p :title) :data p
+                                 :execute (plist-get p :send)))
+               plans)))
+    warnings))
+
+(defun ejira-test--plans (buf &optional object)
+  "Build the push plans of BUF, keeping OBJECT ones only when given.
+The buffer is then saved, as the reconciliation cycle that builds plans
+saves what building them wrote."
+  (with-current-buffer buf
+    (let* ((ops (cl-remove-if
+                 (lambda (op)
+                   (or (eq (plist-get op :op) 'blocked)
+                       (and object (not (eq object (plist-get op :object))))))
+                 (ejira--push-scan-buffer buf)))
+           (plans (ejira--push-build-plans ops)))
+      (let ((ejira-push-on-save nil)) (save-buffer))
+      plans)))
+
+(defconst ejira-test--real-finalize
+  (symbol-function 'ejira--finalize-new-issue-review-safe)
+  "The real finalize step, for tests that run it under `ejira-test--with-creation'.")
+
+(defconst ejira-test--subtask-content
+  "* Project\n:PROPERTIES:\n:ID:       TEST\n:TYPE:     ejira-project\n:END:\n\
+** TODO Parent issue\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n\
+:Issuetype: Task\n:END:\n*** TODO New subtask\n\nSubtask body.\n")
+
+(defmacro ejira-test--with-creation (create-fn &rest body)
+  "Run BODY around a subtask creation whose Jira request runs CREATE-FN.
+Binds `file', `buf' and `plans'; BODY runs the plans.  The finalize
+pull is simulated: it stamps the metadata a real pull writes."
+  (declare (indent 1))
+  `(ejira-test--with-project-dir ejira-test--subtask-content
+     (let* ((file (expand-file-name "TEST.org" ejira-org-directory))
+            (buf (find-file-noselect file t))
+            (ejira--assign-new-issues nil)
+            (ejira--auto-sync-queue nil)
+            (ejira--auto-sync-review-queue nil)
+            (ejira--disk-conflicts-cache nil)
+            (plans (ejira-test--plans buf 'subtask)))
+       (cl-letf (((symbol-function 'ejira--default-priority-id) (lambda (&rest _) nil))
+                 ((symbol-function 'jiralib2-create-issue)
+                  (lambda (&rest _) (funcall ,create-fn) '((key . "TEST-2"))))
+                 ((symbol-function 'ejira--finalize-new-issue-review-safe)
+                  (lambda (new-key marker &rest _)
+                    (org-with-point-at marker
+                      (should (equal new-key (org-entry-get nil "ID")))
+                      (org-set-property "TYPE" "ejira-subtask")
+                      (org-set-property "Pushhash" "pulled")))))
+         ,@body))))
+
+(ert-deftest ejira-durable/creation-identity-reaches-the-file ()
+  "A confirmed creation leaves its key in the file and no unsaved edit.
+The journal is in the file while the request runs."
+  (let (journal-on-disk)
+    (ejira-test--with-creation
+        (lambda ()
+          (setq journal-on-disk
+                (string-match-p ":Creating:" (ejira-test--file-string file))))
+      (should (null (ejira-test--confirm plans)))
+      (should journal-on-disk)
+      (with-current-buffer buf (should-not (buffer-modified-p)))
+      (let ((disk (ejira-test--file-string file)))
+        (should (string-match-p "^:ID: +TEST-2$" disk))
+        (should (string-match-p "^:ORIG_ID: +[0-9A-F-]+$" disk))
+        (should (string-match-p "^:TYPE: +ejira-subtask$" disk))
+        (should (string-match-p "^:Pushhash: +pulled$" disk))
+        (should-not (string-match-p ":Creating:" disk))))))
+
+(ert-deftest ejira-durable/creation-survives-an-external-write ()
+  "The file changing during the request costs neither the key nor the
+other writer's change.  Regression: the key stayed in the unsaved
+buffer, the buffer was reverted to the other writer's version, and the
+next pull imported the issue again."
+  (ejira-test--with-creation
+      (lambda () (ejira-test--append-externally file "* Agent note\n"))
+    (should (null (ejira-test--confirm plans)))
+    (let ((disk (ejira-test--file-string file)))
+      (should (string-match-p "^\\* Agent note$" disk))
+      (should (string-match-p "^:ID: +TEST-2$" disk))
+      (should (string-match-p "^:Pushhash: +pulled$" disk))
+      (should-not (string-match-p ":Creating:" disk))
+      (with-current-buffer buf
+        (should-not (buffer-modified-p))
+        (should-not (ejira--file-changed-p))
+        (should (equal disk (buffer-substring-no-properties (point-min) (point-max))))))))
+
+(ert-deftest ejira-durable/finalize-survives-an-external-write ()
+  "A file changed while the finalize pull fetches the new issue keeps the
+pulled metadata and the other writer's change, and nothing asks whether
+to edit the stale buffer.  Regression: the pull edited the stale buffer,
+which raised Emacs's \"changed on disk; really edit the buffer?\" prompt."
+  (ejira-test--with-creation #'ignore
+    (cl-letf (((symbol-function 'ejira--finalize-new-issue-review-safe)
+               ejira-test--real-finalize)
+              ((symbol-function 'ejira--transition-to-org-state) #'ignore)
+              ((symbol-function 'ejira--get-priority-scheme) (lambda (&rest _) nil))
+              ((symbol-function 'ejira--my-fullname) (lambda () "Me"))
+              ((symbol-function 'jiralib2-get-issue)
+               (lambda (key)
+                 (ejira-test--append-externally file "* Agent note\n")
+                 `((key . ,key)
+                   (fields . ((summary . "New subtask")
+                              (description . "Subtask body.")
+                              (status . ((name . "Open")))
+                              (issuetype . ((name . "Sub-task")))
+                              (project . ((key . "TEST")))
+                              (parent . ((key . "TEST-1")))
+                              (created . "2026-10-06T10:00:00.000+0000")
+                              (updated . "2026-10-06T10:00:01.000+0000")))))))
+      (should (null (ejira-test--confirm plans))))
+    (let ((disk (ejira-test--file-string file)))
+      (should (string-match-p "^\\* Agent note$" disk))
+      (should (string-match-p "^:ID: +TEST-2$" disk))
+      (should (string-match-p "^:TYPE: +ejira-subtask$" disk))
+      (should (string-match-p "^:Status: +Open$" disk))
+      (should (string-match-p "^:Pushhash: +v2:" disk))
+      (should-not (string-match-p ":Creating:" disk))
+      (with-current-buffer buf
+        (should-not (buffer-modified-p))
+        (should-not (ejira--file-changed-p))))))
+
+(ert-deftest ejira-durable/user-edits-are-kept-apart ()
+  "With unsaved user edits over a changed file, the key goes into both
+versions and the user's edits are neither saved nor reverted."
+  (ejira-test--with-creation #'ignore
+    (with-current-buffer buf
+      (goto-char (point-max))
+      (insert "* User draft\n"))
+    (ejira-test--append-externally file "* Agent note\n")
+    (should (null (ejira-test--confirm plans)))
+    (let ((disk (ejira-test--file-string file)))
+      (should (string-match-p "^\\* Agent note$" disk))
+      (should-not (string-match-p "User draft" disk))
+      (should (string-match-p "^:ID: +TEST-2$" disk))
+      (should (string-match-p "^:Pushhash: +pulled$" disk))
+      (should-not (string-match-p ":Creating:" disk)))
+    (with-current-buffer buf
+      (should (buffer-modified-p))
+      (should (ejira--file-changed-p))
+      (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+        (should (string-match-p "^\\* User draft$" text))
+        (should (string-match-p "^:ID: +TEST-2$" text))
+        (should-not (string-match-p ":Creating:" text))))
+    ;; The stuck file is shown, not left silent.
+    (should (memq buf (ejira--disk-conflict-buffers)))
+    (should (string-match-p "Jira:TEST\\.org.* changed on disk" (ejira--auto-sync-mode-line)))))
+
+(defun ejira-test--delete-subtask-externally (file)
+  "Remove the new subtask heading from FILE on disk."
+  (ejira-test--write-externally
+   file (lambda ()
+          (re-search-forward "^\\*\\*\\* TODO New subtask")
+          (beginning-of-line)
+          (delete-region (point) (point-max)))))
+
+(ert-deftest ejira-durable/no-creation-of-a-heading-gone-from-the-file ()
+  "A heading another writer removed is not created."
+  (let ((requested nil))
+    (ejira-test--with-creation (lambda () (setq requested t))
+      (ejira-test--delete-subtask-externally file)
+      (let ((warnings (ejira-test--confirm plans)))
+        (should (string-match-p "no longer in TEST.org" (car warnings))))
+      (should-not requested))))
+
+(ert-deftest ejira-durable/no-creation-without-a-journal-in-the-file ()
+  "A heading still in the buffer but gone from the file is not created:
+its journal cannot be written where a later scan would see it."
+  (let ((requested nil))
+    (ejira-test--with-creation (lambda () (setq requested t))
+      ;; Unsaved user edits keep the buffer from being reloaded.
+      (with-current-buffer buf
+        (goto-char (point-max))
+        (insert "* User draft\n"))
+      (ejira-test--delete-subtask-externally file)
+      (let ((warnings (ejira-test--confirm plans)))
+        (should (string-match-p "nothing was created" (car warnings))))
+      (should-not requested))))
+
+(ert-deftest ejira-durable/settle-saves-ejira-edits ()
+  "An operation that edited a clean buffer and did not save leaves it saved."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let ((buf (find-file-noselect file t)))
+      (ejira--with-transaction
+        (with-current-buffer buf
+          (goto-char (point-max))
+          (insert "* Written by a sync\n")))
+      (with-current-buffer buf (should-not (buffer-modified-p)))
+      (should (string-match-p "Written by a sync" (ejira-test--file-string file))))))
+
+(ert-deftest ejira-durable/refused-save-reloads-an-owned-buffer ()
+  "A save refused because the file changed reloads a buffer holding only
+ejira's edits, and queues the file for a fresh cycle."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let ((buf (find-file-noselect file t))
+          (ejira--auto-sync-queue nil))
+      (ejira--with-transaction
+        (with-current-buffer buf
+          (goto-char (point-max))
+          (insert "* Recomputable pull\n")
+          (ejira-test--append-externally file "* Agent note\n")
+          (should-not (ejira--save-buffer-safe))))
+      (with-current-buffer buf
+        (should-not (buffer-modified-p))
+        (should-not (ejira--file-changed-p))
+        (should (string-match-p "Agent note" (buffer-string)))
+        (should-not (string-match-p "Recomputable pull" (buffer-string))))
+      (should (member (file-truename file) ejira--auto-sync-queue)))))
+
+(ert-deftest ejira-durable/user-edits-are-never-reverted ()
+  "A buffer that held unsaved edits when the operation began is neither
+saved over the changed file nor reverted."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let ((buf (find-file-noselect file t)))
+      (with-current-buffer buf
+        (goto-char (point-max))
+        (insert "* User draft\n"))
+      (ejira-test--append-externally file "* Agent note\n")
+      (ejira--with-transaction
+        (with-current-buffer buf
+          (should-not (ejira--save-buffer-safe))))
+      (with-current-buffer buf
+        (should (buffer-modified-p))
+        (should (string-match-p "User draft" (buffer-string))))
+      (should-not (string-match-p "User draft" (ejira-test--file-string file))))))
+
+(ert-deftest ejira-durable/operation-starts-from-the-current-file ()
+  "A clean buffer whose file changed is reloaded before ejira edits it."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let ((buf (find-file-noselect file t)))
+      (ejira-test--append-externally file "* Agent note\n")
+      (ejira--with-transaction
+        (with-current-buffer buf
+          (should-not (ejira--file-changed-p))
+          (should (string-match-p "Agent note" (buffer-string))))))))
+
+(ert-deftest ejira-durable/cycle-restarts-when-the-file-changes-during-fetch ()
+  "Jira answers about a file that changed while they were fetched are not
+applied: the buffer is reloaded and the cycle queued again, review kept."
+  (ejira-test--with-project-dir ejira-test--discover-content
+    (let ((buf (find-file-noselect file t))
+          (ejira-epic-field 'customfield_10857)
+          (ejira-auto-sync-discover 'unresolved)
+          (ejira--auto-sync-queue nil)
+          (ejira--auto-sync-review-queue nil)
+          (imported nil))
+      (cl-letf (((symbol-function 'ejira--auto-sync-fetch)
+                 (lambda (_keys)
+                   (ejira-test--append-externally file "* Agent note\n")
+                   (list (ejira-test--epic-item "Renamed in Jira"))))
+                ((symbol-function 'jiralib2-jql-search)
+                 (lambda (&rest _) (list (ejira-test--child-item "TEST-3" "Body"))))
+                ((symbol-function 'ejira--auto-sync-import)
+                 (lambda (&rest _) (setq imported t))))
+        (ejira--auto-sync-reconcile (file-truename file) t))
+      (should-not imported)
+      (with-current-buffer buf
+        (should-not (buffer-modified-p))
+        (should-not (ejira--file-changed-p))
+        (should (string-match-p "Agent note" (buffer-string)))
+        (should-not (string-match-p "Renamed in Jira" (buffer-string))))
+      (should (member (file-truename file) ejira--auto-sync-queue))
+      (should (member (file-truename file) ejira--auto-sync-review-queue)))))
+
+(defconst ejira-test--comment-content
+  "* Project\n:PROPERTIES:\n:ID:       TEST\n:TYPE:     ejira-project\n:END:\n\
+** TODO An issue\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n:END:\n\
+*** Comments\n**** A remark\n\nSome remark.\n")
+
+(ert-deftest ejira-durable/comment-creation-is-journaled ()
+  "A new comment is journaled in the file before it is posted, and its
+Jira id replaces the draft's identity in the file.  Regression: a lost
+response or a reverted buffer posted the comment again."
+  (ejira-test--with-project-dir ejira-test--comment-content
+    (let* ((buf (find-file-noselect file t))
+           (ejira--auto-sync-queue nil)
+           (plans (ejira-test--plans buf 'comment))
+           (journal-on-disk nil))
+      (should (= 1 (length plans)))
+      (cl-letf (((symbol-function 'jiralib2-add-comment)
+                 (lambda (&rest _)
+                   (setq journal-on-disk
+                         (string-match-p ":Creating:" (ejira-test--file-string file)))
+                   (ejira-test--append-externally file "* Agent note\n")
+                   '((id . "10001") (body . "Some remark."))))
+                ((symbol-function 'ejira--update-comment)
+                 (lambda (_key comment)
+                   (with-current-buffer buf
+                     (goto-char (ejira--locate-heading
+                                 (list (cons "CommId" (ejira-comment-id comment)))))
+                     (org-set-property "Author" "Me")))))
+        (should (null (ejira-test--confirm plans))))
+      (should journal-on-disk)
+      (let ((disk (ejira-test--file-string file)))
+        (should (string-match-p "^\\* Agent note$" disk))
+        (should (string-match-p "^:CommId: +10001$" disk))
+        (should (string-match-p "^:TYPE: +ejira-comment$" disk))
+        (should (string-match-p "^:Author: +Me$" disk))
+        (should-not (string-match-p ":Creating:" disk))
+        ;; The draft's temporary ID is gone: the comment's issue key is
+        ;; inherited from its issue again.
+        (should (= 2 (with-temp-buffer (insert disk) (count-matches "^:ID:" (point-min) (point-max))))))
+      (with-current-buffer buf (should-not (buffer-modified-p))))))
+
+(ert-deftest ejira-durable/journaled-comment-is-blocked ()
+  "A comment draft with a creation journal is never posted blindly."
+  (ejira-test--with-org-buf
+   (replace-regexp-in-string
+    "\\*\\*\\*\\* A remark\n"
+    "**** A remark\n:PROPERTIES:\n:Creating: 2026-10-06 14:45:45\n:END:\n"
+    ejira-test--comment-content t t)
+   (let ((ops (cl-letf (((symbol-function 'ejira--synced-project-p) (lambda (_) t)))
+                (ejira-test--scan-current))))
+     (should-not (cl-find-if (lambda (op) (eq (plist-get op :op) 'create)) ops))
+     (should (cl-find-if (lambda (op)
+                           (and (eq (plist-get op :op) 'blocked)
+                                (string-match-p "comment creation attempt" (plist-get op :reason))))
+                         ops)))))
+
+(ert-deftest ejira-durable/comment-deletion-reaches-the-file ()
+  "A deleted comment's heading is removed from the file, even when the
+file changed during the request."
+  (ejira-test--with-project-dir
+      (concat ejira-test--project-content
+              "*** Comments\n**** [2026-10-01 Thu 10:00] Me\n:PROPERTIES:\n:CommId:   7\n\
+:TYPE:     ejira-comment\n:PendingDelete: t\n:END:\n\nGone.\n")
+    (let* ((buf (find-file-noselect file t))
+           (ejira--auto-sync-queue nil)
+           (plans (ejira-test--plans buf 'comment)))
+      (should (= 1 (length plans)))
+      (cl-letf (((symbol-function 'jiralib2-delete-comment)
+                 (lambda (&rest _) (ejira-test--append-externally file "* Agent note\n"))))
+        (should (null (ejira-test--confirm plans))))
+      (let ((disk (ejira-test--file-string file)))
+        (should (string-match-p "^\\* Agent note$" disk))
+        (should-not (string-match-p ":CommId:" disk))
+        (should-not (string-match-p "Gone\\." disk)))
+      (with-current-buffer buf (should-not (buffer-modified-p))))))
+
+(ert-deftest ejira-durable/applied-transition-leaves-the-file ()
+  "A staged transition Jira applied is removed from the file, so the next
+review does not send it again."
+  (ejira-test--with-project-dir
+      "* Project\n:PROPERTIES:\n:ID:       TEST\n:TYPE:     ejira-project\n:END:\n\
+** TODO An issue\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n\
+:PendingTransition: Start Progress\n:END:\n"
+    (let* ((buf (find-file-noselect file t))
+           (ejira--auto-sync-queue nil)
+           (plans (ejira-test--plans buf 'status)))
+      (should (= 1 (length plans)))
+      (cl-letf (((symbol-function 'jiralib2-get-actions)
+                 (lambda (_key) '(("11" . "Start Progress"))))
+                ((symbol-function 'jiralib2-do-action)
+                 (lambda (&rest _) (ejira-test--append-externally file "* Agent note\n")))
+                ((symbol-function 'ejira--update-task-or-hold) (lambda (&rest _) t)))
+        (should (null (ejira-test--confirm plans))))
+      (let ((disk (ejira-test--file-string file)))
+        (should (string-match-p "^\\* Agent note$" disk))
+        (should-not (string-match-p ":PendingTransition:" disk)))
+      (with-current-buffer buf (should-not (buffer-modified-p))))))
+
+(ert-deftest ejira-push-finalize/records-jira-state-for-a-changed-heading ()
+  "A heading edited after the review keeps its content baseline, but the
+remote baseline records what the push left in Jira, so the next cycle
+does not mistake the push for a remote change."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let ((buf (find-file-noselect file t)))
+      (with-current-buffer buf
+        (goto-char (point-min))
+        (re-search-forward "^\\*\\* TODO An issue")
+        (ejira--migrate-push-baseline)
+        (beginning-of-line)
+        (let ((marker (point-marker))
+              (reviewed (md5 (ejira--heading-reviewed-hash)))
+              (pushhash (org-entry-get nil "Pushhash")))
+          (replace-regexp "TODO An issue" "TODO An issue edited" nil
+                          (point) (line-end-position))
+          (ejira--push-finalize marker reviewed "sent fields")
+          (should (equal (md5 "sent fields") (org-entry-get marker "Remotehash")))
+          (should (equal pushhash (org-entry-get marker "Pushhash")))
+          (should (ejira--locally-modified-p)))))))
+
+(ert-deftest ejira-durable/commit-keeps-what-another-writer-added ()
+  "Carrying a heading's metadata into a changed file never removes a
+property the other writer added there; only a finished send's journal
+and staged changes are removed."
+  (ejira-test--with-project-dir
+      "* Project\n:PROPERTIES:\n:ID:       TEST\n:TYPE:     ejira-project\n:END:\n\
+** TODO An issue\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n\
+:PendingEpic: TEST-9\n:END:\n"
+    (let ((buf (find-file-noselect file t)))
+      (ejira--with-transaction
+        (with-current-buffer buf
+          (goto-char (point-min))
+          (re-search-forward "^\\*\\* TODO An issue")
+          (beginning-of-line)
+          (org-delete-property "PendingEpic")
+          (org-set-property "Remotehash" "acked")
+          (ejira-test--write-externally
+           file (lambda ()
+                  (re-search-forward "^:ID: +TEST-1$")
+                  (end-of-line)
+                  (insert "\n:Effort:   1:00")))
+          (should (eq 'saved (ejira--commit-heading (point-marker))))))
+      (let ((disk (ejira-test--file-string file)))
+        (should (string-match-p "^:Effort: +1:00$" disk))
+        (should (string-match-p "^:Remotehash: +acked$" disk))
+        (should-not (string-match-p ":PendingEpic:" disk))))))
+
+(ert-deftest ejira-durable/stale-buffer-is-refused-not-prompted ()
+  "Inside a sync operation, editing a clean buffer whose file changed
+fails instead of asking whether to edit it."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let ((buf (find-file-noselect file t)))
+      (ejira--with-transaction
+        (ejira-test--append-externally file "* Agent note\n")
+        (with-current-buffer buf
+          (should (eq 'ejira-stale-buffer
+                      (car (should-error (insert "x")))))))
+      (with-current-buffer buf
+        (should-not (buffer-modified-p))))))
+
 (provide (quote ejira-test))
 ;;; ejira-test.el ends here

@@ -173,6 +173,14 @@ Every Org file ejira tracks reconciles itself: the project files in =ejira-org-d
 
 Shallow pulls (=ejira-auto-pull-shallow=) only ever acknowledge the state they fetched, and leave a heading with pending local edits untouched.
 
+**** Files changed by another writer
+Every edit ejira makes, by a pull, a cycle or a confirmed push, reaches the file.  Some edits are dropped on purpose because the next cycle recomputes them from Jira.  ejira never leaves a buffer holding its own unsaved edits.  Another writer (git, an agent, another editor) may change the file while ejira works on it:
+
+- A cycle reads Jira before it changes the buffer, then checks the file again.  If the file changed, the cycle starts over on the new content.
+- A buffer that held no unsaved edits when the operation began holds only ejira's edits.  When its file changes, it is reloaded instead of saved over the file.  Edits that cannot be recomputed are then applied again and saved.  These are a created issue's key, a creation journal, the baselines a push records, and a staged change Jira applied.  They find their heading by identity, so they apply to the new version of the file.  Nothing asks whether to edit a buffer whose file changed.
+- A buffer holding your unsaved edits is never saved over a changed file and never reverted.  Those same edits are written into the file and into the buffer, so they survive whichever version you keep.  The mode line shows =Jira:FILE changed on disk= until you keep one version; =mouse-1= on it diffs the buffer with the file.
+- An issue or comment is created only once its creation journal (=Creating=) is in the file.  When the response is lost, the journal blocks a second creation, and the heading waits for you to check Jira.
+
 =M-x ejira-sync-audit= compares each auto-sync file with Jira without changing anything: summary, description, state, priority and comments of every issue, classified as identical, local-newer, remote-newer, both-changed, unknown-baseline, unconvertible or missing-in-jira, plus Jira children missing locally and TODO headings with no Jira identity.  Use it after any bulk change and as a periodic health check.
 
 Org timestamps travel as JIRA dates, the format JIRA shows for date fields: =[2026-10-08 Thu]= exports as =08/Oct/2026=, =[2026-06-23 Tue 16:50]= as =23/Jun/2026 4:50 PM=, and a range joins its ends with =--= (rendered as an en dash).  Exactly that format imports back as inactive timestamps; JIRA cannot tell active from inactive, so comparisons ignore the difference.  Repeaters, warning delays and diary sexps have no JIRA equivalent and travel as their Org text.  Other date spellings in JIRA (=2026-10-08=, =Oct 8, 2026=) are left as written.

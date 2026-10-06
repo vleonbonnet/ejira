@@ -116,57 +116,114 @@ keeps the ID as ORIG_ID and rewrites links to it."
             (org-id-add-location id file))
           id))))
 
+(defun ejira--resolve-heading (marker locators)
+  "Return a marker on the heading LOCATORS identify, starting in MARKER's buffer.
+LOCATORS is a list of (PROPERTY . VALUE); see `ejira--locate-heading'.
+A send resolves its heading again when it runs: an earlier send, or a
+reload of a buffer whose file changed on disk, may have moved it.  An
+issue heading refiled into another file is found by its key.  Signal an
+error when the heading is gone."
+  (let ((buf (marker-buffer marker)))
+    (or (and buf
+             (with-current-buffer buf
+               (org-with-wide-buffer
+                (let ((loc (car locators)))
+                  (when (and loc (cdr loc) (marker-position marker))
+                    (goto-char marker)
+                    (when (and (ignore-errors (org-back-to-heading t) t)
+                               (equal (cdr loc) (org-entry-get (point) (car loc))))
+                      (point-marker)))))))
+        (and buf
+             (with-current-buffer buf
+               (when-let ((pos (ejira--locate-heading locators)))
+                 (copy-marker pos))))
+        (cl-some (lambda (loc)
+                   (and (equal (car loc) "ID")
+                        (cdr loc)
+                        (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" (cdr loc))
+                        (ejira--find-heading (cdr loc))))
+                 locators)
+        (error "ejira: the heading %s is no longer in %s"
+               (mapconcat (lambda (l) (format "%s %s" (car l) (cdr l)))
+                          (cl-remove-if-not #'cdr locators) " / ")
+               (if buf (buffer-name buf) "its buffer")))))
+
 (defun ejira--creation-target (marker id)
   "Return a marker on the heading of MARKER's buffer whose ID is ID.
 Signal an error when no such heading exists any more."
-  (with-current-buffer (marker-buffer marker)
+  (ejira--resolve-heading marker (list (cons "ID" id))))
+
+(defun ejira--commit-creation-journal (marker)
+  "Record in its file that the heading at MARKER is being created in Jira.
+The `Creating' property is written before the request: when Jira
+accepts the request and the response is lost, the journal blocks a
+blind duplicate on the next scan.  It only does that from the file.  A
+journal left in the buffer is lost when the buffer is reloaded, so when
+it cannot reach the file this signals an error and nothing is created.
+Return a marker on the heading."
+  (let* ((id (ejira--creation-target-id marker))
+         (locators (list (cons "ID" id)))
+         (patch `(("Creating" . ,(format-time-string "%Y-%m-%d %H:%M:%S")))))
+    (unless (ejira--commit-edit (marker-buffer marker)
+                                (lambda () (ejira--apply-heading-patch locators patch)))
+      (error "ejira: the heading to create (ID %s) is no longer in %s; nothing was created"
+             id (buffer-name (marker-buffer marker))))
+    (ejira--resolve-heading marker locators)))
+
+(defun ejira--rewrite-id-links (old new)
+  "Rewrite `id:' links to OLD into links to NEW in the current buffer.
+Return non-nil when a link was rewritten."
+  (let ((n 0))
     (org-with-wide-buffer
      (goto-char (point-min))
-     (if (re-search-forward (concat "^[ \t]*:ID:[ \t]+" (regexp-quote id) "[ \t]*$")
-                            nil t)
-         (progn (org-back-to-heading t) (point-marker))
-       (error "ejira: the heading to create (ID %s) is no longer in %s"
-              id (buffer-name))))))
+     (while (re-search-forward (concat "\\[\\[id:" (regexp-quote old) "\\]") nil t)
+       ;; The match includes the closing bracket; keep it.
+       (replace-match (concat "[[id:" new "]") t t)
+       (cl-incf n)))
+    (> n 0)))
 
 (defun ejira--record-new-issue-key (new-key marker)
   "Record newly created Jira issue key NEW-KEY on MARKER's heading.
 
-The identity is written before any follow-up step (assignment,
-transition, cascade): when a later step fails, the heading must already
-look created, or a retry would duplicate the ticket.  A pre-existing
-non-key Org ID (a plain UUID) is preserved in `ORIG_ID' first, and
-`id:' links pointing at it are rewritten to the new key so existing Org
-links keep resolving."
-  (let (orig)
-    (org-with-point-at marker
-      (when-let ((old (org-entry-get nil "ID")))
-        (unless (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" old)
-          (org-set-property "ORIG_ID" old)
-          (setq orig old)))
-      (org-set-property "ID" new-key))
-    (when (buffer-file-name (marker-buffer marker))
+The identity reaches the file before any follow-up step (assignment,
+transition, cascade, the finalize pull), and replaces the creation
+journal (`Creating') in the same write.  When a later step fails, or the
+file changes on disk before the buffer is saved again, the heading must
+already look created.  Otherwise a retry, or the next pull, duplicates
+the ticket.  A pre-existing non-key Org ID (a plain UUID) is preserved in
+`ORIG_ID' first, and `id:' links pointing at it are rewritten to the new
+key so existing Org links keep resolving.
+
+Return a marker on the heading.  Signal an error when the heading is no
+longer in its file: the issue exists in Jira, and the next sync imports
+it under its parent."
+  (let* ((buf (marker-buffer marker))
+         (old (ejira--creation-target-id marker))
+         (orig (unless (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" old) old))
+         (locators (list (cons "ID" new-key) (cons "ID" old)))
+         (patch `(("ID" . ,new-key)
+                  ,@(when orig `(("ORIG_ID" . ,orig)))
+                  ("Creating"))))
+    (unless (ejira--commit-edit buf (lambda () (ejira--apply-heading-patch locators patch)))
+      (error "ejira: created %s, but its heading is no longer in %s; the next sync imports it"
+             new-key (buffer-name buf)))
+    (when (buffer-file-name buf)
       (unless (hash-table-p org-id-locations)
         (setq org-id-locations (make-hash-table :test 'equal)))
-      (puthash new-key
-               (abbreviate-file-name (buffer-file-name (marker-buffer marker)))
+      (puthash new-key (abbreviate-file-name (buffer-file-name buf))
                org-id-locations))
     (when orig
       ;; `id:' links pointing at the old UUID would silently stop
       ;; resolving; rewrite them in the already-visited ejira buffers.
-      (dolist (buf (seq-filter #'buffer-live-p
-                               (delq nil
-                                     (cons (current-buffer)
-                                           (mapcar #'find-buffer-visiting
-                                                   (append (ejira--project-files)
-                                                           ejira-extra-scan-files))))))
-        (with-current-buffer buf
-          (org-with-wide-buffer
-           (save-excursion
-             (goto-char (point-min))
-             (while (re-search-forward
-                     (concat "\\[\\[id:" (regexp-quote orig) "\\]") nil t)
-               ;; The match includes the closing bracket; keep it.
-               (replace-match (concat "[[id:" new-key "]") t t)))))))))
+      (dolist (b (delete-dups
+                  (seq-filter #'buffer-live-p
+                              (delq nil
+                                    (cons buf
+                                          (mapcar #'find-buffer-visiting
+                                                  (append (ejira--project-files)
+                                                          ejira-extra-scan-files)))))))
+        (ejira--commit-edit b (lambda () (ejira--rewrite-id-links orig new-key)))))
+    (ejira--resolve-heading marker (list (cons "ID" new-key)))))
 
 (defun ejira--finalize-new-issue (new-key marker orig-state todo-keywords)
   "Post-create housekeeping for a newly-created Jira issue NEW-KEY.
@@ -331,11 +388,7 @@ parent's assign-self cell."
                    ;; request reaches Jira but whose response is lost
                    ;; must look created, or the next save duplicates the
                    ;; ticket.
-                   (org-with-point-at child-marker
-                     (org-set-property "Creating"
-                                       (format-time-string "%Y-%m-%d %H:%M:%S")))
-                   (with-current-buffer (marker-buffer child-marker)
-                     (ejira--save-buffer-safe))
+                   (setq child-marker (ejira--commit-creation-journal child-marker))
                    (ejira--jira-write (format "create %s under %s" child-type parent-key)
                      (apply #'jiralib2-create-issue
                             project-key child-type
@@ -350,15 +403,32 @@ parent's assign-self cell."
                                            (when priority-id
                                              `(priority . ((id . ,priority-id)))))))))))
          (new-key (ejira--alist-get result 'key)))
-    (ejira--record-new-issue-key new-key child-marker)
-    (org-with-point-at child-marker
-      (org-delete-property "Creating"))
+    (setq child-marker (ejira--record-new-issue-key new-key child-marker))
     (when assign-self
       (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
         (when my-name
           (ejira--jira-write (format "assign %s" new-key)
             (jiralib2-assign-issue new-key my-name)))))
-    (ejira--finalize-new-issue new-key child-marker orig-state todo-keywords)))
+    (ejira--finalize-new-issue new-key child-marker orig-state todo-keywords)
+    (ejira--commit-issue new-key)))
+
+(defun ejira--commit-issue (key)
+  "Make the sync metadata of issue KEY's heading durable in its file.
+Called once a send has finished changing the heading (see
+`ejira--commit-heading').  Return nil when the heading is gone."
+  (when-let ((m (ejira--find-heading key)))
+    (ejira--commit-heading m)))
+
+(defun ejira--clear-pending (marker key property)
+  "Remove the staged PROPERTY of issue KEY once Jira has applied it.
+MARKER is where the heading was at plan time.  The removal reaches the
+file with the rest of the heading's metadata: a staged change left
+there would be sent again by the next review."
+  (ejira--refresh-buffers (cons (marker-buffer marker) (ejira--tracked-buffers)))
+  (let ((m (ejira--resolve-heading marker (list (cons "ID" key)))))
+    (org-with-point-at m
+      (org-delete-property property))
+    (ejira--commit-heading m)))
 
 (defun ejira--push-priority-label (priority-id reference-key)
   "Return the review label of new-issue PRIORITY-ID, or nil without one.
@@ -375,30 +445,40 @@ the plan never calls the server for it.  An uncached scheme shows the id."
 
 (defun ejira--push-finalize (marker &optional reviewed-hash remote-identity
                                     priority)
-  "Refresh MARKER's push baseline after a successful push and save its buffer.
+  "Refresh MARKER's push baselines after a successful push; make them durable.
 
 With REVIEWED-HASH, re-baseline only when the heading still matches the
-state that was reviewed and sent; content edited while the confirmation
-was open was never sent, and keeps the heading dirty so the next save
-re-reviews it.  With REMOTE-IDENTITY, also record the acknowledged
-remote field state for three-way reconciliation.  With PRIORITY, a
-plist (:id :name :rank) of the priority Jira now holds, record it as
-the heading's Jira priority before re-baselining."
+state that was reviewed and sent.  Content edited after the review (in
+the buffer while the confirmation was open, or in the file by another
+writer) was never sent, so the heading stays dirty for the next review.
+With REMOTE-IDENTITY, record the remote field state the push left in
+Jira, for three-way reconciliation.  It is recorded even when the
+heading changed after the review, because it describes Jira, not the
+heading.  Without it, the next cycle would mistake the push for a
+remote change and hold the issue as changed on both sides.  PRIORITY,
+a plist (:id :name :rank) of the priority Jira now holds, is recorded
+the same way."
+  ;; The push waited on Jira: edit the current version of the file.
+  (let ((locators (org-with-point-at marker (ejira--heading-locators))))
+    (ejira--refresh-buffers (cons (marker-buffer marker) (ejira--tracked-buffers)))
+    (setq marker (ejira--resolve-heading marker locators)))
   (org-with-point-at marker
-    (if (and reviewed-hash
-             (not (equal reviewed-hash
-                         (md5 (ejira--heading-reviewed-hash)))))
-        (message "ejira: %s changed since review; keeping it dirty"
-                 (or (org-entry-get nil "ID") "<heading>"))
+    ;; Compared before recording the priority: the priority identity is
+    ;; one of the hashed content fields.
+    (let ((changed (and reviewed-hash
+                        (not (equal reviewed-hash
+                                    (md5 (ejira--heading-reviewed-hash)))))))
       (when remote-identity
         (org-set-property ejira-remote-hash-property
                           (md5 remote-identity)))
       (when priority
         (ejira--record-priority-identity priority))
-      (ejira--update-push-baseline)))
+      (if changed
+          (message "ejira: %s changed since review; keeping it dirty"
+                   (or (org-entry-get nil "ID") "<heading>"))
+        (ejira--update-push-baseline))))
   (let ((ejira--pushing t))
-    (with-current-buffer (marker-buffer marker)
-      (ejira--save-buffer-safe))))
+    (ejira--commit-heading marker)))
 
 (defun ejira--buffer-has-pushable-p ()
   "Return non-nil if the current buffer contains any ejira-managed heading."
@@ -674,13 +754,20 @@ the heading's Jira priority before re-baselining."
                                  (org-entry-get nil "ID")))))
                           (proj (when issue-key (car (split-string issue-key "-")))))
                      (when issue-key
-                       (push (list :op 'create
-                                   :object 'comment
-                                   :key nil
-                                   :project proj
-                                   :parent-issue issue-key
-                                   :marker marker
-                                   :data (list :issue-key issue-key))
+                       (push (if (org-entry-get nil "Creating")
+                                 ;; As for issues: the earlier attempt may
+                                 ;; have reached Jira; never post blindly.
+                                 (list :op 'blocked
+                                       :marker marker
+                                       :title heading-title
+                                       :reason "previous comment creation attempt has unknown outcome; check Jira, then either set the heading's CommId or remove the Creating property")
+                               (list :op 'create
+                                     :object 'comment
+                                     :key nil
+                                     :project proj
+                                     :parent-issue issue-key
+                                     :marker marker
+                                     :data (list :issue-key issue-key)))
                              ops))))))
              (goto-char (line-end-position))))
          ;; Only projects ejira syncs: a heading of another project is
@@ -912,8 +999,11 @@ the heading's Jira priority before re-baselining."
                                            key `(duedate . ,local-deadline))))
                                       (when state-changed
                                         (ejira--transition-to-org-state key local-state todo-kws))
-                                      (ejira--push-finalize marker reviewed-hash
-                                                            sent-identity local-priority))))
+                                      ;; Resolved again after the requests: a
+                                      ;; reload may have moved the heading.
+                                      (ejira--push-finalize
+                                       (ejira--resolve-heading marker (list (cons "ID" key)))
+                                       reviewed-hash sent-identity local-priority))))
                       plans)
               ;; No changes vs remote — re-baseline to clear the dirty hash
               ;; and record the remote fields as the new acknowledged state.
@@ -969,7 +1059,9 @@ the heading's Jira priority before re-baselining."
                                            (jiralib2-edit-comment
                                             issue-key commid
                                             (ejira-parser-org-to-jira body comment-level)))
-                                         (ejira--push-finalize marker reviewed-hash))))))))
+                                         (ejira--push-finalize
+                                          (ejira--resolve-heading marker (list (cons "CommId" commid)))
+                                          reviewed-hash))))))))
          ((and (eq op-type 'update) (eq object 'status))
           (let ((action-name (plist-get data :action-name)))
             (setq plan (list :op 'update
@@ -989,8 +1081,7 @@ the heading's Jira priority before re-baselining."
                                                (ejira--jira-write (format "transition %s: %s" key action-name)
                                                  (jiralib2-do-action key (car action)))
                                                (ejira--update-task-or-hold key)
-                                               (org-with-point-at marker
-                                                 (org-delete-property "PendingTransition")))
+                                               (ejira--clear-pending marker key "PendingTransition"))
                                            (error "ejira: transition '%s' not available for %s"
                                                   action-name key)))))))))
          ((and (eq op-type 'update) (eq object 'issuetype))
@@ -1007,8 +1098,7 @@ the heading's Jira priority before re-baselining."
                                        (ejira--jira-write (format "set %s issue type" key)
                                          (jiralib2-set-issue-type key new-type))
                                        (ejira--update-task-or-hold key)
-                                       (org-with-point-at marker
-                                         (org-delete-property "PendingIssuetype"))))))))
+                                       (ejira--clear-pending marker key "PendingIssuetype")))))))
          ((and (eq op-type 'update) (eq object 'epic))
           (let ((new-epic (plist-get data :new-epic)))
             (setq plan (list :op 'update
@@ -1023,8 +1113,7 @@ the heading's Jira priority before re-baselining."
                                        (ejira--jira-write (format "set %s epic link" key)
                                          (jiralib2-update-issue key `(,epic-field . ,new-epic)))
                                        (ejira--update-task-or-hold key)
-                                       (org-with-point-at marker
-                                         (org-delete-property "PendingEpic"))))))))
+                                       (ejira--clear-pending marker key "PendingEpic")))))))
          ((and (eq op-type 'create) (eq object 'subtask))
           (let* ((parent-key (plist-get data :parent-key))
                  (project-key (plist-get data :project-key))
@@ -1075,16 +1164,12 @@ the heading's Jira priority before re-baselining."
                                        ;; Resolve the heading by its ID: an
                                        ;; earlier send may have moved it.
                                        (setq marker (ejira--creation-target marker target-id))
-                                       ;; Journal the attempt before the
-                                       ;; request: if Jira accepts it and the
-                                       ;; response is lost, the :Creating:
-                                       ;; property blocks a blind duplicate
-                                       ;; on the next save.
-                                       (org-with-point-at marker
-                                         (org-set-property "Creating"
-                                                           (format-time-string "%Y-%m-%d %H:%M:%S")))
-                                       (with-current-buffer (marker-buffer marker)
-                                         (ejira--save-buffer-safe))
+                                       ;; Journal the attempt in the file
+                                       ;; before the request: if Jira accepts
+                                       ;; it and the response is lost, the
+                                       ;; :Creating: property blocks a blind
+                                       ;; duplicate on the next scan.
+                                       (setq marker (ejira--commit-creation-journal marker))
                                        (let* ((priority-id
                                                (or priority-id
                                                    (ejira--default-priority-id
@@ -1102,9 +1187,7 @@ the heading's Jira priority before re-baselining."
                                          ;; Identity first: a failure in any
                                          ;; later step must not make the
                                          ;; heading look uncreated.
-                                         (ejira--record-new-issue-key new-key marker)
-                                         (org-with-point-at marker
-                                           (org-delete-property "Creating"))
+                                         (setq marker (ejira--record-new-issue-key new-key marker))
                                          (when (car assign-self)
                                            (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
                                              (when my-name
@@ -1113,7 +1196,7 @@ the heading's Jira priority before re-baselining."
                                          (ejira--finalize-new-issue-review-safe
                                           new-key marker orig-state todo-kws
                                           reviewed-summary reviewed-body)
-                                         )))))))
+                                         (ejira--commit-issue new-key))))))))
 
          ((and (eq op-type 'create) (eq object 'issue))
           (let* ((project-key      (plist-get data :project-key))
@@ -1184,13 +1267,10 @@ the heading's Jira priority before re-baselining."
                                        ;; Resolve the heading by its ID: an
                                        ;; earlier send may have moved it.
                                        (setq marker (ejira--creation-target marker target-id))
-                                       ;; Journal the attempt before the
-                                       ;; request; see the subtask path.
-                                       (org-with-point-at marker
-                                         (org-set-property "Creating"
-                                                           (format-time-string "%Y-%m-%d %H:%M:%S")))
-                                       (with-current-buffer (marker-buffer marker)
-                                         (ejira--save-buffer-safe))
+                                       ;; Journal the attempt in the file
+                                       ;; before the request; see the
+                                       ;; subtask path.
+                                       (setq marker (ejira--commit-creation-journal marker))
                                        (let* ((epic-name-arg
                                                (when (and is-epic epic-summary-field)
                                                  `(,epic-summary-field . ,summary)))
@@ -1227,9 +1307,7 @@ the heading's Jira priority before re-baselining."
                                          ;; Identity first: a failure in any
                                          ;; later step must not make the
                                          ;; heading look uncreated.
-                                         (ejira--record-new-issue-key new-key marker)
-                                         (org-with-point-at marker
-                                           (org-delete-property "Creating"))
+                                         (setq marker (ejira--record-new-issue-key new-key marker))
                                          (when (car assign-self)
                                            (let ((my-name (cdr (assoc 'name (jiralib2-get-user-info)))))
                                              (when my-name
@@ -1238,6 +1316,7 @@ the heading's Jira priority before re-baselining."
                                          (ejira--finalize-new-issue-review-safe
                                           new-key marker orig-state todo-kws
                                           summary local-body)
+                                         (ejira--commit-issue new-key)
                                          (dolist (child children)
                                            (condition-case err
                                                (ejira--push-create-cascaded-child
@@ -1261,17 +1340,40 @@ the heading's Jira priority before re-baselining."
                              :parent-issue issue-key
                              :preview preview
                              :send (let ((marker marker) (issue-key issue-key)
-                                         (body body))
+                                         (body body)
+                                         ;; The draft's identity until Jira
+                                         ;; assigns the comment id.
+                                         (target-id (ejira--creation-target-id marker)))
                                      (lambda ()
+                                       (setq marker (ejira--creation-target marker target-id))
+                                       ;; Journal the attempt in the file, as
+                                       ;; issue creation does: a lost response
+                                       ;; must not post the comment twice.
+                                       (setq marker (ejira--commit-creation-journal marker))
                                        (let* ((comment (ejira--parse-comment
                                                         (ejira--jira-write (format "add comment on %s" issue-key)
                                                           (jiralib2-add-comment
                                                            issue-key
-                                                           (ejira-parser-org-to-jira body))))))
-                                         (org-with-point-at marker
-                                           (org-set-property "CommId" (ejira-comment-id comment))
-                                           (org-set-property "TYPE" "ejira-comment"))
-                                         (ejira--update-comment issue-key comment))))))))
+                                                           (ejira-parser-org-to-jira body)))))
+                                              (commid (format "%s" (ejira-comment-id comment))))
+                                         ;; The comment id replaces the draft's
+                                         ;; ID and journal in one write, before
+                                         ;; anything else can fail.
+                                         (unless (ejira--commit-edit
+                                                  (marker-buffer marker)
+                                                  (lambda ()
+                                                    (ejira--apply-heading-patch
+                                                     (list (cons "ID" target-id))
+                                                     `(("CommId" . ,commid)
+                                                       ("TYPE" . "ejira-comment")
+                                                       ("ID")
+                                                       ("Creating")))))
+                                           (error "ejira: added comment %s on %s, but its heading is no longer in %s; the next sync imports it"
+                                                  commid issue-key (buffer-name (marker-buffer marker))))
+                                         (ejira--update-comment issue-key comment)
+                                         (ejira--commit-heading
+                                          (ejira--resolve-heading
+                                           marker (list (cons "CommId" commid)))))))))))
          ((and (eq op-type 'delete) (eq object 'comment))
           (let* ((issue-key (plist-get data :issue-key))
                  (commid (plist-get data :commid))
@@ -1286,9 +1388,15 @@ the heading's Jira priority before re-baselining."
                                      (lambda ()
                                        (ejira--jira-write (format "delete comment %s on %s" commid issue-key)
                                          (jiralib2-delete-comment issue-key commid))
-                                       (org-with-point-at marker
-                                         (ejira--with-expand-all
-                                           (org-cut-subtree))))))))))
+                                       ;; Removed from the file too: a heading
+                                       ;; left there would be deleted again by
+                                       ;; the next review.  A heading already
+                                       ;; gone from the file needs nothing.
+                                       (ejira--commit-edit
+                                        (marker-buffer marker)
+                                        (lambda ()
+                                          (ejira--apply-heading-patch
+                                           (list (cons "CommId" commid)) 'cut))))))))))
         (when plan (push plan plans))))
     (nreverse plans)))
 
@@ -1303,23 +1411,34 @@ operates on buffer text regardless of fold state."
      (let ((ejira--pre-scanning t))
        ,@body)))
 
+(defun ejira--save-plan-build-edits ()
+  "Save what building push plans wrote into the current buffer.
+Building plans assigns creation IDs and re-baselines headings that
+already match Jira; those edits are ejira's, and are saved unless the
+buffer also holds unsaved user edits, which stay for the user to save."
+  (unless (ejira--user-edits-p)
+    (let ((ejira--pushing t))
+      (ejira--save-buffer-safe))))
+
 (defun ejira-push-at-point ()
   "Scan the ejira heading at point and show ejira-confirm for it."
   (interactive)
-  (ejira--with-pre-scan (current-buffer)
-    (let* ((ops (ejira--push-scan-buffer (current-buffer)))
-           (point-ops (cl-remove-if-not
-                       (lambda (op)
-                         (let ((m (plist-get op :marker)))
-                           (and m (equal (marker-buffer m) (current-buffer))
-                                (= (save-excursion (goto-char m)
-                                                   (line-beginning-position))
-                                   (line-beginning-position)))))
-                       ops))
-           (plans (when point-ops (ejira--push-build-plans point-ops))))
-      (if plans
-          (ejira-confirm-show plans)
-        (message "ejira: nothing to push at point")))))
+  (ejira--with-transaction
+    (ejira--with-pre-scan (current-buffer)
+      (let* ((ops (ejira--push-scan-buffer (current-buffer)))
+             (point-ops (cl-remove-if-not
+                         (lambda (op)
+                           (let ((m (plist-get op :marker)))
+                             (and m (equal (marker-buffer m) (current-buffer))
+                                  (= (save-excursion (goto-char m)
+                                                     (line-beginning-position))
+                                     (line-beginning-position)))))
+                         ops))
+             (plans (when point-ops (ejira--push-build-plans point-ops))))
+        (ejira--save-plan-build-edits)
+        (if plans
+            (ejira-confirm-show plans)
+          (message "ejira: nothing to push at point"))))))
 
 (defun ejira--auto-sync-file-p (&optional file)
   "Return non-nil when FILE (default: current buffer's file) auto-syncs.
@@ -1356,16 +1475,18 @@ automatic reconciliation queue instead, with review."
              (derived-mode-p 'org-mode)
              (not (ejira--auto-sync-file-p))
              (ejira--buffer-has-pushable-p))
-    (ejira--with-pre-scan (current-buffer)
-      (let* ((ops   (ejira--push-scan-buffer (current-buffer)))
-             (plans (when ops (ejira--push-build-plans ops))))
-        (dolist (op ops)
-          (when (eq (plist-get op :op) 'blocked)
-            (message "ejira: %s — %s"
-                     (or (plist-get op :title) "<heading>")
-                     (plist-get op :reason))))
-        (when plans
-          (ejira-confirm-show plans))))))
+    (ejira--with-transaction
+      (ejira--with-pre-scan (current-buffer)
+        (let* ((ops   (ejira--push-scan-buffer (current-buffer)))
+               (plans (when ops (ejira--push-build-plans ops))))
+          (ejira--save-plan-build-edits)
+          (dolist (op ops)
+            (when (eq (plist-get op :op) 'blocked)
+              (message "ejira: %s — %s"
+                       (or (plist-get op :title) "<heading>")
+                       (plist-get op :reason))))
+          (when plans
+            (ejira-confirm-show plans)))))))
 
 (add-hook 'after-save-hook #'ejira--push-on-save)
 
