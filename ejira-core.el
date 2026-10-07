@@ -353,7 +353,7 @@ Set to nil to disable assigned-tag management entirely.")
                        v)
                       ((consp v) (ejira--alist-get v 'key))))))
      :priority (ejira--alist-get item 'fields 'priority 'name)
-     :priority-id (when-let ((id (ejira--alist-get item 'fields 'priority 'id)))
+     :priority-id (when-let* ((id (ejira--alist-get item 'fields 'priority 'id)))
                     (format "%s" id))
      :summary (ejira--parse-body (ejira--alist-get item 'fields 'summary))
      :description (ejira--alist-get item 'fields 'description)
@@ -441,7 +441,7 @@ not provide allowed values."
 
 (defun ejira--priority-policy-rank (project priority-id)
   "Return PROJECT's configured rank for PRIORITY-ID, or nil."
-  (when-let ((policy (ejira--priority-policy project)))
+  (when-let* ((policy (ejira--priority-policy project)))
     (or (cdr (assoc (ejira--priority-id-string priority-id)
                     (plist-get policy :ranks)))
         (plist-get policy :fallback-rank))))
@@ -460,7 +460,7 @@ not provide allowed values."
   "Return the one-based rank of PRIORITY-ID in SCHEME.
 Use PROJECT's configured policy when one exists."
   (or (ejira--priority-policy-rank project priority-id)
-      (when-let ((position
+      (when-let* ((position
                   (cl-position (ejira--priority-id-string priority-id) scheme
                                :key (lambda (entry) (plist-get entry :id))
                                :test #'equal)))
@@ -1003,9 +1003,9 @@ converted to Org; callers hold the issue and report it."
               (unless local-dirty-p
                 (org-set-property "Modified" (format-time-string "%Y-%m-%d %H:%M:%S"
                                                                  updated "UTC")))
-              (when-let ((minutes (and estimate (/ estimate 60))))
+              (when-let* ((minutes (and estimate (/ estimate 60))))
                 (org-set-property "Effort" (format "%02d:%02d" (/ minutes 60) (% minutes 60))))
-              (when-let ((minutes (and remaining-estimate (/ remaining-estimate 60))))
+              (when-let* ((minutes (and remaining-estimate (/ remaining-estimate 60))))
                 (org-set-property "Left" (format "%02d:%02d" (/ minutes 60) (% minutes 60))))))
 
           (ejira--get-subheading (ejira--find-heading key) ejira-comments-heading-name)
@@ -1172,7 +1172,7 @@ can wedge into an uninterruptible loop."
 (defun ejira--post-capture-comment ()
   "Stage captured comment for push via ejira-confirm on next save."
   (unless org-note-abort
-    (when-let ((m (save-excursion
+    (when-let* ((m (save-excursion
                     (when (search-backward "<new comment>" nil t)
                       (beginning-of-line)
                       (point-marker)))))
@@ -1228,7 +1228,7 @@ storing unconverted markup."
         content
         (save-excursion (org-back-to-heading t) (org-current-level)))))
      (t
-      (when-let ((description
+      (when-let* ((description
                   (ejira--get-subheading (point-marker)
                                          ejira-description-heading-name)))
         (ejira--set-heading-body-jira-markup description content))))))
@@ -1546,13 +1546,13 @@ body.  Normalized so the fingerprint ignores cosmetic whitespace changes."
               ;; Include the exact Jira identity once a heading has been
               ;; migrated.  Omitting it for legacy headings preserves their
               ;; existing baseline until the safe migration path runs.
-              (or (when-let ((priority-id
+              (or (when-let* ((priority-id
                               (org-entry-get nil ejira-priority-id-property)))
                     (concat "\0" (ejira--push-normalize priority-id)))
                   "")
               "\0"
               (ejira--push-normalize
-               (or (when-let ((d (org-get-deadline-time (point-marker))))
+               (or (when-let* ((d (org-get-deadline-time (point-marker))))
                      (format-time-string "%Y-%m-%d" d))
                    ""))
               "\0"
@@ -1571,7 +1571,7 @@ pull reconciles and a push sends.  A shallow pull never fetches them."
            (or (org-entry-get nil ejira-priority-id-property) ""))
           "\0"
           (ejira--push-normalize
-           (or (when-let ((d (org-get-deadline-time (point-marker))))
+           (or (when-let* ((d (org-get-deadline-time (point-marker))))
                  (format-time-string "%Y-%m-%d" d))
                ""))))
 
@@ -1596,7 +1596,7 @@ instead."
 (defun ejira--content-modified-p ()
   "Return non-nil when the task at point's content fields differ from baseline.
 A missing content baseline is treated as unmodified."
-  (when-let ((baseline (org-entry-get nil "Pushhash")))
+  (when-let* ((baseline (org-entry-get nil "Pushhash")))
     (not (equal baseline
                 (concat ejira-pushhash-v2-prefix
                         (md5 (ejira--heading-content-fields)))))))
@@ -1620,7 +1620,7 @@ so they agree whenever ejira last touched them."
 (defun ejira--state-modified-p ()
   "Return non-nil when the task at point's state fields differ from baseline.
 A missing state baseline is treated as unmodified."
-  (when-let ((baseline (org-entry-get nil ejira-state-hash-property)))
+  (when-let* ((baseline (org-entry-get nil ejira-state-hash-property)))
     (or (not (equal baseline (md5 (ejira--heading-state-fields))))
         (ejira--priority-cookie-modified-p))))
 
@@ -1632,7 +1632,7 @@ keeps its single full-content `Pushhash'; it is upgraded to v2 by
 `ejira--migrate-push-baseline' on its next clean full pull or push."
   (if (ejira--v2-baseline-p)
       (ejira--migrate-push-baseline)
-    (when-let ((content (ejira--heading-pushable-content)))
+    (when-let* ((content (ejira--heading-pushable-content)))
       (org-set-property "Pushhash" (md5 content)))))
 
 (defun ejira--migrate-push-baseline ()
@@ -1642,7 +1642,7 @@ full pull or a completed push), so legacy single-hash issue headings
 upgrade without changing their behavior meanwhile.  Comment headings
 never adopt the v2 split: their baseline stays the single body hash."
   (if (equal (org-entry-get nil "TYPE") "ejira-comment")
-      (when-let ((content (ejira--heading-pushable-content)))
+      (when-let* ((content (ejira--heading-pushable-content)))
         (org-set-property "Pushhash" (md5 content)))
     (org-set-property
      "Pushhash"
@@ -1660,7 +1660,7 @@ Headings without a baseline are treated as unmodified; the baseline
 is established on the next sync or push, never during a plain save."
   (if (ejira--v2-baseline-p)
       (or (ejira--content-modified-p) (ejira--state-modified-p))
-    (when-let ((baseline (org-entry-get nil "Pushhash"))
+    (when-let* ((baseline (org-entry-get nil "Pushhash"))
                (content (ejira--heading-pushable-content)))
       (not (equal baseline (md5 content))))))
 
@@ -1751,7 +1751,7 @@ here, and callers distinguish it from a known change explicitly."
 Such comments must not be overwritten by a comment rewrite during a
 full pull."
   (ejira--with-point-on key
-    (when-let ((comments (ejira--find-child-heading
+    (when-let* ((comments (ejira--find-child-heading
                           ejira-comments-heading-name)))
       (cl-some (lambda (m) (org-with-point-at m (ejira--locally-modified-p)))
                (ejira--comment-heading-markers comments)))))
@@ -1841,14 +1841,14 @@ In body-as-description mode the description is the task's owned body region."
       (org-with-point-at heading (ejira--jira-description))
     (cond
      ((ejira--jira-projection-p)
-      (when-let ((description
+      (when-let* ((description
                   (ejira--find-child-heading
                    ejira-jira-description-heading-name)))
         (ejira--get-heading-body description)))
      ((ejira--description-in-body-p)
       (ejira--get-task-description))
      (t
-      (when-let ((description
+      (when-let* ((description
                   (ejira--find-child-heading ejira-description-heading-name)))
         (ejira--get-heading-body description))))))
 
@@ -2427,7 +2427,7 @@ whose VALUE is nil are skipped."
 PATCH is an alist of (PROPERTY . VALUE): a string VALUE sets PROPERTY
 and nil removes it.  The symbol `cut' deletes the heading's subtree
 instead.  Return non-nil when the heading was found."
-  (when-let ((pos (ejira--locate-heading locators)))
+  (when-let* ((pos (ejira--locate-heading locators)))
     (org-with-wide-buffer
      (goto-char pos)
      (if (eq patch 'cut)
@@ -2443,9 +2443,9 @@ instead.  Return non-nil when the heading was found."
   "Return locators (see `ejira--locate-heading') for the heading at point.
 Its comment id, its ID, and the ID it had before an issue key replaced it."
   (delq nil
-        (list (when-let ((c (org-entry-get (point) "CommId"))) (cons "CommId" c))
-              (when-let ((i (org-entry-get (point) "ID"))) (cons "ID" i))
-              (when-let ((o (org-entry-get (point) "ORIG_ID"))) (cons "ID" o)))))
+        (list (when-let* ((c (org-entry-get (point) "CommId"))) (cons "CommId" c))
+              (when-let* ((i (org-entry-get (point) "ID"))) (cons "ID" i))
+              (when-let* ((o (org-entry-get (point) "ORIG_ID"))) (cons "ID" o)))))
 
 (defun ejira--edit-file (file edit coding)
   "Apply EDIT to FILE on disk, bypassing any buffer visiting it.
@@ -2511,7 +2511,7 @@ shows up as a local change for the next review."
                  (append
                   (delq nil
                         (mapcar (lambda (p)
-                                  (when-let ((v (org-entry-get (point) p)))
+                                  (when-let* ((v (org-entry-get (point) p)))
                                     (cons p v)))
                                 ejira--sync-properties))
                   (mapcar (lambda (p) (cons p (org-entry-get (point) p)))
@@ -2650,7 +2650,7 @@ With EXCLUDE-COMMENT do not include comments in the search."
 
 (defun ejira--delete-comment (key id)
   "Stage comment ID of item KEY for deletion via ejira-confirm on next save."
-  (when-let ((m (ejira--find-child-heading-property "CommId" id)))
+  (when-let* ((m (ejira--find-child-heading-property "CommId" id)))
     (org-with-point-at m
       (org-set-property "PendingDelete" "t")))
   (message "ejira: comment deletion staged — save buffer to confirm."))
@@ -2792,7 +2792,7 @@ Without type, match for all ejira types (task, epic, story, subtask)"
        (ejira--with-expand-all
          (goto-char (point-min))
          (cl-loop while (search-forward-regexp "^\\*\\{1,4\\} " nil t)
-                  if (and (when-let ((type (org-entry-get (point) "TYPE")))
+                  if (and (when-let* ((type (org-entry-get (point) "TYPE")))
                             (member type types))
                           (if tags
                               (let ((tags_ (org-get-tags)))

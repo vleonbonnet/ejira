@@ -23,6 +23,7 @@ Individual cells are mutable `(list t)' stored on each plan's
 ;; Defined in ejira.el; loaded after this file.  Auto-sync files route
 ;; their saves to the reconciliation queue instead of the review buffer.
 (defvar ejira-auto-sync-files)
+(defvar ejira--sync-in-progress)
 (declare-function ejira--auto-sync-enqueue "ejira" (file &optional review))
 
 (defvar ejira-state-resolution-alist
@@ -112,7 +113,7 @@ keeps the ID as ORIG_ID and rewrites links to it."
     (or (org-entry-get nil "ID")
         (let ((id (org-id-new)))
           (org-entry-put nil "ID" id)
-          (when-let ((file (buffer-file-name (buffer-base-buffer))))
+          (when-let* ((file (buffer-file-name (buffer-base-buffer))))
             (org-id-add-location id file))
           id))))
 
@@ -135,7 +136,7 @@ error when the heading is gone."
                       (point-marker)))))))
         (and buf
              (with-current-buffer buf
-               (when-let ((pos (ejira--locate-heading locators)))
+               (when-let* ((pos (ejira--locate-heading locators)))
                  (copy-marker pos))))
         (cl-some (lambda (loc)
                    (and (equal (car loc) "ID")
@@ -416,7 +417,7 @@ parent's assign-self cell."
   "Make the sync metadata of issue KEY's heading durable in its file.
 Called once a send has finished changing the heading (see
 `ejira--commit-heading').  Return nil when the heading is gone."
-  (when-let ((m (ejira--find-heading key)))
+  (when-let* ((m (ejira--find-heading key)))
     (ejira--commit-heading m)))
 
 (defun ejira--clear-pending (marker key property)
@@ -523,7 +524,7 @@ the same way."
                    (push (list :op 'delete
                                :object 'comment
                                :key (org-entry-get nil "CommId")
-                               :project (when-let ((ik (org-entry-get nil "ID" t))) (car (split-string ik "-")))
+                               :project (when-let* ((ik (org-entry-get nil "ID" t))) (car (split-string ik "-")))
                                :parent-issue (org-entry-get nil "ID" t)
                                :marker marker
                                :data (list :issue-key (org-entry-get nil "ID" t)
@@ -825,7 +826,7 @@ the same way."
                  (desc-level (org-with-point-at marker
                                (if (ejira--description-in-body-p)
                                    (org-current-level)
-                                 (when-let ((d (ejira--find-child-heading
+                                 (when-let* ((d (ejira--find-child-heading
                                                 (if (ejira--jira-projection-p)
                                                     ejira-jira-description-heading-name
                                                   ejira-description-heading-name))))
@@ -846,7 +847,7 @@ the same way."
                           :rank (ejira--priority-rank priority-scheme
                                                       local-priority-id
                                                       project))))
-                 (local-deadline (when-let ((d (org-get-deadline-time marker)))
+                 (local-deadline (when-let* ((d (org-get-deadline-time marker)))
                                    (format-time-string "%Y-%m-%d" d)))
                  (remote-summary (when item (ejira--alist-get item 'fields 'summary)))
                  (remote-desc-org (when item

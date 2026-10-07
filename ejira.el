@@ -37,6 +37,9 @@
 (require 'ejira-confirm)
 (require 'ejira-push)
 
+(defvar ejira--sync-in-progress)
+(defvar ejira-auto-pull-interval)
+
 
 
 
@@ -158,7 +161,7 @@ Called from async callbacks once all network responses have arrived."
 		 (delq nil
                        (mapcar (lambda (id)
 				 (let ((path (expand-file-name (ejira--project-file-name id))))
-                                   (when-let ((buf (find-buffer-visiting path)))
+                                   (when-let* ((buf (find-buffer-visiting path)))
                                      (with-current-buffer buf
                                        (cons buf (org-fold-core-get-regions))))))
                                projects))))
@@ -199,7 +202,7 @@ Called from async callbacks once all network responses have arrived."
             ;; Normalize: ensure exactly one blank line after every :END: closer.
             ;; No-ops when spacing is already correct — see ejira--normalize-end-spacing.
             (dolist (id projects)
-              (when-let ((buf (find-buffer-visiting
+              (when-let* ((buf (find-buffer-visiting
                                (expand-file-name (ejira--project-file-name id)))))
 		(with-current-buffer buf
                   (ejira--normalize-end-spacing))))
@@ -216,7 +219,7 @@ Called from async callbacks once all network responses have arrived."
                                    collect (marker-buffer m))
                           :test #'eq))))
               (dolist (id projects)
-		(when-let ((buf (find-buffer-visiting
+		(when-let* ((buf (find-buffer-visiting
 				 (expand-file-name (ejira--project-file-name id)))))
                   (cl-pushnew buf touched :test #'eq)))
               (dolist (buf touched)
@@ -387,7 +390,7 @@ comments. With SHALLOW, only update todo status and assignee."
             ;; resolved   |
 
             ;; Normalize spacing on the project buffer.
-            (when-let ((buf (find-buffer-visiting
+            (when-let* ((buf (find-buffer-visiting
                              (expand-file-name (ejira--project-file-name id)))))
               (with-current-buffer buf
 		(ejira--normalize-end-spacing)))
@@ -399,14 +402,14 @@ comments. With SHALLOW, only update todo status and assignee."
                                    when (and (markerp m) (marker-buffer m))
                                    collect (marker-buffer m))
                           :test #'eq))))
-              (when-let ((buf (find-buffer-visiting
+              (when-let* ((buf (find-buffer-visiting
                                (expand-file-name (ejira--project-file-name id)))))
 		(cl-pushnew buf touched :test #'eq))
               (dolist (buf touched)
 		(with-current-buffer buf
                   (ejira--save-buffer-safe))))
             ;; Restore fold state on the project buffer.
-            (when-let ((buf (find-buffer-visiting
+            (when-let* ((buf (find-buffer-visiting
                              (expand-file-name (ejira--project-file-name id)))))
               (with-current-buffer buf
 		(org-fold-core-regions vis-save :override t))))))
@@ -866,7 +869,7 @@ second, because the mode line asks on every redisplay."
 Then keep one version: save the buffer to overwrite the file, or revert
 it to take the file's version."
   (interactive)
-  (if-let ((buf (car (ejira--disk-conflict-buffers))))
+  (if-let* ((buf (car (ejira--disk-conflict-buffers))))
       (diff-buffer-with-file buf)
     (message "ejira: no auto-sync buffer conflicts with its file")))
 
@@ -1001,7 +1004,7 @@ here.  A conversion failure is reported through ON-HOLD (see
       (let ((created (unless (ejira--find-heading key)
                        (ejira--new-heading buf parent key))))
         (if (ejira--update-task-or-hold item on-hold)
-            (when-let ((m (ejira--find-heading key)))
+            (when-let* ((m (ejira--find-heading key)))
               (org-with-point-at m (ejira--store-remote-baseline item))
               t)
           ;; Held: remove the empty placeholder so the next cycle retries
@@ -1061,7 +1064,7 @@ timestamp is active (JIRA dates import as inactive timestamps)."
          (diffs nil)
          (local nil))
     (ejira--with-point-on key
-      (when-let ((cm (ejira--find-child-heading ejira-comments-heading-name)))
+      (when-let* ((cm (ejira--find-child-heading ejira-comments-heading-name)))
         (dolist (m (ejira--comment-heading-markers cm))
           (org-with-point-at m
             (push (list (org-entry-get (point) "CommId") m (ejira--locally-modified-p))
@@ -1393,7 +1396,7 @@ is reloaded and the file queued again."
                            (when (let ((ejira--force-full-update t))
                                    (ejira--update-task-or-hold item on-hold))
                              ;; The heading may have been refiled; re-find it.
-                             (when-let ((m (ejira--find-heading key)))
+                             (when-let* ((m (ejira--find-heading key)))
                                (org-with-point-at m
                                  (ejira--store-remote-baseline item)))))))
                      ;; Pulls and imports reach the file before the plans

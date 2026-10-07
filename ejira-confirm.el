@@ -89,7 +89,7 @@ FIELDS is a list of (NAME OLD NEW) string triples."
   "Return the org heading title for Jira KEY, or nil if not found."
   (when (and (stringp key) (fboundp 'ejira--find-heading))
     (condition-case nil
-        (when-let ((m (ejira--find-heading key)))
+        (when-let* ((m (ejira--find-heading key)))
           (org-with-point-at m
             (org-no-properties (org-get-heading t t t t))))
       (error nil))))
@@ -107,10 +107,10 @@ FIELDS is a list of (NAME OLD NEW) string triples."
 Without FIELDS, PREVIEW becomes a single body field."
   (or (delq nil
             (mapcar (lambda (f)
-                      (when-let ((v (ejira-confirm--present (nth 1 f))))
+                      (when-let* ((v (ejira-confirm--present (nth 1 f))))
                         (list :name (nth 0 f) :new v)))
                     fields))
-      (when-let ((body (ejira-confirm--present preview)))
+      (when-let* ((body (ejira-confirm--present preview)))
         (list (list :name "body" :new body)))))
 
 (defun ejira-confirm--create-label (plan)
@@ -164,13 +164,13 @@ Without FIELDS, PREVIEW becomes a single body field."
               :fields (ejira-confirm--value-fields (plist-get plan :fields)
                                                    (plist-get plan :preview))
               :children (mapcar #'ejira-confirm--child-item (plist-get plan :children))
-              :toggles (when-let ((cell (plist-get plan :assign-self)))
+              :toggles (when-let* ((cell (plist-get plan :assign-self)))
                          (list (list :key 'assign-self :label "assign to me" :cell cell)))))
        ('delete
         (list :label (plist-get plan :title)
               :kind 'deleted
               :warning "permanent"
-              :fields (when-let ((body (ejira-confirm--present (plist-get plan :preview))))
+              :fields (when-let* ((body (ejira-confirm--present (plist-get plan :preview))))
                         (list (list :name "body" :old body)))))
        (_
         (list :label (ejira-confirm--update-label plan)

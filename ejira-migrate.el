@@ -13,6 +13,11 @@
 ;;
 ;; Set `ejira-migrate--apply' to t to write; nil = dry run.
 
+(require 'cl-lib)
+(require 'seq)
+(require 'subr-x)
+(require 'ejira-push)
+
 (defvar ejira-migrate--apply nil)
 (defvar ejira-migrate--file "/Users/val/Documents/projects/pr-bot/secateur/todo.org")
 (defvar ejira-migrate--result nil)
@@ -91,7 +96,7 @@ LEVEL heading become a single (:level 0) verbatim block."
             (let* ((meta-end (ejira-migrate--meta-end own))
                    (meta (seq-take own meta-end))
                    (prose (seq-drop own meta-end))
-                   (parsed (ejira-migrate--parse rest (1+ level))))
+                   (parsed (ejira-migrate--parse rest (1+ l))))
               (push (list :level l
                           :heading-line heading-line
                           :title (string-trim
@@ -106,13 +111,16 @@ LEVEL heading become a single (:level 0) verbatim block."
                           :own prose
                           :children (car parsed))
                     blocks)
-              (setq lines (cdr parsed)))))))
-  (cons (nreverse blocks) lines)))
+              (setq lines (cdr parsed))))))))
+    (cons (nreverse blocks) lines)))
 
 (defun ejira-migrate--render-block (b)
   "Flatten block B back into lines."
   (if (= 0 (plist-get b :level))
-      (plist-get b :lines)
+      (append (plist-get b :lines)
+              (apply #'append
+                     (mapcar #'ejira-migrate--render-block
+                             (plist-get b :children))))
     (let ((body (append
                  (plist-get b :own)
                  (apply #'append
@@ -215,7 +223,7 @@ Returns (NEW-BLOCK . FOLD-INFO-OR-NIL)."
                                   (t 'diff))
                     :baseline-heading (plist-get b :heading-line)
                     :baseline-meta (plist-get b :meta)
-                    :baseline-body remote-equiv-body)))))))
+                    :baseline-body remote-equiv-body))))))
 
 (defun ejira-migrate--content-identity ()
   "Return the canonical content identity for the heading at point.
@@ -230,7 +238,7 @@ binds `ejira-description-in-body'."
     (or (org-entry-get nil ejira-priority-id-property) ""))
    "\0"
    (ejira--push-normalize
-    (or (when-let ((d (org-get-deadline-time (point-marker))))
+    (or (when-let* ((d (org-get-deadline-time (point-marker))))
           (format-time-string "%Y-%m-%d" d))
         ""))))
 
@@ -254,10 +262,10 @@ binds `ejira-description-in-body'."
 
 (defun ejira-migrate--set-props (meta-lines prop-alist)
   "Set drawer properties in META-LINES from PROP-ALIST."
-  (let ((lines (copy-sequence meta-lines))
-        (drawer-start (cl-position-if
-                       (lambda (l) (string-match-p "^:PROPERTIES:" l))
-                       lines)))
+  (let* ((lines (copy-sequence meta-lines))
+         (drawer-start (cl-position-if
+                        (lambda (l) (string-match-p "^:PROPERTIES:" l))
+                        lines)))
     (dolist (p prop-alist)
       (let ((pat (concat "^:" (regexp-quote (car p)) ":[ \t]*.*$"))
             (found nil))
