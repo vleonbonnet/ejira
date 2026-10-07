@@ -2716,9 +2716,12 @@ whenever their file was saved."
                (updated . "2026-09-21T10:00:00.000+0000")))))
 
 (ert-deftest ejira-auto-sync/discovers-children-created-in-jira ()
-  "An unresolved Jira child of an epic in the file is imported under it.
+  "An open Jira child of an epic in the file is imported under it.
 Regression: the cycle fetched only the keys the file already held, so
-an issue created in Jira under a synced epic never reached the file."
+an issue created in Jira under a synced epic never reached the file.
+Open means not in a terminal status.  Regression: the query asked for
+an empty resolution, which RNDSEC's Cancelled never sets, so archived
+cancelled issues were pulled on every cycle."
   (when (get-buffer "*ejira sync log*")
     (with-current-buffer "*ejira sync log*" (erase-buffer)))
   (ejira-test--with-project-dir ejira-test--discover-content
@@ -2736,7 +2739,7 @@ an issue created in Jira under a synced epic never reached the file."
                                             ((symbol-function 'ejira--push-scan-buffer) (lambda (_buf) nil)))
                                     (ejira--auto-sync-reconcile file))
                                   (should (string-match-p "cf\\[10857\\] in (TEST-1)" jql))
-                                  (should (string-match-p "resolution = Unresolved" jql))
+                                  (should (string-match-p "statusCategory != Done" jql))
                                   (with-current-buffer buf
                                     (goto-char (point-min))
                                     (should (re-search-forward "^\\*\\*\\* TODO Created in Jira" nil t))

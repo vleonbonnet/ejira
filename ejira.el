@@ -63,8 +63,10 @@ Used by both `ejira-update-my-projects' (full list) and `ejira-update-project'
 
 (defun ejira-jql-all-unresolved-multi-project-tickets (project-ids)
   "Default multi-project JQL for `ejira-update-jql-unresolved-multi-fn'.
-Returns unresolved tickets across all PROJECT-IDS."
-  (format "project in (%s) and resolution = unresolved"
+Returns the open tickets across all PROJECT-IDS: those not in a terminal
+status (status category Done).  The resolution field is not used: a
+workflow can end an issue without setting one."
+  (format "project in (%s) and statusCategory != Done"
           (s-join ", " (mapcar (lambda (p) (format "'%s'" p)) project-ids))))
 
 (defun ejira-jql-all-resolved-project-tickets (project-id keys)
@@ -911,8 +913,9 @@ but which the file does not contain yet (created in Jira, or by someone
 else), is otherwise never pulled: the cycle only fetches the keys the
 file already holds.
   nil         never import;
-  `unresolved' import unresolved children;
-  `all'        import children whatever their resolution."
+  `unresolved' import open children: those not in a terminal status
+               (status category Done), whatever their resolution field;
+  `all'        import children whatever their status."
   :group 'ejira
   :type '(choice (const :tag "Never" nil)
                  (const :tag "Unresolved children" unresolved)
@@ -975,8 +978,13 @@ the other issue headings); see `ejira-auto-sync-discover'."
                         (when ejira-projects
                           (format " AND project in (%s)"
                                   (s-join ", " ejira-projects)))
+                        ;; Open means not in a terminal status.  A workflow
+                        ;; can end an issue without a resolution (RNDSEC's
+                        ;; Cancelled sets none), and such an issue is
+                        ;; finished: re-importing it from the archive that
+                        ;; holds it would pull it again on every cycle.
                         (when (eq ejira-auto-sync-discover 'unresolved)
-                          " AND resolution = Unresolved"))
+                          " AND statusCategory != Done"))
                 (ejira--get-fields-to-sync nil)))))))
 
 (defun ejira--auto-sync-import (item buf &optional on-hold)
