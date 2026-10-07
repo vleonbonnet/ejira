@@ -63,7 +63,8 @@
 
 (defcustom ejira-epic-child-type-name "Task"
   "Jira issue type to create when a TODO heading is added directly under an Epic.
-Defaults to \"Task\"; set to \"Story\" if your team prefers stories under epics."
+Defaults to \"Task\"; set to \"Story\" if your team prefers stories under
+epics."
   :group 'ejira
   :type 'string)
 
@@ -78,7 +79,8 @@ and creation emits a warning."
   :type '(choice (const nil) symbol))
 
 (defcustom ejira-epic-parent-issuetypes '("Initiative")
-  "Jira issue types under which new TODO headings create Epics rather than subtasks.
+  "Jira issue types under which new TODO headings create Epics rather than
+subtasks.
 Defaults to (\"Initiative\").  Add other top-level planning types (e.g. \"Goal\")
 if your project hierarchy uses them as Epic parents."
   :group 'ejira
@@ -159,10 +161,12 @@ IDs in :selectable are offered by `ejira-set-priority'; omitted Jira IDs use
                                      ("In Progress" . 2)
                                      ("Done"        . 3))
   "Association list to convert from JIRA todo states to `org-mode' todo states.
-The org-state is defined as a number, which is a 1-based index of an element in
+The org-state is defined as a number, which is a 1-based index of an element
+in
 `org-todo-keywords'.
 The default value is applicable for:
- (setq org-todo-keywords '((sequence \"TODO\" \"IN PROGRESS\" \"|\" \"DONE\")))"
+ (setq org-todo-keywords \='((sequence \"TODO\" \"IN PROGRESS\" \"|\"
+ \"DONE\")))"
   :group 'ejira
   :tag "JIRA state map"
   :type '(alist :key-type (string :tag "JIRA State")
@@ -173,7 +177,8 @@ The default value is applicable for:
     (alist-get status ejira-todo-states-alist 1 nil #'equal))
   "Function to map a Jira STATUS and RESOLUTION to an org-mode todo index.
 The index is 1-based into `org-todo-keywords-1'. Override to implement
-resolution-aware mappings (e.g. Closed+Fixed→DONE vs Closed+Won't Fix→CANCELED)."
+resolution-aware mappings (e.g. Closed+Fixed→DONE vs Closed+Won't
+Fix→CANCELED)."
   :group 'ejira
   :type 'function)
 
@@ -1424,7 +1429,8 @@ and the reserved Comments container are never tasks."
              (not (equal type "ejira-comment"))))))
 
 (defun ejira--description-boundary ()
-  "Return the position where the description-owned region of the task at point ends.
+  "Return the position where the description-owned region of the task at point
+ends.
 Point must be on the task heading.  The region ends before the first
 descendant heading that is itself a task or the reserved Comments
 container, or at the end of the task's subtree.  Content after such a
@@ -1757,7 +1763,8 @@ full pull."
                (ejira--comment-heading-markers comments)))))
 
 (defun ejira--normalize-end-spacing ()
-  "Ensure exactly one blank line after every :END: drawer closer in the current buffer."
+  "Ensure exactly one blank line after every :END: drawer closer in the current
+buffer."
   (save-excursion
     (goto-char (point-min))
     (while (re-search-forward "^[ \t]*:END:[ \t]*\n" nil t)
@@ -1982,7 +1989,8 @@ task heading itself."
 
 (defun ejira--new-heading (buffer parent id)
   "Create a header with ID under PARENT into BUFFER and return a marker to it.
-If TITLE is given, use it as header title. If PARENT is nil assume the beginning
+If TITLE is given, use it as header title. If PARENT is nil assume the
+beginning
 of the document.
 
 Never creates a second heading for an ID that is already present -- it
@@ -2364,7 +2372,8 @@ holding the user's edits over a changed file is left alone and reported."
             (ejira--auto-sync-enqueue file)))))))
 
 (defmacro ejira--with-transaction (&rest body)
-  "Run BODY as one sync operation; see `ejira--txn-begin' and `ejira--txn-settle'.
+  "Run BODY as one sync operation; see `ejira--txn-begin' and
+`ejira--txn-settle'.
 Nested uses join the running operation.  While it runs, an edit of a
 stale buffer fails instead of asking (`ejira--refuse-supersession')."
   (declare (indent 0) (debug t))
@@ -2648,7 +2657,7 @@ With EXCLUDE-COMMENT do not include comments in the search."
   "Get ID of the issue or project under point (ingores comments)."
   (nth 1 (ejira-get-id-under-point nil t)))
 
-(defun ejira--delete-comment (key id)
+(defun ejira--delete-comment (_key id)
   "Stage comment ID of item KEY for deletion via ejira-confirm on next save."
   (when-let* ((m (ejira--find-child-heading-property "CommId" id)))
     (org-with-point-at m
@@ -2777,7 +2786,7 @@ With SHALLOW update only todo state."
   "Get ejira headings from FILENAME with parameters PLIST.
 Parameters:
   :type     match for the TYPE-property (defaults to task, project and epic)
-  :resolved match for the resolved status of the item. either 'todo or 'done
+  :resolved match for the resolved status of the item. either `todo' or `done'
   :tags     match for the tags (defaults to any)
 Without type, match for all ejira types (task, epic, story, subtask)"
   (let* ((type-arg (or (plist-get plist :type) '("ejira-issue" "ejira-epic"

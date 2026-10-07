@@ -1,4 +1,4 @@
-;;; helm-ejira.el --- Helm-completion for ejira.el
+;;; helm-ejira.el --- Helm-completion for ejira.el -*- lexical-binding: nil; -*-
 
 ;; Copyright (C) 2017-2019 Henrik Nyman
 

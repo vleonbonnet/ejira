@@ -1,4 +1,4 @@
-;;; ejira-agenda.el --- org-agenda integration for ejira
+;;; ejira-agenda.el --- org-agenda integration for ejira -*- lexical-binding: nil; -*-
 
 ;; Copyright (C) 2017 - 2019 Henrik Nyman
 
@@ -178,7 +178,7 @@ parameters."
 	     (t (error "Line update did not work")))
 
 	    (save-restriction
-	      (narrow-to-region (point-at-bol) (point-at-eol))
+	      (narrow-to-region (line-beginning-position) (line-end-position))
 	      (org-agenda-finalize)))
           (beginning-of-line 0))))
 

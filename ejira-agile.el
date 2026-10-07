@@ -1,4 +1,4 @@
-;;; ejira-agile.el --- Scrum and Kanban functionality for ejira
+;;; ejira-agile.el --- Scrum and Kanban functionality for ejira -*- lexical-binding: nil; -*-
 
 ;; Copyright (C) 2017 - 2019 Henrik Nyman
 

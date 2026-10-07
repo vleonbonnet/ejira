@@ -1,4 +1,4 @@
-;;; ejira-parser.el --- Parsing to and from JIRA markup.
+;;; ejira-parser.el --- Parsing to and from JIRA markup. -*- lexical-binding: nil; -*-
 
 ;; Copyright (C) 2017 Henrik Nyman
 

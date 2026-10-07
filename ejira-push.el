@@ -30,7 +30,7 @@ Individual cells are mutable `(list t)' stored on each plan's
   '((5 . "Done")
     (6 . "Won't Fix"))
   "Alist mapping org-todo-keyword index to the Jira resolution name used when
-a transition requires a resolution field (e.g. the 'Closed' workflow step).
+a transition requires a resolution field (e.g. the `Closed' workflow step).
 Index values correspond to positions in org-todo-keywords-1 (1-based).")
 
 (defun ejira--transition-to-org-state (key org-state todo-keywords)
@@ -81,7 +81,8 @@ Signals an error if no matching transition is available or the API call fails."
             (jiralib2-do-action key action-id)))))))
 
 (defun ejira--nearest-task-ancestor ()
-  "Return (TYPE ID ISSUETYPE) of the nearest task ancestor of the heading at point.
+  "Return (TYPE ID ISSUETYPE) of the nearest task ancestor of the heading at
+point.
 Plain (non-task) sections between a TODO and its task ancestor are
 skipped, so a TODO nested under a descriptive heading still belongs to
 the enclosing task's hierarchy.  Returns nil when there is no task or
@@ -226,7 +227,7 @@ it under its parent."
         (ejira--commit-edit b (lambda () (ejira--rewrite-id-links orig new-key)))))
     (ejira--resolve-heading marker (list (cons "ID" new-key)))))
 
-(defun ejira--finalize-new-issue (new-key marker orig-state todo-keywords)
+(defun ejira--finalize-new-issue (new-key _marker orig-state todo-keywords)
   "Post-create housekeeping for a newly-created Jira issue NEW-KEY.
 Tries to transition the Jira issue to ORIG-STATE before refreshing so
 the push baseline is stamped with the final state.  If the transition
@@ -296,7 +297,8 @@ heading by NEW-KEY."
 CHILDREN are direct-child plists (:marker :id :title :state :body
 :priority-id) captured for cascade creation (see
 `ejira--creation-target-id' for :id); the priority comes from
-the child's Org cookie within PROJECT-KEY's policy.  BLOCKED-OPS are ops for TODOs deeper than the
+the child's Org cookie within PROJECT-KEY's policy.  BLOCKED-OPS are ops for
+TODOs deeper than the
 direct children: the native Jira hierarchy has no place for them, so
 they are reported instead of being silently flattened or lost.  The
 child bodies are prepared (moved into description position) here, at

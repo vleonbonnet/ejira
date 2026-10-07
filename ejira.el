@@ -45,7 +45,8 @@
 
 (defvar ejira-update-jql-resolved-fn #'ejira-jql-all-resolved-project-tickets
   "Generates JQL used in `ejira-update-project' to find server-resolved items.
-Must take a project-id as a string, a list of keys, and return JQL as a string.")
+Must take a project-id as a string, a list of keys, and return JQL as a
+string.")
 
 (defvar ejira-update-jql-unresolved-multi-fn
   #'ejira-jql-all-unresolved-multi-project-tickets
@@ -124,7 +125,8 @@ This is the function used in `ejira-update-project'. Override with
 
 (defvar ejira--trace-file nil
   "When set to a file path, `ejira--apply-sync' appends timestamped phase
-traces there.  Debugging aid for locating where a sync stalls; nil disables it.")
+traces there.  Debugging aid for locating where a sync stalls; nil disables
+it.")
 
 (defun ejira--trace (fmt &rest args)
   "Append a timestamped FMT/ARGS line to `ejira--trace-file' when set."
@@ -264,16 +266,17 @@ whose local copy is stale is resolved without pushing it."
 
 
 
-(defun ejira-heading-to-task (focus)
+(defun ejira-heading-to-task (_focus)
   "Mark the current heading as a pending Jira issue creation.
-Ensure it has a TODO state; save the buffer to stage creation via ejira-confirm.
+Ensure it has a TODO state; save the buffer to stage creation via
+ejira-confirm.
 FOCUS is accepted for compatibility but has no effect until confirmed."
   (interactive "P")
   (unless (org-get-todo-state)
     (org-todo (car org-todo-keywords-1)))
   (message "ejira: heading marked as pending issue — save buffer to stage."))
 
-(defun ejira-heading-to-subtask (focus)
+(defun ejira-heading-to-subtask (_focus)
   "Mark the current heading as a pending Jira subtask creation.
 Save the buffer to stage creation via ejira-confirm."
   (interactive "P")
@@ -1597,7 +1600,8 @@ With prefix-argument TO-ME assign to me."
 
 ;;;###autoload
 (defun ejira-progress-issue ()
-  "Stage a Jira status transition. The actual transition is confirmed via ejira-confirm on save."
+  "Stage a Jira status transition. The actual transition is confirmed via
+ejira-confirm on save."
   (interactive)
   (let* ((key (ejira-issue-id-under-point))
          (actions (jiralib2-get-actions key))
@@ -1691,8 +1695,8 @@ With prefix-argument TO-ME assign to me."
      (ejira-issue-id-under-point))))
 
 (define-minor-mode ejira-mode
-  "Ejira Mode"
-  "Minor mode for managing JIRA ticket in a narrowed org buffer."
+  "Minor mode for managing JIRA tickets in a narrowed Org buffer."
+  :lighter " Ejira"
   :init-value nil
   :global nil
   :keymap (let ((map (make-sparse-keymap)))
