@@ -41,6 +41,9 @@
 
 (require 'ejira-parser)
 
+;; Defined in ejira-push.el, which requires this file.
+(declare-function ejira--adopt-creation-journal "ejira-push" (task))
+
 
 
 (defgroup ejira nil
@@ -887,191 +890,205 @@ converted to Org; callers hold the issue and report it."
                  (not (ejira--find-heading epic)))
         (ejira--update-task epic))
 
-      ;; Find or create the issue heading.  Bind the marker so the skip check
-      ;; and any other callers reuse the same cache hit rather than calling
-      ;; ejira--find-heading again.
-      (unless (ejira--find-heading key)
-        (when (fboundp 'helm-ejira-invalidate-cache) (helm-ejira-invalidate-cache))
-        (ejira--new-heading (marker-buffer (ejira--find-heading project))
-                            (or parent project)
-                            key))
-      (let* ((key-m (ejira--find-heading key))
-             (modified-p
-              (or ejira--force-full-update
-                  ejira--discard-local-edits
-                  (not (equal (org-entry-get key-m "Modified")
-                              (format-time-string "%Y-%m-%d %H:%M:%S"
-                                                  updated "UTC")))))
-             ;; A legacy heading can already contain a real local edit.  Do
-             ;; not reinterpret its old Org cookie as an outbound Jira
-             ;; priority while migrating it.  For a v2 heading only the
-             ;; content fields gate summary/description imports: a pending
-             ;; local state edit must not block a description pull.
-             (local-dirty-p
-              (and (not ejira--discard-local-edits)
-                   (org-with-point-at key-m
-                     (if (ejira--v2-baseline-p)
-                         (ejira--content-modified-p)
-                       (ejira--locally-modified-p)))))
-             (state-dirty-p
-              ;; Pending local state edits (todo keyword, assignee, status)
-              ;; on a v2 heading: the pull keeps the local values and leaves
-              ;; them dirty for the push flow instead of reversing them.
-              (and (not ejira--discard-local-edits)
-                   (org-with-point-at key-m
-                     (and (ejira--v2-baseline-p) (ejira--state-modified-p)))))
-             (stored-priority-id
-              (org-entry-get key-m ejira-priority-id-property))
-             (stored-priority-name
-              (org-entry-get key-m ejira-priority-name-property))
-             (stored-priority-rank
-              (org-entry-get key-m ejira-priority-rank-property))
-             (priority-scheme
-              (when priority-id (ejira--get-priority-scheme key)))
-             (remote-priority-rank
-              (when priority-id
-                (ejira--priority-rank priority-scheme priority-id project)))
-             (priority-needs-sync
-              (or modified-p
-                  (not (equal stored-priority-id priority-id))
-                  (not (equal stored-priority-name priority))
-                  (not (equal stored-priority-rank
-                              (and remote-priority-rank
-                                   (number-to-string remote-priority-rank))))))
-             (priority-migration-skipped-p
-              (and local-dirty-p
-                   (not stored-priority-id)
-                   priority-needs-sync))
-             (priority-applied-p nil))
+      ;; Find or create the issue heading.  An issue missing locally may
+      ;; be the outcome of a creation whose response was lost: its
+      ;; journaled heading takes the key instead of a duplicate heading.
+      (let ((adopted
+             (unless (ejira--find-heading key)
+               (when (fboundp 'helm-ejira-invalidate-cache) (helm-ejira-invalidate-cache))
+               (or (and (fboundp 'ejira--adopt-creation-journal)
+                        (ejira--adopt-creation-journal
+                         (make-ejira-task :key key :summary summary :created created
+                                          :parent parent :epic epic :project project)))
+                   (progn
+                     (ejira--new-heading (marker-buffer (ejira--find-heading project))
+                                         (or parent project)
+                                         key)
+                     nil)))))
+        ;; Bind the marker so the skip check
+        ;; and any other callers reuse the same cache hit rather than calling
+        ;; ejira--find-heading again.
+        (let* ((key-m (ejira--find-heading key))
+               (modified-p
+                (or ejira--force-full-update
+                    ejira--discard-local-edits
+                    (not (equal (org-entry-get key-m "Modified")
+                                (format-time-string "%Y-%m-%d %H:%M:%S"
+                                                    updated "UTC")))))
+               ;; A legacy heading can already contain a real local edit.  Do
+               ;; not reinterpret its old Org cookie as an outbound Jira
+               ;; priority while migrating it.  For a v2 heading only the
+               ;; content fields gate summary/description imports: a pending
+               ;; local state edit must not block a description pull.
+               (local-dirty-p
+                (and (not ejira--discard-local-edits)
+                     (org-with-point-at key-m
+                       (if (ejira--v2-baseline-p)
+                           (ejira--content-modified-p)
+                         (ejira--locally-modified-p)))))
+               (state-dirty-p
+                ;; Pending local state edits (todo keyword, assignee, status)
+                ;; on a v2 heading: the pull keeps the local values and leaves
+                ;; them dirty for the push flow instead of reversing them.
+                (and (not ejira--discard-local-edits)
+                     (org-with-point-at key-m
+                       (and (ejira--v2-baseline-p) (ejira--state-modified-p)))))
+               (stored-priority-id
+                (org-entry-get key-m ejira-priority-id-property))
+               (stored-priority-name
+                (org-entry-get key-m ejira-priority-name-property))
+               (stored-priority-rank
+                (org-entry-get key-m ejira-priority-rank-property))
+               (priority-scheme
+                (when priority-id (ejira--get-priority-scheme key)))
+               (remote-priority-rank
+                (when priority-id
+                  (ejira--priority-rank priority-scheme priority-id project)))
+               (priority-needs-sync
+                (or modified-p
+                    (not (equal stored-priority-id priority-id))
+                    (not (equal stored-priority-name priority))
+                    (not (equal stored-priority-rank
+                                (and remote-priority-rank
+                                     (number-to-string remote-priority-rank))))))
+               (priority-migration-skipped-p
+                (and local-dirty-p
+                     (not stored-priority-id)
+                     priority-needs-sync))
+               (priority-applied-p nil))
 
-        ;; Priority metadata is handled separately so an unchanged heading can
-        ;; still be migrated from the old global name map.
-        (when (and priority-needs-sync (not priority-migration-skipped-p))
-          (ejira--set-task-priority key-m priority-id priority priority-scheme project)
-          (setq priority-applied-p t))
+          ;; Priority metadata is handled separately so an unchanged heading can
+          ;; still be migrated from the old global name map.
+          (when (and priority-needs-sync (not priority-migration-skipped-p))
+            (ejira--set-task-priority key-m priority-id priority priority-scheme project)
+            (setq priority-applied-p t))
 
-        ;; Skip expensive field/comment updates when Jira reports no changes.
-        ;; Modified stores the last-seen Jira updated timestamp; equality means
-        ;; nothing else on the server changed since the last sync.
-        (when modified-p
-          ;; Convert first, change second: a description or comment that
-          ;; cannot be converted aborts the pull before the heading is
-          ;; touched, so it is never half-applied.
-          (ejira--validate-remote-markup (unless local-dirty-p description)
-                                         comments)
-          (unless state-dirty-p
-            (ejira--set-todo-state key (funcall ejira-todo-state-fn status resolution)))
+          ;; Skip expensive field/comment updates when Jira reports no changes.
+          ;; Modified stores the last-seen Jira updated timestamp; equality means
+          ;; nothing else on the server changed since the last sync.
+          (when modified-p
+            ;; Convert first, change second: a description or comment that
+            ;; cannot be converted aborts the pull before the heading is
+            ;; touched, so it is never half-applied.
+            (ejira--validate-remote-markup (unless local-dirty-p description)
+                                           comments)
+            (unless state-dirty-p
+              (ejira--set-todo-state key (funcall ejira-todo-state-fn status resolution)))
 
-          (ejira--set-property key "TYPE" (symbol-name org-type))
+            (ejira--set-property key "TYPE" (symbol-name org-type))
 
-          ;; JIRA's copy of the summary and description must not overwrite
-          ;; unpushed local edits: the push-confirmation flow owns outbound
-          ;; changes, and clobbering here would silently drop them.
-          (when local-dirty-p
-            (message "ejira: %s has unpushed local edits; keeping local summary and description"
-                     key))
-          (unless local-dirty-p
-            (ejira--set-summary key summary))
+            ;; JIRA's copy of the summary and description must not overwrite
+            ;; unpushed local edits: the push-confirmation flow owns outbound
+            ;; changes, and clobbering here would silently drop them.
+            (when local-dirty-p
+              (message "ejira: %s has unpushed local edits; keeping local summary and description"
+                       key))
+            (unless local-dirty-p
+              (ejira--set-summary key summary))
 
-          ;; Set the sprint tag
-          (if state-dirty-p
-              (message "ejira: %s has unpushed local state edits; keeping local state"
-                       key)
-            (ejira--with-point-on key
-              (dolist (tag (org-get-tags))
-                (when (s-starts-with-p ejira-sprint-tagname-prefix tag)
-                  (org-toggle-tag tag 'off)))
+            ;; Set the sprint tag
+            (if state-dirty-p
+                (message "ejira: %s has unpushed local state edits; keeping local state"
+                         key)
+              (ejira--with-point-on key
+                (dolist (tag (org-get-tags))
+                  (when (s-starts-with-p ejira-sprint-tagname-prefix tag)
+                    (org-toggle-tag tag 'off)))
 
-              (when sprint (org-toggle-tag sprint 'on))
+                (when sprint (org-toggle-tag sprint 'on))
 
-              ;; Update deadline (4 is the prefix argument to remove deadline)
-              ;; The deadline is a content field: a pending local edit must
-              ;; not be clobbered with the remote value.
-              (unless local-dirty-p
-                (if deadline (org-deadline nil deadline) (org-deadline '(4))))
+                ;; Update deadline (4 is the prefix argument to remove deadline)
+                ;; The deadline is a content field: a pending local edit must
+                ;; not be clobbered with the remote value.
+                (unless local-dirty-p
+                  (if deadline (org-deadline nil deadline) (org-deadline '(4))))
 
-              (org-set-property "Status" status)
-              (when reporter
-                (org-set-property "Reporter" reporter))
-              (org-set-property "Assignee" (or assignee ""))
-              (when ejira-assigned-tagname
-                (if (equal assignee (ejira--my-fullname))
-                    (org-toggle-tag ejira-assigned-tagname 'on)
-                  (org-toggle-tag ejira-assigned-tagname 'off)))
+                (org-set-property "Status" status)
+                (when reporter
+                  (org-set-property "Reporter" reporter))
+                (org-set-property "Assignee" (or assignee ""))
+                (when ejira-assigned-tagname
+                  (if (equal assignee (ejira--my-fullname))
+                      (org-toggle-tag ejira-assigned-tagname 'on)
+                    (org-toggle-tag ejira-assigned-tagname 'off)))
 
-              (org-set-property "Issuetype" type)
-              (org-set-property "Created" (format-time-string "%Y-%m-%d %H:%M:%S"
-                                                              created "UTC"))
-              ;; Do not advance Modified while local edits are pending: the
-              ;; deferred summary/description update must be retried after the
-              ;; push resolves the dirtiness, not silently dropped.
-              (unless local-dirty-p
-                (org-set-property "Modified" (format-time-string "%Y-%m-%d %H:%M:%S"
-                                                                 updated "UTC")))
-              (when-let* ((minutes (and estimate (/ estimate 60))))
-                (org-set-property "Effort" (format "%02d:%02d" (/ minutes 60) (% minutes 60))))
-              (when-let* ((minutes (and remaining-estimate (/ remaining-estimate 60))))
-                (org-set-property "Left" (format "%02d:%02d" (/ minutes 60) (% minutes 60))))))
+                (org-set-property "Issuetype" type)
+                (org-set-property "Created" (format-time-string "%Y-%m-%d %H:%M:%S"
+                                                                created "UTC"))
+                ;; Do not advance Modified while local edits are pending: the
+                ;; deferred summary/description update must be retried after the
+                ;; push resolves the dirtiness, not silently dropped.
+                (unless local-dirty-p
+                  (org-set-property "Modified" (format-time-string "%Y-%m-%d %H:%M:%S"
+                                                                   updated "UTC")))
+                (when-let* ((minutes (and estimate (/ estimate 60))))
+                  (org-set-property "Effort" (format "%02d:%02d" (/ minutes 60) (% minutes 60))))
+                (when-let* ((minutes (and remaining-estimate (/ remaining-estimate 60))))
+                  (org-set-property "Left" (format "%02d:%02d" (/ minutes 60) (% minutes 60))))))
 
-          (ejira--get-subheading (ejira--find-heading key) ejira-comments-heading-name)
-          (unless local-dirty-p
-            (ejira--set-jira-description-jira-markup key description))
+            (ejira--get-subheading (ejira--find-heading key) ejira-comments-heading-name)
+            (unless local-dirty-p
+              (ejira--set-jira-description-jira-markup key description))
 
-          ;; Update existing, and insert missing comments
-          (mapc (-partial #'ejira--update-comment key) comments)
+            ;; Update existing, and insert missing comments
+            (mapc (-partial #'ejira--update-comment key) comments)
 
-          ;; Delete removed comments -- but only when the embedded comment
-          ;; list is provably complete: a truncated page (Jira serves one
-          ;; page inside the issue response) must never delete local
-          ;; comments that merely fell outside it.
-          (if comments-complete
-              (ejira--kill-deleted-comments key (mapcar 'ejira-comment-id comments))
-            (message "ejira: %s comment list incomplete; skipping comment deletion" key))
+            ;; Delete removed comments -- but only when the embedded comment
+            ;; list is provably complete: a truncated page (Jira serves one
+            ;; page inside the issue response) must never delete local
+            ;; comments that merely fell outside it.
+            (if comments-complete
+                (ejira--kill-deleted-comments key (mapcar 'ejira-comment-id comments))
+              (message "ejira: %s comment list incomplete; skipping comment deletion" key))
 
-          ;; Ensure comments are ordered by creation
-          (ejira--sort-comments key)
+            ;; Ensure comments are ordered by creation
+            (ejira--sort-comments key)
 
-          ;; Refile to enforce the Jira hierarchy.  Inside ejira-org-directory
-          ;; always enforce, so subtasks and stories stay nested correctly.
-          ;; A heading the user placed outside it (a refiled epic living with
-          ;; its backlog) is only re-nested within its own file: moving it
-          ;; to a parent in another file would take the whole subtree out of
-          ;; the user's file (observed: an epic's subtree moved into the
-          ;; project file under its Initiative).  Use file-truename on both
-          ;; sides to handle symlinks.
-          (let* ((target (cond ((and parent (ejira--find-heading parent)) parent)
-                               ((and epic (ejira--find-heading epic)) epic)
-                               (t project)))
-                 (heading-buf (marker-buffer (ejira--find-heading key)))
-                 (heading-file (buffer-file-name heading-buf))
-                 (target-m (ejira--find-heading target))
-                 ;; `heading-file' is nil for non-file-backed buffers
-                 ;; (tests, capture targets); treat them as outside the
-                 ;; ejira directory.
-                 (in-ejira-dir (and heading-file
-                                    (string-prefix-p
-                                     (file-truename (expand-file-name ejira-org-directory))
-                                     (file-truename heading-file))))
-                 (same-buffer (and target-m (eq (marker-buffer target-m) heading-buf))))
-            (when (if in-ejira-dir
-                      t
-                    (and (or parent epic) same-buffer))
-              (ejira--refile key target)))
-          (message "Updated %s: %s" key summary)
-          ;; Record the push baseline from the content we just wrote so later
-          ;; local edits are detectable.  Kept inside the guard: an unchanged
-          ;; item keeps its still-valid baseline and pays nothing — recomputing
-          ;; it for every item turned a no-op sync into O(items) body scans.
-          ;; A dirty heading keeps its old baseline: re-recording it would
-          ;; erase the very signal that the local edit still needs pushing.
-          (unless (or local-dirty-p state-dirty-p)
+            ;; Refile to enforce the Jira hierarchy.  Inside ejira-org-directory
+            ;; always enforce, so subtasks and stories stay nested correctly.
+            ;; A heading the user placed outside it (a refiled epic living with
+            ;; its backlog) is only re-nested within its own file: moving it
+            ;; to a parent in another file would take the whole subtree out of
+            ;; the user's file (observed: an epic's subtree moved into the
+            ;; project file under its Initiative).  Use file-truename on both
+            ;; sides to handle symlinks.
+            (let* ((target (cond ((and parent (ejira--find-heading parent)) parent)
+                                 ((and epic (ejira--find-heading epic)) epic)
+                                 (t project)))
+                   (heading-buf (marker-buffer (ejira--find-heading key)))
+                   (heading-file (buffer-file-name heading-buf))
+                   (target-m (ejira--find-heading target))
+                   ;; `heading-file' is nil for non-file-backed buffers
+                   ;; (tests, capture targets); treat them as outside the
+                   ;; ejira directory.
+                   (in-ejira-dir (and heading-file
+                                      (string-prefix-p
+                                       (file-truename (expand-file-name ejira-org-directory))
+                                       (file-truename heading-file))))
+                   (same-buffer (and target-m (eq (marker-buffer target-m) heading-buf))))
+              (when (if in-ejira-dir
+                        t
+                      (and (or parent epic) same-buffer))
+                (ejira--refile key target)))
+            (message "Updated %s: %s" key summary)
+            ;; Record the push baseline from the content we just wrote so later
+            ;; local edits are detectable.  Kept inside the guard: an unchanged
+            ;; item keeps its still-valid baseline and pays nothing — recomputing
+            ;; it for every item turned a no-op sync into O(items) body scans.
+            ;; A dirty heading keeps its old baseline: re-recording it would
+            ;; erase the very signal that the local edit still needs pushing.
+            (unless (or local-dirty-p state-dirty-p)
+              (ejira--with-point-on key (ejira--migrate-push-baseline))))
+
+          ;; For an unchanged, clean legacy heading, the priority migration is
+          ;; the only content change and must establish a new clean baseline.
+          (when (and priority-applied-p (not modified-p)
+                     (not local-dirty-p) (not state-dirty-p))
             (ejira--with-point-on key (ejira--migrate-push-baseline))))
-
-        ;; For an unchanged, clean legacy heading, the priority migration is
-        ;; the only content change and must establish a new clean baseline.
-        (when (and priority-applied-p (not modified-p)
-                   (not local-dirty-p) (not state-dirty-p))
-          (ejira--with-point-on key (ejira--migrate-push-baseline)))))))
+        ;; The pull replaced an adopted heading's content with what the
+        ;; creation sent; local edits made since were never sent.
+        (when adopted
+          (ejira--restore-adopted-content key adopted))))))
 
 (defun ejira--update-comment (key comment)
   "Update comment list of item KEY with data from COMMENT."
@@ -1237,6 +1254,41 @@ storing unconverted markup."
                   (ejira--get-subheading (point-marker)
                                          ejira-description-heading-name)))
         (ejira--set-heading-body-jira-markup description content))))))
+
+(defun ejira--set-jira-description-org (id content)
+  "Set issue ID's Jira-facing description to the Org text CONTENT.
+The Org counterpart of `ejira--set-jira-description-jira-markup', for
+local text that must come back exactly as it was written."
+  (ejira--with-point-on id
+    (cond
+     ((ejira--jira-projection-p)
+      (when-let* ((description
+                   (or (ejira--find-child-heading ejira-jira-description-heading-name)
+                       (unless (string-empty-p content)
+                         (ejira--get-subheading (point-marker)
+                                                ejira-jira-description-heading-name)))))
+        (ejira--set-heading-body description content)))
+     ((ejira--description-in-body-p)
+      (ejira--set-task-description content))
+     (t
+      (when-let* ((description
+                   (ejira--get-subheading (point-marker)
+                                          ejira-description-heading-name)))
+        (ejira--set-heading-body description content))))))
+
+(defun ejira--restore-adopted-content (key content)
+  "Put back the local CONTENT of KEY's heading that a pull replaced.
+CONTENT is (SUMMARY . DESCRIPTION), as `ejira--adopt-creation-journal'
+captured it before the pull.  A field the pull left equal is not
+touched.  A restored field differs from the baseline the pull wrote,
+so the heading is dirty and the next review offers the local version."
+  (ejira--with-point-on key
+    (unless (equal (ejira--push-normalize (car content))
+                   (ejira--push-normalize (ejira--jira-summary)))
+      (ejira--set-summary key (car content)))
+    (unless (equal (ejira--push-normalize (cdr content))
+                   (ejira--push-normalize (ejira--jira-description)))
+      (ejira--set-jira-description-org key (cdr content)))))
 
 (defun ejira--find-task-subheading (id heading)
   "Return marker to the subheading HEADING of task ID."

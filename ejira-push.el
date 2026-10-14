@@ -227,6 +227,99 @@ it under its parent."
         (ejira--commit-edit b (lambda () (ejira--rewrite-id-links orig new-key)))))
     (ejira--resolve-heading marker (list (cons "ID" new-key)))))
 
+(defcustom ejira-creation-adoption-window 600
+  "Seconds between a creation journal and an issue's creation in Jira.
+A pull meeting an issue missing locally takes it for the outcome of a
+creation journal (see `ejira--commit-creation-journal') when the
+journaled heading has its summary, belongs under its parent, and was
+journaled within this many seconds of the issue's creation time.  The
+two differ by the request's latency and the skew between the clocks."
+  :group 'ejira
+  :type 'integer)
+
+(defun ejira--creation-journals (parent)
+  "Return markers on the creation journals of new issues under PARENT.
+PARENT is the key of an issue, epic or project heading.  A journal is
+a TODO heading carrying `Creating' and no issue identity, whose nearest
+task ancestor is PARENT."
+  (when-let* ((pm (ejira--find-heading parent)))
+    (org-with-point-at pm
+      (org-with-wide-buffer
+       (let ((end (ejira--true-subtree-end))
+             found)
+         ;; Search the journal property first: most subtrees hold none,
+         ;; and a pull meets every issue of a fresh project.
+         (while (re-search-forward "^[ \t]*:Creating:" end t)
+           (save-excursion
+             (when (and (ignore-errors (org-back-to-heading t) t)
+                        (> (point) pm)
+                        (org-entry-get nil "Creating")
+                        (org-get-todo-state)
+                        (not (org-entry-get nil "TYPE"))
+                        (not (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'"
+                                             (or (org-entry-get nil "ID") "")))
+                        (not (org-in-commented-heading-p))
+                        (equal parent (nth 1 (ejira--nearest-task-ancestor))))
+               (push (point-marker) found))))
+         (nreverse (delete-dups found)))))))
+
+(defun ejira--creation-journal-for (task)
+  "Return a marker on the creation journal TASK is the outcome of, or nil.
+TASK is an `ejira-task' missing locally.  Its journal sits under TASK's
+parent, epic or (with neither) project, carries TASK's summary, and was
+journaled within `ejira-creation-adoption-window' of TASK's creation.
+Nil unless exactly one journal matches: two candidates are left for the
+user to tell apart."
+  (let* ((parents (or (delq nil (list (ejira-task-parent task) (ejira-task-epic task)))
+                      (list (ejira-task-project task))))
+         (summary (ejira--push-normalize (ejira-task-summary task)))
+         (created (ejira-task-created task))
+         (matches
+          (when created
+            (cl-loop
+             for parent in parents
+             append (cl-remove-if-not
+                     (lambda (m)
+                       (org-with-point-at m
+                         (let ((at (ignore-errors
+                                     (ejira--date-to-time (org-entry-get nil "Creating")))))
+                           (and at
+                                (<= (abs (float-time (time-subtract created at)))
+                                    ejira-creation-adoption-window)
+                                (equal summary
+                                       (ejira--push-normalize (ejira--jira-summary)))))))
+                     (ejira--creation-journals parent))))))
+    (when (= 1 (length matches))
+      (car matches))))
+
+(defun ejira--adopt-creation-journal (task)
+  "Give TASK's key to the creation journal TASK is the outcome of.
+A creation whose response was lost leaves its heading journaled and
+blocked, and the issue it created later reaches a pull as an issue
+missing locally.  Recording the key on the journaled heading resolves
+both at once, as the creation would have; creating a heading for the
+issue instead would duplicate it.
+
+Return nil when no journal matches (see `ejira--creation-journal-for').
+Otherwise return (SUMMARY . DESCRIPTION), the heading's Jira-facing
+content before the pull: edits made since the journal was written were
+never sent, and `ejira--restore-adopted-content' puts them back after
+the pull replaced them."
+  (when-let* ((journal (ejira--creation-journal-for task)))
+    (let* ((key (ejira-task-key task))
+           ;; Identity first, as for a creation: once the key is in the
+           ;; file, nothing can make the heading look uncreated again.
+           (m (ejira--record-new-issue-key key journal))
+           (summary (org-with-point-at m (ejira--jira-summary)))
+           ;; What creation would have done before sending: a legacy
+           ;; heading's body moves to its Description child.
+           (description (org-with-point-at m (ejira--prepare-new-issue-description))))
+      (ejira--auto-sync-log
+       (or (buffer-file-name (marker-buffer m)) (buffer-name (marker-buffer m)))
+       (list (format "%s: the creation of unknown outcome of \"%s\" took effect; its heading now carries the key"
+                     key summary)))
+      (cons summary description))))
+
 (defun ejira--finalize-new-issue (new-key _marker orig-state todo-keywords)
   "Post-create housekeeping for a newly-created Jira issue NEW-KEY.
 Tries to transition the Jira issue to ORIG-STATE before refreshing so

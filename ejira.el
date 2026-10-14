@@ -1062,13 +1062,20 @@ the other issue headings); see `ejira-auto-sync-discover'."
 The heading is created directly under the parent so it inherits the
 file's layout (body-as-description), then pulled and baselined.  An
 issue already present in another file is pulled, which refiles it
-here.  A conversion failure is reported through ON-HOLD (see
+here.  An issue created by a creation whose response was lost is
+pulled onto the journaled heading (see `ejira--adopt-creation-journal').
+A conversion failure is reported through ON-HOLD (see
 `ejira--update-task-or-hold') and leaves no heading behind."
   (let* ((key (ejira--alist-get item 'key))
          (parent (ejira--item-parent-key item))
          (parent-m (and parent (ejira--find-heading parent))))
     (when (and parent-m (eq (marker-buffer parent-m) buf))
-      (let ((created (unless (ejira--find-heading key)
+      (let ((created (unless (or (ejira--find-heading key)
+                                 ;; The outcome of a creation journal: the
+                                 ;; pull gives the journaled heading the key,
+                                 ;; and a placeholder would duplicate it.
+                                 (ignore-errors
+                                   (ejira--creation-journal-for (ejira--parse-item item))))
                        (ejira--new-heading buf parent key))))
         (if (ejira--update-task-or-hold item on-hold)
             (when-let* ((m (ejira--find-heading key)))

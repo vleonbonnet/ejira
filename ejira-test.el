@@ -3042,6 +3042,111 @@ visiting the file and `shown' holding the plans the review offered."
     (goto-char (point-min))
     (how-many (concat "^\\*+ TODO " (regexp-quote title) "$"))))
 
+(ert-deftest ejira-adopt/creation-journal-takes-the-key ()
+  "An issue a journaled creation produced lands on the journaled heading.
+The key replaces the journal, links to the old ID follow it, and
+nothing is held.  Regression: a creation whose response was lost left
+its heading blocked forever, and the issue it created was imported as
+a second heading."
+  (ejira-test--with-journal-cycle
+      (concat ejira-test--discover-content
+              "See [[id:" ejira-test--journal-id "][the new task]].\n"
+              (ejira-test--journal "Created in Jira" "2026-09-20T10:00:03+0000"
+                                   "Body text."))
+      (ejira-test--child-item "TEST-2" "Body text.")
+    (with-current-buffer buf
+      (should (= 1 (ejira-test--count-headings "Created in Jira")))
+      (goto-char (point-min))
+      (re-search-forward "^\\*\\*\\* TODO Created in Jira$")
+      (should (equal "TEST-2" (org-entry-get nil "ID")))
+      (should (equal ejira-test--journal-id (org-entry-get nil "ORIG_ID")))
+      (should-not (org-entry-get nil "Creating"))
+      (should (equal "ejira-issue" (org-entry-get nil "TYPE")))
+      (should (org-entry-get nil "Remotehash"))
+      (should-not (ejira--locally-modified-p))
+      (should (equal "Body text." (string-trim (ejira--jira-description))))
+      (should (string-match-p "\\[\\[id:TEST-2\\]\\[the new task\\]\\]" (buffer-string)))
+      (should-not (buffer-modified-p)))
+    (should (= 0 (ejira-auto-sync-held-count)))
+    (should-not shown)
+    (with-current-buffer "*ejira sync log*"
+      (should (string-match-p "TEST-2: the creation of unknown outcome of \"Created in Jira\" took effect"
+                              (buffer-string))))))
+
+(ert-deftest ejira-adopt/edits-since-the-journal-survive ()
+  "Edits made after the journal was written were never sent: the pull
+onto the journaled heading keeps them, and the review offers them."
+  (ejira-test--with-journal-cycle
+      (concat ejira-test--discover-content
+              (ejira-test--journal "Created in Jira" "2026-09-20T10:00:03+0000"
+                                   "Edited after the send."))
+      (ejira-test--child-item "TEST-2" "Sent body.")
+    (with-current-buffer buf
+      (should (= 1 (ejira-test--count-headings "Created in Jira")))
+      (goto-char (point-min))
+      (re-search-forward "^\\*\\*\\* TODO Created in Jira$")
+      (should (equal "TEST-2" (org-entry-get nil "ID")))
+      (should (equal "Edited after the send." (string-trim (ejira--jira-description))))
+      (should (ejira--locally-modified-p)))
+    (should (member "TEST-2" (mapcar (lambda (p) (plist-get p :parent-issue)) shown)))
+    (should (= 1 (ejira-auto-sync-held-count 'review)))
+    (should (= 0 (ejira-auto-sync-held-count 'blocked)))))
+
+(ert-deftest ejira-adopt/only-a-single-matching-journal ()
+  "A journal written far from the issue's creation, or two journals
+matching the same issue, are left for the user: the issue is imported
+and the journals stay blocked."
+  ;; Three hours apart: another creation.
+  (ejira-test--with-journal-cycle
+      (concat ejira-test--discover-content
+              (ejira-test--journal "Created in Jira" "2026-09-20T13:00:00+0000" "Body."))
+      (ejira-test--child-item "TEST-2" "Body.")
+    (with-current-buffer buf
+      (should (= 2 (ejira-test--count-headings "Created in Jira")))
+      (goto-char (point-min))
+      (re-search-forward "^\\*\\*\\* TODO Created in Jira$")
+      (should (equal ejira-test--journal-id (org-entry-get nil "ID")))
+      (should (org-entry-get nil "Creating")))
+    (should (= 1 (ejira-auto-sync-held-count 'blocked))))
+  ;; Two candidates: no guess.
+  (ejira-test--with-journal-cycle
+      (concat ejira-test--discover-content
+              (ejira-test--journal "Created in Jira" "2026-09-20T10:00:01+0000" "Body.")
+              (ejira-test--journal "Created in Jira" "2026-09-20T10:00:02+0000" "Body."
+                                   "5A1C2C2E-0000-4000-8000-000000000002"))
+      (ejira-test--child-item "TEST-2" "Body.")
+    (with-current-buffer buf
+      (should (= 3 (ejira-test--count-headings "Created in Jira")))
+      (should (= 2 (how-many "^:Creating:" (point-min)))))
+    (should (= 2 (ejira-auto-sync-held-count 'blocked)))))
+
+(ert-deftest ejira-adopt/any-pull-adopts-a-project-level-journal ()
+  "A pull of an issue missing locally adopts its journal outside the
+auto-sync discovery too, here for an issue with no parent or epic."
+  (ejira-test--with-project-dir
+      (concat ejira-test--project-content
+              (ejira-test--journal "Top task" "2026-09-20T10:00:00+0000" "Top body." nil "**"))
+    (let ((buf (find-file-noselect (expand-file-name "TEST.org" ejira-org-directory) t))
+          (ejira-epic-field 'customfield_10857)
+          (ejira-assigned-tagname nil)
+          (ejira-todo-states-alist '(("Open" . 1)))
+          (item `((key . "TEST-5")
+                  (fields . ((summary . "Top task")
+                             (description . "Top body.")
+                             (status . ((name . "Open")))
+                             (issuetype . ((name . "Task")))
+                             (project . ((key . "TEST")))
+                             (created . "2026-09-20T10:00:04.000+0000")
+                             (updated . "2026-09-20T10:00:04.000+0000"))))))
+      (cl-letf (((symbol-function 'ejira--get-priority-scheme) (lambda (&rest _) nil)))
+        (should (ejira--update-task-or-hold item)))
+      (with-current-buffer buf
+        (should (= 1 (ejira-test--count-headings "Top task")))
+        (goto-char (point-min))
+        (re-search-forward "^\\*\\* TODO Top task$")
+        (should (equal "TEST-5" (org-entry-get nil "ID")))
+        (should-not (org-entry-get nil "Creating"))))))
+
 (ert-deftest ejira-auto-sync/blocked-items-are-not-offered-for-review ()
   "An item no push can release is counted as blocked, not as a change
 to review.  Regression: a lone blocked journal read \"1 change(s)
