@@ -2443,11 +2443,13 @@ pushed without confirmation; nothing may reach Jira unreviewed."
          (held (ejira--auto-sync-hold "test.org" plans)))
     (should (null sent))
     (should (= 6 (length held)))
+    (should (cl-every (lambda (h) (eq (car h) 'review)) held))
     (should (equal (length plans) (length ejira--auto-sync-review-plans)))
-    (should (member "TEST-1: summary, priority awaiting review" held))
-    (should (member "TEST-2: changed remotely since last sync; held for review" held))
-    (should (member "new issue: X: creation awaiting review" held))
-    (should (member "delete comment on TEST-1: deletion awaiting review" held))))
+    (let ((lines (mapcar #'cdr held)))
+      (should (member "TEST-1: summary, priority awaiting review" lines))
+      (should (member "TEST-2: changed remotely since last sync; held for review" lines))
+      (should (member "new issue: X: creation awaiting review" lines))
+      (should (member "delete comment on TEST-1: deletion awaiting review" lines)))))
 
 (ert-deftest ejira-auto-sync/hold-skips-review-when-file-changed ()
   "Plans built from a buffer whose file changed on disk are neither sent
@@ -2464,7 +2466,8 @@ nor offered for review: they describe stale content."
           (let ((held (ejira--auto-sync-hold file plans)))
             (should (null sent))
             (should (null ejira--auto-sync-review-plans))
-            (should (string-match-p "file changed on disk" (car held))))
+            (should (eq 'pending (car (car held))))
+            (should (string-match-p "file changed on disk" (cdr (car held)))))
           (kill-buffer buf))
       (delete-file file))))
 
@@ -2649,7 +2652,8 @@ review buffer.  Regression: the cycle pushed updates unattended."
      (should (member "TEST-1" shown))
      (should (member "new task: Brand new task" shown))
      (should (member "new comment on TEST-1" shown))
-     (should (>= (ejira-auto-sync-held-count) 3)))))
+     (should (>= (ejira-auto-sync-held-count) 3))
+     (should (= 0 (ejira-auto-sync-held-count 'blocked))))))
 
 (ert-deftest ejira-projects/only-listed-projects-sync ()
   "Headings of projects outside `ejira-projects' are neither reconciled,
@@ -2774,7 +2778,10 @@ cancelled issues were pulled on every cycle."
                                   (with-current-buffer buf
                                     (should-not (string-match-p "TEST-3\\|ejira new heading" (buffer-string))))
                                   (should (= 1 (ejira-auto-sync-held-count)))
-                                  (should (string-match-p "1 to review" (ejira--auto-sync-mode-line)))
+                                  ;; No push can release a conversion hold.
+                                  (should (= 1 (ejira-auto-sync-held-count 'blocked)))
+                                  (should (string-match-p "Jira:1 blocked" (ejira--auto-sync-mode-line)))
+                                  (should-not (string-match-p "to review" (ejira--auto-sync-mode-line)))
                                   (clrhash ejira--auto-sync-held)
                                   (should-not (ejira--auto-sync-mode-line)))))
 
@@ -2990,6 +2997,121 @@ it can never become an issue, so it is not held or counted."
        (ejira--auto-sync-reconcile file))
      (should (= 0 (ejira-auto-sync-held-count))))))
 
+(defconst ejira-test--journal-id "5A1C2C2E-0000-4000-8000-000000000001"
+  "Org ID of the journaled heading in the creation-journal tests.")
+
+(defun ejira-test--journal (title journaled body &optional id stars)
+  "A TODO heading TITLE journaled as being created at JOURNALED.
+JOURNALED is an ISO 8601 time; BODY the heading's text; ID its Org ID
+\(default `ejira-test--journal-id'); STARS its level (default 3)."
+  (format "%s TODO %s\n:PROPERTIES:\n:ID:       %s\n:Creating: %s\n:END:\n\n%s\n"
+          (or stars "***") title (or id ejira-test--journal-id)
+          (format-time-string "%Y-%m-%d %H:%M:%S" (date-to-time journaled))
+          body))
+
+(defmacro ejira-test--with-journal-cycle (content item &rest body)
+  "Run a reviewing cycle on TEST.org made of CONTENT, with Jira serving ITEM.
+ITEM is discovered as a child of the epic TEST-1.  BODY runs with `buf'
+visiting the file and `shown' holding the plans the review offered."
+  (declare (indent 2))
+  `(progn
+     (when (get-buffer "*ejira sync log*")
+       (with-current-buffer "*ejira sync log*" (erase-buffer)))
+     (ejira-test--with-project-dir ,content
+       (let* ((file (file-truename (expand-file-name "TEST.org" ejira-org-directory)))
+              (buf (find-file-noselect file t))
+              (ejira-epic-field 'customfield_10857)
+              (ejira-auto-sync-discover 'unresolved)
+              (ejira-assigned-tagname nil)
+              (ejira-todo-states-alist '(("Open" . 1)))
+              (ejira--auto-sync-held (make-hash-table :test 'equal))
+              (shown nil))
+         (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
+                   ((symbol-function 'jiralib2-jql-search) (lambda (&rest _) (list ,item)))
+                   ((symbol-function 'ejira--get-priority-scheme) (lambda (&rest _) nil))
+                   ((symbol-function 'run-at-time)
+                    (lambda (_time _repeat fn &rest args) (apply fn args)))
+                   ((symbol-function 'ejira-confirm-show) (lambda (plans) (setq shown plans))))
+           (ejira--auto-sync-reconcile file t))
+         (ignore shown)
+         ,@body))))
+
+(defun ejira-test--count-headings (title)
+  "Return the number of TODO headings titled TITLE in the current buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (how-many (concat "^\\*+ TODO " (regexp-quote title) "$"))))
+
+(ert-deftest ejira-auto-sync/blocked-items-are-not-offered-for-review ()
+  "An item no push can release is counted as blocked, not as a change
+to review.  Regression: a lone blocked journal read \"1 change(s)
+awaiting review\" and \"Jira:1 to review\", yet the review never opened."
+  (ejira-test--with-journal-cycle
+      (concat ejira-test--discover-content
+              (ejira-test--journal "Never created" "2026-09-20T10:00:00+0000" "Body."))
+      (ejira-test--child-item "TEST-2" "Unrelated.")
+    (should-not shown)
+    (should (= 1 (ejira-auto-sync-held-count 'blocked)))
+    (should (= 0 (ejira-auto-sync-held-count 'review)))
+    (should (string-match-p "Jira:1 blocked" (ejira--auto-sync-mode-line)))
+    (should-not (string-match-p "to review" (ejira--auto-sync-mode-line)))
+    (with-current-buffer "*ejira sync log*"
+      (should (string-match-p "blocked: Never created: previous creation attempt has unknown outcome"
+                              (buffer-string))))))
+
+(ert-deftest ejira-auto-sync/review-command-explains-blocked-items ()
+  "Asked to review while only blocked items are held, the command shows
+the log that explains them instead of doing nothing visible."
+  (ejira-test--with-project-dir
+      (concat ejira-test--discover-content
+              (ejira-test--journal "Never created" "2026-09-20T10:00:00+0000" "Body."))
+    (let ((ejira-auto-sync-files nil)
+          (ejira-auto-sync-tracked t)
+          (ejira-epic-field 'customfield_10857)
+          (ejira--auto-sync-queue nil)
+          (ejira--auto-sync-review-queue nil)
+          (ejira--auto-sync-mtimes (make-hash-table :test 'equal))
+          (ejira--auto-sync-held (make-hash-table :test 'equal))
+          (reviewed nil)
+          (log-shown nil))
+      (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
+                ((symbol-function 'jiralib2-jql-search) (lambda (&rest _) nil))
+                ((symbol-function 'run-at-time)
+                 (lambda (_time _repeat fn &rest args) (apply fn args)))
+                ((symbol-function 'ejira-confirm-show) (lambda (_plans) (setq reviewed t)))
+                ((symbol-function 'ejira-auto-sync-show-log) (lambda () (setq log-shown t))))
+        (ejira-auto-sync-review))
+      (should-not reviewed)
+      (should log-shown)
+      (should (= 1 (ejira-auto-sync-held-count 'blocked))))))
+
+(ert-deftest ejira-auto-sync/indicator-hook-runs-on-change ()
+  "`ejira-auto-sync-indicator-hook' runs when the counts or the conflicted
+buffers change, and not otherwise: a mode line caching its rendering
+learns when to render again.  Regression: a cached global status kept
+showing \"Jira:3 to review\" long after the count fell to 1."
+  (let ((ejira--auto-sync-held (make-hash-table :test 'equal))
+        (ejira--auto-sync-indicator-state nil)
+        (conflicts nil)
+        (runs 0))
+    (cl-letf (((symbol-function 'ejira--disk-conflict-buffers) (lambda () conflicts))
+              ((symbol-function 'ejira--auto-sync-files) (lambda () nil)))
+      (let ((ejira-auto-sync-indicator-hook (list (lambda () (cl-incf runs)))))
+        (ejira--auto-sync-record-held "a.org" '((review . "x") (review . "y")))
+        (should (= 1 runs))
+        (ejira--auto-sync-record-held "a.org" '((review . "x") (review . "y")))
+        (should (= 1 runs))
+        (ejira--auto-sync-record-held "a.org" '((review . "x")))
+        (should (= 2 runs))
+        (ejira--auto-sync-record-held "a.org" '((blocked . "z")))
+        (should (= 3 runs))
+        ;; A buffer coming to conflict with its file is seen by the worker.
+        (setq conflicts (list (current-buffer)))
+        (ejira--auto-sync-worker)
+        (should (= 4 runs))
+        (ejira--auto-sync-worker)
+        (should (= 4 runs))))))
+
 (ert-deftest ejira-auto-sync/reconcile-classification ()
   "One reconcile cycle: clean+remote-changed pulls, dirty+remote-changed
 holds as conflict, clean+unchanged does nothing."
@@ -3046,6 +3168,10 @@ holds as conflict, clean+unchanged does nothing."
                                       (should (string-match-p
                                                "TEST-1: changed locally and remotely"
                                                (buffer-substring (point-min) (point-max)))))
+                                    ;; With nothing to push for it (the scan is mocked
+                                    ;; empty), the conflict has nothing to review.
+                                    (should (equal '(blocked)
+                                                   (mapcar #'car (gethash file ejira--auto-sync-held))))
                                     ;; The dirty heading keeps its state for the push flow.
                                     (with-current-buffer buf
                                       (goto-char (point-min))

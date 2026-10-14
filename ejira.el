@@ -803,24 +803,58 @@ with unconvertible remote markup).  They only appear in the
   :type 'boolean)
 
 (defvar ejira--auto-sync-held (make-hash-table :test 'equal)
-  "Map an auto-sync file to the held-issue lines of its last cycle.")
+  "Map an auto-sync file to the held items of its last cycle.
+Each item is (KIND . LINE).  KIND is `review' for a change the review
+buffer can push, and `blocked' for an item no push can release: only a
+fix by hand does (a creation of unknown outcome, a duplicate identity,
+unconvertible remote markup).")
 
-(defun ejira--auto-sync-record-held (file lines)
-  "Record LINES as FILE's held issues from its latest cycle."
-  (puthash file lines ejira--auto-sync-held)
-  (force-mode-line-update t))
+(defcustom ejira-auto-sync-indicator-hook nil
+  "Normal hook run when the auto-sync mode-line indicator changed.
+The indicator is computed when the mode line is redisplayed.  A mode
+line that renders `global-mode-string' ahead of redisplay and caches
+the result needs to know when to render it again: add its refresh
+function here."
+  :group 'ejira
+  :type 'hook)
 
-(defun ejira-auto-sync-held-count ()
-  "Return the number of issues held by the latest auto-sync cycles."
+(defvar ejira--auto-sync-indicator-state nil
+  "The indicator inputs last announced by `ejira-auto-sync-indicator-hook'.")
+
+(defun ejira--auto-sync-indicator-update ()
+  "Redisplay the auto-sync indicator when its inputs changed.
+Its inputs are the held counts and the buffers conflicting with their
+file.  Run `ejira-auto-sync-indicator-hook' on a change."
+  (let ((state (list (ejira-auto-sync-held-count 'review)
+                     (ejira-auto-sync-held-count 'blocked)
+                     (mapcar #'buffer-name (ejira--disk-conflict-buffers)))))
+    (unless (equal state ejira--auto-sync-indicator-state)
+      (setq ejira--auto-sync-indicator-state state)
+      (force-mode-line-update t)
+      (run-hooks 'ejira-auto-sync-indicator-hook))))
+
+(defun ejira--auto-sync-record-held (file items)
+  "Record ITEMS, a list of (KIND . LINE), as FILE's held items.
+See `ejira--auto-sync-held' for the kinds."
+  (puthash file items ejira--auto-sync-held)
+  (ejira--auto-sync-indicator-update))
+
+(defun ejira-auto-sync-held-count (&optional kind)
+  "Return the number of items held by the latest auto-sync cycles.
+With KIND, `review' or `blocked', count only the items of that kind."
   (let ((n 0))
-    (maphash (lambda (_file lines) (setq n (+ n (length lines))))
+    (maphash (lambda (_file items)
+               (setq n (+ n (if kind
+                                (cl-count kind items :key #'car)
+                              (length items)))))
              ejira--auto-sync-held)
     n))
 
 (defun ejira-auto-sync-show-log ()
-  "Display the `*ejira sync log*' buffer."
+  "Display the `*ejira sync log*' buffer at its latest entries."
   (interactive)
-  (pop-to-buffer (get-buffer-create "*ejira sync log*")))
+  (pop-to-buffer (get-buffer-create "*ejira sync log*"))
+  (goto-char (point-max)))
 
 (defun ejira--auto-sync-show-review (plans)
   "Open the review buffer for PLANS held by an auto-sync cycle.
@@ -832,14 +866,30 @@ cycle so the held count reflects what is left."
 (defun ejira-auto-sync-review ()
   "Reconcile the auto-sync files now and review what they hold.
 Opens the review buffer for every local change awaiting confirmation
-and for issues changed on both sides; see `ejira--auto-sync-reconcile'."
+and for issues changed on both sides; see `ejira--auto-sync-reconcile'.
+When only blocked items are held, shows the `*ejira sync log*' that
+explains them instead."
   (interactive)
   (dolist (file (ejira--auto-sync-files))
     (ejira--auto-sync-enqueue file t))
   ;; Asked for now: work through the whole queue.
   (let ((guard (length ejira--auto-sync-queue)))
     (while (and ejira--auto-sync-queue (>= (cl-decf guard) 0))
-      (ejira--auto-sync-worker))))
+      (ejira--auto-sync-worker)))
+  ;; The cycles open the review buffer for what a push can resolve.
+  ;; Blocked items have nothing to review: say so, and show where they
+  ;; are explained, instead of leaving the command without an answer.
+  (let ((review (ejira-auto-sync-held-count 'review))
+        (blocked (ejira-auto-sync-held-count 'blocked)))
+    (cond
+     (ejira--auto-sync-queue
+      (message "ejira auto-sync: a sync is running; the review opens when it ends"))
+     ((> review 0))
+     ((> blocked 0)
+      (ejira-auto-sync-show-log)
+      (message "ejira auto-sync: nothing to review; %d item(s) blocked until fixed by hand"
+               blocked))
+     (t (message "ejira auto-sync: nothing to review")))))
 
 (defvar ejira--auto-sync-mode-line-map
   (let ((map (make-sparse-keymap)))
@@ -847,6 +897,12 @@ and for issues changed on both sides; see `ejira--auto-sync-reconcile'."
     (define-key map [mode-line mouse-3] #'ejira-auto-sync-show-log)
     map)
   "Keymap for the auto-sync mode-line indicator.")
+
+(defvar ejira--auto-sync-blocked-mode-line-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mode-line mouse-1] #'ejira-auto-sync-show-log)
+    map)
+  "Keymap for the mode-line indicator of blocked auto-sync items.")
 
 (defvar ejira--disk-conflicts-cache nil
   "(TIME . BUFFERS) of the last `ejira--disk-conflict-buffers' scan.")
@@ -884,10 +940,12 @@ it to take the file's version."
 
 (defun ejira--auto-sync-mode-line ()
   "Return the mode-line indicators of auto-sync, or nil.
-The number of held issues, and the files that cannot sync because their
+The number of changes awaiting review, the number of items blocked
+until fixed by hand, and the files that cannot sync because their
 buffer holds unsaved edits while the file changed on disk."
   (when ejira-auto-sync-mode-line
-    (let* ((n (ejira-auto-sync-held-count))
+    (let* ((n (ejira-auto-sync-held-count 'review))
+           (blocked (ejira-auto-sync-held-count 'blocked))
            (conflicts (ejira--disk-conflict-buffers))
            (indicator
             (concat
@@ -903,7 +961,13 @@ buffer holds unsaved edits while the file changed on disk."
                      'face 'warning
                      'help-echo "ejira changes awaiting review; mouse-1: review, mouse-3: show *ejira sync log*"
                      'mouse-face 'mode-line-highlight
-                     'local-map ejira--auto-sync-mode-line-map)))))
+                     'local-map ejira--auto-sync-mode-line-map))
+       (when (> blocked 0)
+         (propertize (format " Jira:%d blocked" blocked)
+                     'face 'error
+                     'help-echo "ejira items no push can release: each needs a fix by hand, explained in *ejira sync log*.  mouse-1: show the log"
+                     'mouse-face 'mode-line-highlight
+                     'local-map ejira--auto-sync-blocked-mode-line-map)))))
       (unless (string-empty-p indicator) indicator))))
 
 (defconst ejira--auto-sync-mode-line-construct
@@ -1245,8 +1309,9 @@ the `*ejira sync audit*' buffer and return the audit plists."
 Invariant: an automatic cycle never writes to Jira.  Every plan is
 collected in `ejira--auto-sync-review-plans' for the review buffer,
 where the user confirms what is sent (see `ejira--jira-write').
-Return the held lines, for the caller to log and count with the
-cycle's other held issues."
+Return the held items, (KIND . LINE) for the caller to log and count
+with the cycle's other held items: KIND is `review', or `pending' for
+plans built from stale content, which the next cycle rebuilds."
   (let ((buf (get-file-buffer file))
         held)
     (if (and buf (buffer-live-p buf) (not (verify-visited-file-modtime buf)))
@@ -1254,13 +1319,30 @@ cycle's other held issues."
         ;; plans were built from stale in-memory content and must not be
         ;; offered for review; the next cycle rebuilds them.
         (dolist (plan plans)
-          (push (format "%s: file changed on disk mid-cycle; held for the next cycle"
-                        (plist-get plan :title))
+          (push (cons 'pending
+                      (format "%s: file changed on disk mid-cycle; held for the next cycle"
+                              (plist-get plan :title)))
                 held))
       (dolist (plan plans)
         (push plan ejira--auto-sync-review-plans)
-        (push (ejira--auto-sync-hold-line plan) held)))
+        (push (cons 'review (ejira--auto-sync-hold-line plan)) held)))
     (nreverse held)))
+
+(defun ejira--auto-sync-held-message (review blocked pending reviewing)
+  "Return the message reporting a cycle's held items.
+REVIEW, BLOCKED and PENDING count them by kind; REVIEWING is non-nil
+when the cycle opens the review buffer itself."
+  (string-join
+   (delq nil
+         (list (when (> review 0)
+                 (format "%d change(s) awaiting review%s" review
+                         (if reviewing "" "; click Jira in the mode line to review")))
+               (when (> blocked 0)
+                 (format "%d item(s) blocked until fixed by hand (see *ejira sync log*)"
+                         blocked))
+               (when (> pending 0)
+                 (format "%d change(s) held for the next cycle" pending))))
+   "; "))
 
 (defun ejira--auto-sync-reconcile (file &optional review)
   "Run one reconciliation cycle for FILE: pull, then hold pushes for review.
@@ -1271,8 +1353,10 @@ Jira (see `ejira--jira-write').  With REVIEW (a save in Emacs, or
 that a push can resolve: every local change, and issues changed on
 both sides or without a remote baseline.  Without REVIEW (an external
 change) the held changes are only counted in the mode line.
-Duplicate identities and unconvertible markup are not reviewable
-pushes and stay in the log.
+What no push can release is held as blocked: a creation of unknown
+outcome, a duplicate identity, unconvertible markup, and a conflicted
+issue with nothing to push.  It is counted apart in the mode line and
+explained in the log; only a fix by hand releases it.
 
 Jira is read before the buffer changes.  Every fetch the cycle needs
 runs against the file as it is, and the buffer is then checked against
@@ -1291,6 +1375,8 @@ is reloaded and the file queued again."
            (ejira--pushing t)
            (ejira--heading-cache (make-hash-table :test 'equal))
            (pulls nil)
+           ;; Held items, (KIND KEY LINE).  KIND `issue' is a conflicted
+           ;; issue: reviewable when it has a plan, blocked otherwise.
            (conflicts nil)
            (notes nil)
            (held-keys nil)
@@ -1301,7 +1387,7 @@ is reloaded and the file queued again."
            (on-hold (lambda (key line)
                       (push key held-keys)
                       (push key unreviewable-keys)
-                      (push line conflicts))))
+                      (push (list 'blocked key line) conflicts))))
       (ejira--with-transaction
         (with-current-buffer buf
           ;; A buffer with unsaved edits is a moving target: wait for its
@@ -1317,10 +1403,11 @@ is reloaded and the file queued again."
               (when (> (length files) 1)
                 (push key held-keys)
                 (push key unreviewable-keys)
-                (push (format "%s: %d headings carry this key (%s); held until one is removed"
-                              key (length files)
-                              (s-join ", " (mapcar #'file-name-nondirectory
-                                                   (delete-dups (copy-sequence files)))))
+                (push (list 'blocked key
+                            (format "%s: %d headings carry this key (%s); held until one is removed"
+                                    key (length files)
+                                    (s-join ", " (mapcar #'file-name-nondirectory
+                                                         (delete-dups (copy-sequence files))))))
                       conflicts)))))
         ;; ── read Jira: nothing changes the buffer until every answer is in ──
         (let ((items (cl-remove-if
@@ -1373,13 +1460,15 @@ is reloaded and the file queued again."
                            (push item pulls))
                           ((and remote-changed-p dirty)
                            (push key held-keys)
-                           (push (format "%s: changed locally and remotely" key)
+                           (push (list 'issue key
+                                       (format "%s: changed locally and remotely" key))
                                  conflicts))
                           ;; Dirty with no baseline: the remote side is
                           ;; unknown; never push blind.
                           ((and dirty remote-unknown-p)
                            (push key held-keys)
-                           (push (format "%s: changed locally with no remote baseline" key)
+                           (push (list 'issue key
+                                       (format "%s: changed locally with no remote baseline" key))
                                  conflicts)))))
                      ;; ── import Jira-side children missing locally ──
                      (dolist (item discovered)
@@ -1393,8 +1482,9 @@ is reloaded and the file queued again."
                        (let ((key (ejira--alist-get item 'key)))
                          (if (ejira--issue-comments-dirty-p key)
                              (progn (push key held-keys)
-                                    (push (format "%s: locally edited comments; pull deferred"
-                                                  key)
+                                    (push (list 'issue key
+                                                (format "%s: locally edited comments; pull deferred"
+                                                        key))
                                           conflicts))
                            (when (let ((ejira--force-full-update t))
                                    (ejira--update-task-or-hold item on-hold))
@@ -1419,9 +1509,10 @@ is reloaded and the file queued again."
                          ;; A TODO with no Jira ancestor is a local task, not
                          ;; a sync item: tracked files mix both freely.
                          (unless (plist-get b :local-only)
-                           (push (format "%s: %s"
-                                         (plist-get b :title)
-                                         (plist-get b :reason))
+                           (push (list 'blocked nil
+                                       (format "%s: %s"
+                                               (plist-get b :title)
+                                               (plist-get b :reason)))
                                  conflicts)))
                        ;; Issue-wide holds: the plans of an issue classified
                        ;; as conflicted (staged transitions, type changes,
@@ -1441,19 +1532,39 @@ is reloaded and the file queued again."
                               plans))
                        ;; Everything else waits for review too: an automatic
                        ;; cycle never sends anything to Jira.
-                       (when plans
-                         (setq conflicts
-                               (append (reverse (ejira--auto-sync-hold file plans))
-                                       conflicts))))
+                       (dolist (h (ejira--auto-sync-hold file plans))
+                         (push (list (car h) nil (cdr h)) conflicts)))
                      (when notes
                        (ejira--auto-sync-log file (nreverse notes)))
-                     (setq conflicts (nreverse conflicts))
-                     (when conflicts
-                       (message "ejira auto-sync: %d change(s) awaiting review%s"
-                                (length conflicts)
-                                (if review "" "; click Jira in the mode line to review"))
-                       (ejira--auto-sync-log file conflicts))
-                     (ejira--auto-sync-record-held file conflicts)
+                     ;; A conflicted issue is reviewable when the review
+                     ;; buffer offers a push for it; otherwise nothing but
+                     ;; a fix by hand releases it.
+                     (let* ((review-keys (mapcar (lambda (p) (plist-get p :parent-issue))
+                                                 ejira--auto-sync-review-plans))
+                            (held (mapcar (lambda (c)
+                                            (if (eq (car c) 'issue)
+                                                (cons (if (member (nth 1 c) review-keys)
+                                                          'review
+                                                        'blocked)
+                                                      (nth 2 c))
+                                              (cons (car c) (nth 2 c))))
+                                          (nreverse conflicts)))
+                            (count (lambda (kind) (cl-count kind held :key #'car))))
+                       (when held
+                         (message "ejira auto-sync: %s"
+                                  (ejira--auto-sync-held-message
+                                   (funcall count 'review) (funcall count 'blocked)
+                                   (funcall count 'pending) review))
+                         (ejira--auto-sync-log
+                          file (mapcar (lambda (h)
+                                         (if (eq (car h) 'blocked)
+                                             (concat "blocked: " (cdr h))
+                                           (cdr h)))
+                                       held)))
+                       ;; Pending items are rebuilt by the next cycle: they
+                       ;; are logged, not counted.
+                       (ejira--auto-sync-record-held
+                        file (cl-remove 'pending held :key #'car)))
                      (ejira--save-buffer-safe)
                      (when (and review ejira--auto-sync-review-plans)
                        ;; Shown after the cycle's own writes; confirming runs
@@ -1476,7 +1587,10 @@ is reloaded and the file queued again."
 (defun ejira--auto-sync-worker ()
   "Reconcile the next queued or externally changed auto-sync file.
 One file per call: the idle timer calls again while Emacs stays idle,
-so input between files is never held up by a whole round of cycles."
+so input between files is never held up by a whole round of cycles.
+Each call first refreshes the indicator: a buffer may have come to
+conflict with its file since the last call."
+  (ejira--auto-sync-indicator-update)
   (when (and (ejira--auto-sync-files)
              (not ejira--sync-in-progress)
              (not (and (boundp 'ejira--pushing) ejira--pushing))
@@ -1542,6 +1656,9 @@ See `ejira-auto-sync-tracked' and `ejira-auto-sync-files'."
       (setq global-mode-string
             (append (or global-mode-string '(""))
                     (list ejira--auto-sync-mode-line-construct))))
+    ;; The indicator just joined the mode line: announce it.
+    (setq ejira--auto-sync-indicator-state nil)
+    (ejira--auto-sync-indicator-update)
     (message "ejira: auto-sync enabled for %d file(s)"
              (length (ejira--auto-sync-files)))))
 
@@ -1551,7 +1668,11 @@ See `ejira-auto-sync-tracked' and `ejira-auto-sync-files'."
     (cancel-timer ejira--auto-sync-timer)
     (setq ejira--auto-sync-timer nil))
   (setq global-mode-string
-        (delete ejira--auto-sync-mode-line-construct global-mode-string)))
+        (delete ejira--auto-sync-mode-line-construct global-mode-string))
+  ;; The indicator left the mode line: announce it.
+  (setq ejira--auto-sync-indicator-state nil)
+  (force-mode-line-update t)
+  (run-hooks 'ejira-auto-sync-indicator-hook))
 
 
 ;;;###autoload
