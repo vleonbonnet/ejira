@@ -91,15 +91,13 @@ if your project hierarchy uses them as Epic parents."
 
 (defvar ejira-comments-heading-name "Comments"
   "Subheading ejira uses for the comments list.")
-(defvar ejira-description-heading-name "Description"
-  "Subheading ejira uses for the description of the item.")
 
 (defconst ejira-jira-title-property "JIRA_TITLE"
   "Property overriding an Org heading's title when synchronizing with Jira.
 
 When this property or `ejira-jira-description-heading-name' is present, ejira
-treats the heading as a Jira projection: its local title and normal
-`Description' subtree remain local-only.")
+treats the heading as a Jira projection: its local title and body remain
+local-only.")
 
 (defconst ejira-jira-description-heading-name "JIRA_DESCRIPTION"
   "Direct child heading containing the Jira-facing description projection.
@@ -107,34 +105,18 @@ treats the heading as a Jira projection: its local title and normal
 Unlike an Org property, this heading supports a full Org body and therefore
 round-trips arbitrary Jira markup without flattening it into one line.")
 
-(defcustom ejira-description-in-body nil
-  "When non-nil, a task's Jira description is its own Org body.
-
-The description spans the task's direct prose plus its ordinary
-subheadings, and stops before the first descendant task heading or the
-reserved Comments container, which keep their own subtrees.  This
-replaces the legacy dedicated `Description' child heading.
-
-A file or heading opts in per outline with the inherited
-`EJIRA_DESCRIPTION_IN_BODY' property, so existing projects keep the
-legacy layout until they are migrated."
-  :group 'ejira
-  :type 'boolean)
-
-(defconst ejira-body-description-property "EJIRA_DESCRIPTION_IN_BODY"
-  "Org property opting a file or heading into body-as-description mode.")
-
-(defconst ejira-state-hash-property "Statehash"
-  "Property hashing the state fields (todo state, assignee, status).
-
-Written by `ejira--update-push-baseline' next to a version-prefixed
-`Pushhash' covering only content fields (summary, description,
-priority identity, deadline).  The split lets a shallow pull
-acknowledge the state fields it actually fetched without also
-acknowledging content edits it never pushed.")
-
-(defconst ejira-pushhash-v2-prefix "v2:"
-  "Prefix distinguishing v2 content baselines from legacy full-content hashes.")
+(defconst ejira-local-hash-property "LocalHash"
+  "Property holding the local baseline of a heading: itself at its last sync.
+For an issue, two hashes separated by a space: its content fields
+\(summary, description, priority identity, deadline; see
+`ejira--heading-content-fields') and its state fields (todo state,
+assignee, status; see `ejira--heading-state-fields').  The two parts
+are acknowledged apart: a shallow pull fetches only the state, so it
+moves only the state part, and never acknowledges a content edit it did
+not compare; a pull keeps a pending local state edit while it applies a
+remote description, and the other way round.  For a comment, one hash
+of its body.  A heading without it has no baseline and is never seen as
+edited locally.")
 
 (defcustom ejira-projects nil
   "Projects to synchronize."
@@ -228,7 +210,8 @@ Set to nil to disable assigned-tag management entirely.")
   parent
   description
   comments
-  comments-complete)
+  comments-complete
+  remote-identity)
 
 (defconst ejira-priority-id-property "JiraPriorityId"
   "Org property storing the exact Jira priority ID for a heading.")
@@ -375,7 +358,9 @@ Set to nil to disable assigned-tag management entirely.")
                               (and (equal 0 (ejira--alist-get co 'startAt))
                                    (equal (ejira--alist-get co 'total)
                                           (length (ejira--alist-get
-                                                   co 'comments)))))))))
+                                                   co 'comments))))))
+     ;; What a pull applying this version records as its remote baseline.
+     :remote-identity (ejira--remote-fields-identity item))))
 
 (defun ejira--priority-id-string (id)
   "Return ID as a string, or nil when ID is absent."
@@ -756,17 +741,12 @@ something a background auto-pull should ever do."
           (progn (cl-pushnew issue-key ejira--deferred-keys :test #'equal) nil)
         (ejira--update-task issue-key))
 
-    ;; A shallow pull may only acknowledge what it fetched.  A v2 heading
-    ;; with a pending local state edit, or a legacy heading with any
-    ;; pending edit (its single hash cannot tell state from content), is
-    ;; left entirely alone: applying the remote state and re-baselining
-    ;; would silently acknowledge work that was never pushed.  The full
-    ;; reconcile or the push flow resolves it.
-    (let* ((v2 (ejira--with-point-on issue-key (ejira--v2-baseline-p)))
-           (pending (ejira--with-point-on issue-key
-                      (if v2
-                          (ejira--state-modified-p)
-                        (ejira--locally-modified-p)))))
+    ;; A shallow pull may only acknowledge what it fetched.  A heading
+    ;; with a pending local state edit is left entirely alone: applying
+    ;; the remote state and re-baselining would silently acknowledge work
+    ;; that was never pushed.  The full reconcile or the push flow
+    ;; resolves it.
+    (let ((pending (ejira--with-point-on issue-key (ejira--state-modified-p))))
       (if pending
           (message "ejira: %s has unpushed local edits; shallow pull skipped" issue-key)
         (ejira--with-point-on issue-key
@@ -783,18 +763,11 @@ something a background auto-pull should ever do."
         (ejira--set-todo-state issue-key
                                (funcall ejira-todo-state-fn status resolution))
         ;; Refresh the baseline so sync-induced state/assignee changes are
-        ;; not mistaken for local edits.  A v2 heading acknowledges only the
-        ;; state fields this pull fetched: its content baseline must not
-        ;; move, or unpushed summary/description edits would be silently
-        ;; acknowledged.  A clean legacy heading is upgraded to v2 here: it
-        ;; had nothing pending, so its current content IS the baseline.  A
-        ;; heading with no baseline at all gets none: only a full pull,
-        ;; which compares the content, may establish one.
+        ;; not mistaken for local edits.  Only the state part, the fields
+        ;; this pull fetched: moving the content part would silently
+        ;; acknowledge unpushed summary/description edits.
         (ejira--with-point-on issue-key
-          (cond
-           (v2 (org-set-property ejira-state-hash-property
-                                 (md5 (ejira--heading-state-fields))))
-           ((org-entry-get nil "Pushhash") (ejira--migrate-push-baseline))))))))
+          (ejira--update-state-baseline))))))
 
 (defun ejira--auto-sync-log (header lines)
   "Append LINES under HEADER to the `*ejira sync log*' buffer.
@@ -915,24 +888,18 @@ converted to Org; callers hold the issue and report it."
                     (not (equal (org-entry-get key-m "Modified")
                                 (format-time-string "%Y-%m-%d %H:%M:%S"
                                                     updated "UTC")))))
-               ;; A legacy heading can already contain a real local edit.  Do
-               ;; not reinterpret its old Org cookie as an outbound Jira
-               ;; priority while migrating it.  For a v2 heading only the
-               ;; content fields gate summary/description imports: a pending
-               ;; local state edit must not block a description pull.
+               ;; Only the content fields gate summary/description imports:
+               ;; a pending local state edit must not block a description
+               ;; pull.
                (local-dirty-p
                 (and (not ejira--discard-local-edits)
-                     (org-with-point-at key-m
-                       (if (ejira--v2-baseline-p)
-                           (ejira--content-modified-p)
-                         (ejira--locally-modified-p)))))
+                     (org-with-point-at key-m (ejira--content-modified-p))))
                (state-dirty-p
-                ;; Pending local state edits (todo keyword, assignee, status)
-                ;; on a v2 heading: the pull keeps the local values and leaves
-                ;; them dirty for the push flow instead of reversing them.
+                ;; Pending local state edits (todo keyword, assignee,
+                ;; status): the pull keeps the local values and leaves them
+                ;; dirty for the push flow instead of reversing them.
                 (and (not ejira--discard-local-edits)
-                     (org-with-point-at key-m
-                       (and (ejira--v2-baseline-p) (ejira--state-modified-p)))))
+                     (org-with-point-at key-m (ejira--state-modified-p))))
                (stored-priority-id
                 (org-entry-get key-m ejira-priority-id-property))
                (stored-priority-name
@@ -1015,12 +982,6 @@ converted to Org; callers hold the issue and report it."
                 (org-set-property "Issuetype" type)
                 (org-set-property "Created" (format-time-string "%Y-%m-%d %H:%M:%S"
                                                                 created "UTC"))
-                ;; Do not advance Modified while local edits are pending: the
-                ;; deferred summary/description update must be retried after the
-                ;; push resolves the dirtiness, not silently dropped.
-                (unless local-dirty-p
-                  (org-set-property "Modified" (format-time-string "%Y-%m-%d %H:%M:%S"
-                                                                   updated "UTC")))
                 (when-let* ((minutes (and estimate (/ estimate 60))))
                   (org-set-property "Effort" (format "%02d:%02d" (/ minutes 60) (% minutes 60))))
                 (when-let* ((minutes (and remaining-estimate (/ remaining-estimate 60))))
@@ -1071,20 +1032,28 @@ converted to Org; callers hold the issue and report it."
                       (and (or parent epic) same-buffer))
                 (ejira--refile key target)))
             (message "Updated %s: %s" key summary)
-            ;; Record the push baseline from the content we just wrote so later
-            ;; local edits are detectable.  Kept inside the guard: an unchanged
-            ;; item keeps its still-valid baseline and pays nothing — recomputing
-            ;; it for every item turned a no-op sync into O(items) body scans.
-            ;; A dirty heading keeps its old baseline: re-recording it would
-            ;; erase the very signal that the local edit still needs pushing.
+            ;; Record the baselines of the version just applied, so later
+            ;; local and remote edits are detectable.  Kept inside the
+            ;; guard: an unchanged item keeps its still-valid baselines and
+            ;; pays nothing -- recomputing them for every item turned a
+            ;; no-op sync into O(items) body scans.  A dirty heading keeps
+            ;; both: re-recording the local one would erase the very signal
+            ;; that the edit still needs pushing, and advancing the remote
+            ;; one would hide the remote change it was made against, which
+            ;; the next pull must still apply.
             (unless (or local-dirty-p state-dirty-p)
-              (ejira--with-point-on key (ejira--migrate-push-baseline))))
+              (ejira--with-point-on key
+                (ejira--update-local-baseline)
+                ;; Every task parsed from a REST item carries it.
+                (when remote-identity
+                  (ejira--store-remote-baseline-of remote-identity updated)))))
 
-          ;; For an unchanged, clean legacy heading, the priority migration is
-          ;; the only content change and must establish a new clean baseline.
+          ;; For an unchanged, clean heading whose priority metadata was
+          ;; migrated, that metadata is the only content change and must
+          ;; establish a new clean baseline.
           (when (and priority-applied-p (not modified-p)
                      (not local-dirty-p) (not state-dirty-p))
-            (ejira--with-point-on key (ejira--migrate-push-baseline))))
+            (ejira--with-point-on key (ejira--update-local-baseline))))
         ;; The pull replaced an adopted heading's content with what the
         ;; creation sent; local edits made since were never sent.
         (when adopted
@@ -1112,7 +1081,7 @@ converted to Org; callers hold the issue and report it."
       (ejira--set-heading-body-jira-markup
        (point-marker)
        (ejira-comment-body comment))
-      (ejira--update-push-baseline))))
+      (ejira--update-local-baseline))))
 
 (defun ejira--get-comment-heading (key id)
   "Get marker to comment ID of item KEY. Create heading if it does not exits."
@@ -1199,9 +1168,9 @@ can wedge into an uninterruptible loop."
                       (beginning-of-line)
                       (point-marker)))))
       (when (equal (org-entry-get m "TYPE") "ejira-comment")
-        ;; Initialise pushhash so the heading is baseline-clean.  The scan
+        ;; Initialise the baseline so the heading is clean.  The scan
         ;; detects it as a new-comment draft (TYPE=ejira-comment, no CommId).
-        (org-with-point-at m (ejira--update-push-baseline))))))
+        (org-with-point-at m (ejira--update-local-baseline))))))
 
 (defun ejira--heading-body-level (heading)
   "Return the heading-shift level used when parsing JIRA body under HEADING."
@@ -1224,11 +1193,10 @@ The content will be adjusted based on the heading level.  Signals
 (defun ejira--set-jira-description-jira-markup (id content)
   "Set issue ID's Jira-facing description from Jira markup CONTENT.
 
-For a projected heading, update its `JIRA_DESCRIPTION' child and leave the
-ordinary local description untouched.  In body-as-description mode, rewrite
-the task's owned body region.  Otherwise retain ejira's established
-`Description' child behavior.  Signals `ejira-parser-error' rather than
-storing unconverted markup."
+For a projected heading, update its `JIRA_DESCRIPTION' child and leave
+its local body untouched.  Otherwise rewrite the task's owned body
+region (see `ejira--description-boundary').  Signals
+`ejira-parser-error' rather than storing unconverted markup."
   (let ((ejira-parser-signal-failures t))
     (ejira--set-jira-description-jira-markup-1 id content)))
 
@@ -1244,16 +1212,11 @@ storing unconverted markup."
                                           ejira-jira-description-heading-name)))))
         (when description
           (ejira--set-heading-body-jira-markup description content))))
-     ((ejira--description-in-body-p)
+     (t
       (ejira--set-task-description
        (ejira--parse-body
         content
-        (save-excursion (org-back-to-heading t) (org-current-level)))))
-     (t
-      (when-let* ((description
-                  (ejira--get-subheading (point-marker)
-                                         ejira-description-heading-name)))
-        (ejira--set-heading-body-jira-markup description content))))))
+        (save-excursion (org-back-to-heading t) (org-current-level))))))))
 
 (defun ejira--set-jira-description-org (id content)
   "Set issue ID's Jira-facing description to the Org text CONTENT.
@@ -1268,13 +1231,8 @@ local text that must come back exactly as it was written."
                          (ejira--get-subheading (point-marker)
                                                 ejira-jira-description-heading-name)))))
         (ejira--set-heading-body description content)))
-     ((ejira--description-in-body-p)
-      (ejira--set-task-description content))
      (t
-      (when-let* ((description
-                   (ejira--get-subheading (point-marker)
-                                          ejira-description-heading-name)))
-        (ejira--set-heading-body description content))))))
+      (ejira--set-task-description content)))))
 
 (defun ejira--restore-adopted-content (key content)
   "Put back the local CONTENT of KEY's heading that a pull replaced.
@@ -1459,13 +1417,6 @@ the region are spacing, not content."
       (ejira--strip-leading-blank-lines
        (buffer-substring-no-properties (car region) (cdr region))))))
 
-(defun ejira--description-in-body-p ()
-  "Return non-nil when the task at point stores its description in its body.
-Enabled by `ejira-description-in-body' or the inherited
-`EJIRA_DESCRIPTION_IN_BODY' property."
-  (or ejira-description-in-body
-      (equal "t" (org-entry-get nil ejira-body-description-property t))))
-
 (defconst ejira-pushable-types
   '("ejira-issue" "ejira-story" "ejira-subtask" "ejira-epic" "ejira-comment")
   "Heading TYPE values whose content can be pushed back to Jira.")
@@ -1579,43 +1530,14 @@ hash flips only when a real (pushable) difference exists, not when refile or
 org editing nudges trailing whitespace."
   (string-trim (replace-regexp-in-string "\r" "" (or s ""))))
 
-(defun ejira--heading-pushable-content ()
-  "Return the push-relevant content of the ejira heading at point, or nil.
-For an issue this is its summary plus description body; for a comment, its
-body.  Normalized so the fingerprint ignores cosmetic whitespace changes."
-  (let ((type (org-entry-get nil "TYPE")))
-    (cond
-     ((equal type "ejira-comment")
-      (ejira--push-normalize (ejira--get-heading-body (point-marker))))
-     ((member type ejira-pushable-types)
-      (concat (ejira--push-normalize (ejira--jira-summary))
-              "\0"
-              (ejira--push-normalize (ejira--jira-description))
-              "\0"
-              (ejira--push-normalize
-               (or (org-entry-get nil "Assignee") ""))
-              "\0"
-              (ejira--push-normalize
-               (or (save-excursion
-                     (org-back-to-heading t)
-                     (when (looking-at org-priority-regexp)
-                       (match-string 2)))
-                   ""))
-              ;; Include the exact Jira identity once a heading has been
-              ;; migrated.  Omitting it for legacy headings preserves their
-              ;; existing baseline until the safe migration path runs.
-              (or (when-let* ((priority-id
-                              (org-entry-get nil ejira-priority-id-property)))
-                    (concat "\0" (ejira--push-normalize priority-id)))
-                  "")
-              "\0"
-              (ejira--push-normalize
-               (or (when-let* ((d (org-get-deadline-time (point-marker))))
-                     (format-time-string "%Y-%m-%d" d))
-                   ""))
-              "\0"
-              (ejira--push-normalize
-               (or (org-get-todo-state) "")))))))
+(defun ejira--comment-heading-p ()
+  "Return non-nil when the heading at point is a Jira comment."
+  (equal (org-entry-get nil "TYPE") "ejira-comment"))
+
+(defun ejira--comment-content ()
+  "Return the push-relevant content of the comment heading at point.
+Its body, normalized so the fingerprint ignores cosmetic whitespace."
+  (ejira--push-normalize (ejira--get-heading-body (point-marker))))
 
 (defun ejira--heading-content-fields ()
   "Return the content fields of the ejira task at point.
@@ -1636,28 +1558,30 @@ pull reconciles and a push sends.  A shallow pull never fetches them."
 (defun ejira--heading-state-fields ()
   "Return the state fields of the ejira task at point.
 Todo state, assignee and status: the fields a shallow pull fetches.
-The priority cookie is deliberately NOT hashed here: changing its
-composition would invalidate every stored Statehash at once.  A direct
-cookie edit is caught live by `ejira--priority-cookie-modified-p'
-instead."
+The priority cookie is deliberately NOT hashed here: a direct cookie
+edit is caught live by `ejira--priority-cookie-modified-p' instead."
   (concat (substring-no-properties (or (org-get-todo-state) ""))
           "\0"
           (ejira--push-normalize (or (org-entry-get nil "Assignee") ""))
           "\0"
           (ejira--push-normalize (or (org-entry-get nil "Status") ""))))
 
-(defun ejira--v2-baseline-p ()
-  "Return non-nil when the heading at point uses the v2 split fingerprints."
-  (and (org-entry-get nil "Pushhash")
-       (org-entry-get nil ejira-state-hash-property)))
+(defun ejira--local-baseline ()
+  "Return the local baseline of the heading at point, or nil without one.
+A list of hashes: (CONTENT STATE) for an issue, (BODY) for a comment;
+see `ejira-local-hash-property'."
+  (when-let* ((value (org-entry-get nil ejira-local-hash-property)))
+    (split-string value " " t)))
 
 (defun ejira--content-modified-p ()
-  "Return non-nil when the task at point's content fields differ from baseline.
-A missing content baseline is treated as unmodified."
-  (when-let* ((baseline (org-entry-get nil "Pushhash")))
+  "Return non-nil when the content at point differs from its baseline.
+For an issue its content fields, for a comment its body.  A heading
+without a baseline is unmodified."
+  (when-let* ((baseline (car (ejira--local-baseline))))
     (not (equal baseline
-                (concat ejira-pushhash-v2-prefix
-                        (md5 (ejira--heading-content-fields)))))))
+                (md5 (if (ejira--comment-heading-p)
+                         (ejira--comment-content)
+                       (ejira--heading-content-fields)))))))
 
 (defun ejira--priority-cookie-modified-p ()
   "Return non-nil when the org priority cookie disagrees with the stored rank.
@@ -1676,88 +1600,63 @@ so they agree whenever ejira last touched them."
                           stored))))))
 
 (defun ejira--state-modified-p ()
-  "Return non-nil when the task at point's state fields differ from baseline.
-A missing state baseline is treated as unmodified."
-  (when-let* ((baseline (org-entry-get nil ejira-state-hash-property)))
+  "Return non-nil when the state at point differs from its baseline.
+A heading without a state baseline (a comment, or no baseline at all)
+is unmodified."
+  (when-let* ((baseline (nth 1 (ejira--local-baseline))))
     (or (not (equal baseline (md5 (ejira--heading-state-fields))))
         (ejira--priority-cookie-modified-p))))
 
-(defun ejira--update-push-baseline ()
-  "Store the push baselines of the heading at point.
-A v2 heading (one that already has a `Statehash') gets a refreshed
-version-prefixed content `Pushhash' plus `Statehash'.  A legacy heading
-keeps its single full-content `Pushhash'; it is upgraded to v2 by
-`ejira--migrate-push-baseline' on its next clean full pull or push."
-  (if (ejira--v2-baseline-p)
-      (ejira--migrate-push-baseline)
-    (when-let* ((content (ejira--heading-pushable-content)))
-      (org-set-property "Pushhash" (md5 content)))))
-
-(defun ejira--migrate-push-baseline ()
-  "Force v2 split baselines on the heading at point.
-Used where the caller knows the heading is fully reconciled (a clean
-full pull or a completed push), so legacy single-hash issue headings
-upgrade without changing their behavior meanwhile.  Comment headings
-never adopt the v2 split: their baseline stays the single body hash."
-  (if (equal (org-entry-get nil "TYPE") "ejira-comment")
-      (when-let* ((content (ejira--heading-pushable-content)))
-        (org-set-property "Pushhash" (md5 content)))
-    (org-set-property
-     "Pushhash"
-     (concat ejira-pushhash-v2-prefix
-             (md5 (ejira--heading-content-fields))))
-    (org-set-property
-     ejira-state-hash-property
-     (md5 (ejira--heading-state-fields)))))
-
 (defun ejira--locally-modified-p ()
-  "Return non-nil if the ejira heading at point differs from its push baseline.
-v2 headings compare content and state fields separately.  Legacy headings
-(single `Pushhash' over the full pushable content) compare as before.
-Headings without a baseline are treated as unmodified; the baseline
-is established on the next sync or push, never during a plain save."
-  (if (ejira--v2-baseline-p)
-      (or (ejira--content-modified-p) (ejira--state-modified-p))
-    (when-let* ((baseline (org-entry-get nil "Pushhash"))
-               (content (ejira--heading-pushable-content)))
-      (not (equal baseline (md5 content))))))
+  "Return non-nil if the ejira heading at point differs from its local baseline.
+Headings without a baseline are treated as unmodified; the baseline is
+established on the next sync or push, never during a plain save."
+  (or (ejira--content-modified-p) (ejira--state-modified-p)))
+
+(defun ejira--update-local-baseline ()
+  "Record the heading at point as it is now as its local baseline.
+For a clean full pull, a completed push, or a new comment draft: the
+heading then matches Jira, or is meant to."
+  (org-set-property ejira-local-hash-property
+                    (if (ejira--comment-heading-p)
+                        (md5 (ejira--comment-content))
+                      (concat (md5 (ejira--heading-content-fields))
+                              " "
+                              (md5 (ejira--heading-state-fields))))))
+
+(defun ejira--update-state-baseline ()
+  "Acknowledge the current state fields of the issue at point.
+Only the state part of its local baseline moves.  An issue without a
+baseline gets none: only a full pull, which compares the content, may
+establish one."
+  (when-let* ((baseline (ejira--local-baseline))
+              ((not (ejira--comment-heading-p))))
+    (org-set-property ejira-local-hash-property
+                      (concat (car baseline)
+                              " "
+                              (md5 (ejira--heading-state-fields))))))
 
 (defun ejira--heading-reviewed-hash ()
   "Return a value identifying the current pushable state of the heading at point.
 Compared in `ejira--push-finalize' against the state reviewed at plan
 build time, so buffer edits made while the confirmation was open keep
 the heading dirty instead of being acknowledged without being sent."
-  (if (ejira--v2-baseline-p)
-      (concat (ejira--heading-content-fields)
-              "\0"
-              (ejira--heading-state-fields))
-    (ejira--heading-pushable-content)))
+  (if (ejira--comment-heading-p)
+      (ejira--comment-content)
+    (concat (ejira--heading-content-fields)
+            "\0"
+            (ejira--heading-state-fields))))
 
-(defconst ejira-remote-hash-property "Remotehash"
-  "Property hashing the remote field values at the last acknowledgment.
-
-The remote baseline enables three-way reconciliation: the automatic
-sync compares a freshly fetched issue against this hash to tell
-\"remote changed since we last synchronized\" apart from \"only the
-local copy changed\".  Written by the auto-sync cycle after applying a
-pull, and by push finalization with the identity of the values that
-were just sent.  A missing hash means unknown, not unchanged.")
-
-(defconst ejira-remote-updated-property "Remoteupdated"
-  "Property holding Jira's update time of the issue `Remotehash' hashes.
-Jira moves an issue's update time on every change of the issue,
-comments included.  While Jira still reports this time, the issue's
-fields still hash to `Remotehash', and the automatic sync does not
-need to fetch them (see `ejira-auto-sync-full-fetch-interval').  The
-two properties describe one fetched version of the issue: whatever
-writes `Remotehash' from another source writes
-`ejira-remote-updated-unknown' here.")
-
-(defconst ejira-remote-updated-unknown "unknown"
-  "`Remoteupdated' value of a `Remotehash' that no fetch produced.
-Push finalization hashes the values it sent; Jira's update time after
-the push is not known until the next fetch.  No Jira time equals it, so
-the next cycle fetches the issue and records the actual time.")
+(defconst ejira-remote-hash-property "RemoteHash"
+  "Property holding the remote baseline of an issue: Jira at its last sync.
+A hash of the synced fields of that version (see
+`ejira--remote-fields-identity').  It tells a change of a synced field
+in Jira apart from a change of anything else there, and from ejira's
+own pushes: the three-way reconciliation compares a fetched issue with
+it to tell \"remote changed since the last sync\" from \"only the local
+copy changed\".  It is dated by `Modified', Jira's update time of the
+same version (see `ejira--store-remote-baseline-of').  A missing hash
+means unknown, not unchanged.")
 
 (defconst ejira-remote-identity-unknown "?status-unknown?"
   "Placeholder for the status component of a sent-fields identity when
@@ -1805,31 +1704,48 @@ stayed the same.  The fetch must request the `comment' field."
              (ejira--alist-get item 'fields 'comment 'comments)
              ","))
 
-(defun ejira--store-remote-baseline (item)
-  "Store the remote baseline of remote issue ITEM on the heading at point.
-That is its `Remotehash', and the `Remoteupdated' it belongs to.  An
-ITEM fetched without its update time leaves no `Remoteupdated': the
-pair must describe one version of the issue."
-  (org-set-property
-   ejira-remote-hash-property
-   (md5 (ejira--remote-fields-identity item)))
-  (if-let* ((updated (ejira--alist-get item 'fields 'updated)))
-      (org-set-property ejira-remote-updated-property updated)
-    (org-delete-property ejira-remote-updated-property)))
+(defun ejira--remote-time (time)
+  "Return TIME, a Lisp time or a Jira timestamp, as `Modified' stores it.
+To the second, in UTC."
+  (format-time-string "%Y-%m-%d %H:%M:%S"
+                      (if (stringp time) (ejira--date-to-time time) time)
+                      "UTC"))
 
-(defun ejira--note-remote-updated (marker item)
-  "Record remote ITEM's update time on the heading at MARKER.
-Only for a heading whose `Remotehash' ITEM still matches: the time then
-dates the stored baseline, and the next cycles need not fetch the issue
-while Jira reports the same time."
+(defun ejira--store-remote-baseline-of (identity updated)
+  "Record the remote baseline of the issue at point.
+IDENTITY is the `ejira--remote-fields-identity' of the version, and
+UPDATED Jira's update time of the same version, a Lisp time or a Jira
+timestamp.  The hash goes to `RemoteHash' and the time to `Modified':
+the two always describe one version, so that while Jira reports the
+same update time the issue still hashes to `RemoteHash', and the
+automatic sync need not fetch it.  Without UPDATED, `Modified' is
+removed: an undated baseline is checked by the next fetch."
+  (org-set-property ejira-remote-hash-property (md5 identity))
+  (if updated
+      (org-set-property "Modified" (ejira--remote-time updated))
+    (org-delete-property "Modified")))
+
+(defun ejira--store-remote-baseline (item)
+  "Record REST ITEM as the remote baseline of the issue at point.
+See `ejira--store-remote-baseline-of'."
+  (ejira--store-remote-baseline-of (ejira--remote-fields-identity item)
+                                   (ejira--alist-get item 'fields 'updated)))
+
+(defun ejira--date-remote-baseline (marker item)
+  "Date the remote baseline of the issue at MARKER with REST ITEM's time.
+Only for an issue whose `RemoteHash' ITEM still matches.  Push
+finalization hashes the values it sent, while Jira's update time after
+the push is unknown until a fetch: this records it, and the next cycles
+need not fetch the issue while Jira reports the same time."
   (when-let* ((updated (ejira--alist-get item 'fields 'updated)))
-    (unless (equal updated (org-entry-get marker ejira-remote-updated-property))
-      (org-with-point-at marker
-        (org-set-property ejira-remote-updated-property updated)))))
+    (let ((time (ejira--remote-time updated)))
+      (unless (equal time (org-entry-get marker "Modified"))
+        (org-with-point-at marker
+          (org-set-property "Modified" time))))))
 
 (defun ejira--remote-changed-p (item)
   "Return non-nil when remote issue ITEM differs from its known baseline.
-A missing :Remotehash: means the baseline is unknown; that returns nil
+A missing `RemoteHash' means the baseline is unknown; that returns nil
 here, and callers distinguish it from a known change explicitly."
   (let ((stored (org-entry-get nil ejira-remote-hash-property)))
     (and stored
@@ -1925,9 +1841,9 @@ HEADING defaults to the heading at point.  A projection is enabled by either a
 (defun ejira--jira-description (&optional heading)
   "Return the Jira-facing description for HEADING or the heading at point.
 
-Projected headings deliberately default to an empty Jira description rather
-than exporting their local body or ordinary `Description' child subtree.
-In body-as-description mode the description is the task's owned body region."
+The description is the task's owned body region.  Projected headings
+deliberately default to an empty Jira description rather than exporting
+their local body."
   (if heading
       (org-with-point-at heading (ejira--jira-description))
     (cond
@@ -1936,19 +1852,14 @@ In body-as-description mode the description is the task's owned body region."
                   (ejira--find-child-heading
                    ejira-jira-description-heading-name)))
         (ejira--get-heading-body description)))
-     ((ejira--description-in-body-p)
-      (ejira--get-task-description))
      (t
-      (when-let* ((description
-                  (ejira--find-child-heading ejira-description-heading-name)))
-        (ejira--get-heading-body description))))))
+      (ejira--get-task-description)))))
 
 (defun ejira--jira-description-raw (&optional heading)
   "Return HEADING's Jira-facing description region exactly as stored.
 Like `ejira--jira-description', but with the leading blank lines kept,
 for `ejira--body-shape-canonical-p'.  Nil when there is no
-description region (a projection or legacy heading without its
-description child)."
+description region (a projection without its `JIRA_DESCRIPTION' child)."
   (if heading
       (org-with-point-at heading (ejira--jira-description-raw))
     (cond
@@ -1957,72 +1868,15 @@ description child)."
                    (ejira--find-child-heading
                     ejira-jira-description-heading-name)))
         (ejira--heading-body-raw description)))
-     ((ejira--description-in-body-p)
-      (ejira--task-description-raw))
      (t
-      (when-let* ((description
-                   (ejira--find-child-heading ejira-description-heading-name)))
-        (ejira--heading-body-raw description))))))
+      (ejira--task-description-raw)))))
 
 (defun ejira--new-issue-description (&optional heading)
   "Return the Jira description for a local heading not yet created in Jira.
-
-An ordinary heading without a dedicated `Description' child exports its
-direct body; in body-as-description mode the owned body region already
-is the description.  Projected headings intentionally export only
+Its owned body region, sent as it is: the first pull imports the remote
+markup into the same region.  Projected headings export only
 `JIRA_DESCRIPTION'."
-  (if heading
-      (org-with-point-at heading (ejira--new-issue-description))
-    (cond
-     ((ejira--jira-projection-p) (or (ejira--jira-description) ""))
-     ((ejira--description-in-body-p) (or (ejira--jira-description) ""))
-     (t (or (ejira--jira-description)
-            (ejira--get-heading-own-body))))))
-
-(defun ejira--prepare-new-issue-description (&optional heading)
-  "Return a new heading's Jira description, migrating an ordinary body.
-
-Before creation under the legacy model, move a plain heading's direct body
-into its dedicated `Description' child.  This keeps local and remote
-descriptions aligned after the initial Jira refresh without exposing
-content from a projection.  In body-as-description mode nothing moves:
-the body is sent as-is and the first pull imports the remote markup
-into the same region."
-  (if heading
-      (org-with-point-at heading (ejira--prepare-new-issue-description))
-    (if (or (ejira--jira-projection-p)
-            (ejira--description-in-body-p)
-            (ejira--find-child-heading ejira-description-heading-name))
-        (or (ejira--jira-description) "")
-      (let* ((region (ejira--heading-own-body-region))
-             (body (ejira--strip-leading-blank-lines
-                    (buffer-substring-no-properties (car region) (cdr region)))))
-        (if (string-empty-p (string-trim body))
-            ""
-          ;; Markers: creating the Description heading inserts text at
-          ;; the end of the subtree, which can be the region's end.
-          (let ((start (copy-marker (car region)))
-                (end (copy-marker (cdr region))))
-            (unwind-protect
-                (let ((description
-                       (ejira--get-subheading (point-marker)
-                                              ejira-description-heading-name)))
-                  (ejira--set-heading-body description body)
-                  ;; The region holds the body's surrounding blank lines
-                  ;; too; the heading insertion may have added its own
-                  ;; blank line right after it.  Leave exactly one
-                  ;; between the metadata and the next heading, the
-                  ;; shape `ejira--set-heading-body' gives an empty body.
-                  (save-excursion
-                    (delete-region start end)
-                    (goto-char start)
-                    (while (and (not (eobp)) (looking-at-p "[ \t]*$"))
-                      (delete-region (point) (min (point-max)
-                                                  (line-beginning-position 2))))
-                    (insert "\n")))
-              (set-marker start nil)
-              (set-marker end nil))
-            body))))))
+  (or (ejira--jira-description heading) ""))
 
 (defun ejira--remote-body-for-diff (remote local)
   "Return REMOTE, or LOCAL when they differ only in what JIRA cannot carry.
@@ -2040,9 +1894,8 @@ timestamp that comes back inactive is not a change to push."
 
 For a projection without an existing `JIRA_DESCRIPTION' child, non-empty
 remote text remains visibly different so the normal confirmation flow can
-either import it on pull or clear it on an intentional push.  In
-body-as-description mode the expected text is parsed relative to the
-task heading itself."
+either import it on pull or clear it on an intentional push.  Otherwise
+the expected text is parsed relative to the task heading itself."
   (org-with-point-at heading
     (cond
      ((ejira--jira-projection-p)
@@ -2051,15 +1904,8 @@ task heading itself."
         (if description
             (ejira--expected-org-body description content)
           (or content ""))))
-     ((ejira--description-in-body-p)
-      (ejira--parse-body
-       content (org-current-level)))
      (t
-      (let ((description
-             (ejira--find-child-heading ejira-description-heading-name)))
-        (if description
-            (ejira--expected-org-body description content)
-          (or content "")))))))
+      (ejira--parse-body content (org-current-level))))))
 
 (defun ejira--is-parent-p (child parent)
   "Return t if CHILD is a subheading of PARENT."
@@ -2332,9 +2178,8 @@ stale index misses, through `ejira--find-heading'."
 
 (defconst ejira--sync-properties
   '("ID" "ORIG_ID" "TYPE" "CommId" "Author" "Status" "Reporter" "Assignee"
-    "Issuetype" "Created" "Modified" "Effort" "Left" "Pushhash" "Statehash"
-    "Remotehash" "Remoteupdated" "JiraPriorityId" "JiraPriorityName"
-    "JiraPriorityRank")
+    "Issuetype" "Created" "Modified" "Effort" "Left" "LocalHash" "RemoteHash"
+    "JiraPriorityId" "JiraPriorityName" "JiraPriorityRank")
   "Properties ejira writes as sync metadata.
 `ejira--commit-heading' carries the values the heading holds to the file.")
 
@@ -2624,19 +2469,26 @@ shows up as a local change for the next review."
     (org-entry-get (point-marker) property)))
 
 (defun ejira--find-child-heading-predicate (predicate)
-  "Get marker to child heading with PREDICATE function returning t."
+  "Get marker to the first direct child heading for which PREDICATE is non-nil.
+PREDICATE is called with point on each child.  A direct child is a
+heading of the subtree not nested under an earlier heading of it.  A
+description converted from Jira can skip outline levels (an `h2.'
+section lies two levels below its task), and the headings after such a
+section are children all the same: walking siblings from the first
+child stopped at it, missed the Comments container behind it, and a
+pull created a second one."
   (org-with-wide-buffer
-   (ejira--with-expand-all
-     (when (org-goto-first-child)
-       (let ((found-p nil)
-             (end-p nil))
-         (while (and (not found-p) (not end-p))
-           (if (funcall predicate)
-               (setq found-p t)
-             (unless (org-goto-sibling)
-               (setq end-p t))))
-         (when found-p
-           (point-marker)))))))
+   (org-back-to-heading t)
+   (let ((end (save-excursion (org-end-of-subtree t t) (point)))
+         (min-level most-positive-fixnum)
+         found)
+     (while (and (not found) (outline-next-heading) (< (point) end))
+       (let ((level (org-current-level)))
+         (when (<= level min-level)
+           (setq min-level level)
+           (when (save-excursion (funcall predicate))
+             (setq found (point-marker))))))
+     found)))
 
 (defun ejira--find-child-heading-property (name value)
   "Get marker to child heading with property NAME with value VALUE."
@@ -2681,7 +2533,7 @@ shows up as a local change for the next review."
   "Set item ID's Jira-facing summary to SUMMARY.
 
 Projected headings retain their local title and receive the remote value in
-`JIRA_TITLE'; ordinary headings keep ejira's historical title behavior."
+`JIRA_TITLE'; other headings take it as their title."
   (ejira--with-point-on id
     (if (ejira--jira-projection-p)
         (org-set-property ejira-jira-title-property summary)

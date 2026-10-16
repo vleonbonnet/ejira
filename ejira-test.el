@@ -233,11 +233,11 @@ Concise external description.
    (should (equal "Concise external title" (ejira--jira-summary)))
    (should (equal "Concise external description."
                   (string-trim (ejira--jira-description))))
-   (let ((hash (md5 (ejira--heading-pushable-content))))
+   (let ((hash (md5 (ejira--heading-content-fields))))
      (search-forward "Private implementation notes.")
      (replace-match "Changed private implementation notes.")
      (goto-char (point-min))
-     (should (equal hash (md5 (ejira--heading-pushable-content)))))))
+     (should (equal hash (md5 (ejira--heading-content-fields)))))))
 
 (ert-deftest ejira-projection--pull-preserves-local-title-and-description ()
   "A Jira pull updates projection fields without replacing local content."
@@ -274,27 +274,6 @@ Private local description.
                          (ejira--find-child-heading "JIRA_DESCRIPTION")
                        (ejira--get-heading-body (point-marker)))))))))
 
-(ert-deftest ejira-new-issue-description--migrates-plain-body ()
-  "A plain new heading moves its direct body into Description before creation."
-  (ejira-test--with-org-buf
-   "* TODO Local task
-:PROPERTIES:
-:END:
-
-Content intended for Jira.
-"
-   (goto-char (point-min))
-   (should (equal "Content intended for Jira.\n"
-                  (ejira--new-issue-description)))
-   (should-not (ejira--find-child-heading "Description"))
-   (should (equal "Content intended for Jira.\n"
-                  (ejira--prepare-new-issue-description)))
-   (goto-char (point-min))
-   (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
-   (org-with-point-at (ejira--find-child-heading "Description")
-     (should (equal "Content intended for Jira."
-                    (string-trim (ejira--get-heading-body (point-marker))))))))
-
 (ert-deftest ejira-new-issue-description--projection-keeps-local-body-private ()
   "Preparing a projected heading never moves local content into Description."
   (ejira-test--with-org-buf
@@ -311,7 +290,7 @@ External task description.
 "
    (goto-char (point-min))
    (should (equal "External task description."
-                  (string-trim (ejira--prepare-new-issue-description))))
+                  (string-trim (ejira--new-issue-description))))
    (goto-char (point-min))
    (should (equal "Private implementation notes."
                   (string-trim (ejira--get-heading-own-body))))
@@ -452,7 +431,7 @@ External task description.
                             (org-entry-get (point-marker)
                                            ejira-priority-id-property))))
            (should (org-with-point-at issue-marker
-                     (org-entry-get (point-marker) "Pushhash")))))))))
+                     (org-entry-get (point-marker) "LocalHash")))))))))
 
 (ert-deftest ejira-priority--update-task/preserves-dirty-legacy-heading ()
   "A dirty legacy heading is left untouched until its current push succeeds."
@@ -462,7 +441,7 @@ External task description.
         (ejira--heading-cache (make-hash-table :test #'equal))
         (updated (date-to-time "2026-07-09 23:18:09 +0000")))
     (ejira-test--with-org-buf
-     "* TEST\n:PROPERTIES:\n:ID: TEST\n:TYPE: ejira-project\n:END:\n* DONE [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:Modified: 2026-07-09 23:18:09\n:Pushhash: WRONG\n:END:\n"
+     "* TEST\n:PROPERTIES:\n:ID: TEST\n:TYPE: ejira-project\n:END:\n* DONE [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:Modified: 2026-07-09 23:18:09\n:LocalHash: WRONG\n:END:\n"
      (goto-char (point-min))
      (re-search-forward org-heading-regexp)
      (let ((project-marker (point-marker)))
@@ -547,7 +526,7 @@ Comment body.
 :PROPERTIES:
 :TYPE:        ejira-issue
 :ID:          PROJ-1
-:Pushhash:    clean
+:LocalHash:    clean
 :PendingDelete: t
 :END:
 ")))
@@ -564,7 +543,7 @@ Comment body.
 :PROPERTIES:
 :TYPE:     ejira-issue
 :ID:       PROJ-1
-:Pushhash: WRONGHASH
+:LocalHash: WRONGHASH
 :END:
 ")))
     (let ((issue-ops (cl-remove-if-not
@@ -592,7 +571,7 @@ Comment body.
                       (duedate . nil)
                       (status . ((name . "Open"))))))))
     (ejira-test--with-org-buf
-     "* TODO [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:JiraPriorityId: hidden-default\n:JiraPriorityName: Hidden default\n:Pushhash: WRONG\n:END:\n** Description\n"
+     "* TODO [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:JiraPriorityId: hidden-default\n:JiraPriorityName: Hidden default\n:LocalHash: WRONG\n:END:\n"
      (let ((marker (progn (goto-char (point-min))
                           (re-search-forward org-heading-regexp)
                           (point-marker))))
@@ -633,7 +612,7 @@ Regression: the push sent an empty string, which Jira rejects with
                       (duedate . "2026-10-15")
                       (status . ((name . "Open"))))))))
     (ejira-test--with-org-buf
-     "* TODO Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:Pushhash: WRONG\n:END:\n** Description\n"
+     "* TODO Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:LocalHash: WRONG\n:END:\n"
      (let ((marker (progn (goto-char (point-min))
                           (re-search-forward org-heading-regexp)
                           (point-marker))))
@@ -678,12 +657,12 @@ REMOTE-PRIORITY.  Binds MARKER and PLANS (built from the heading)."
                        (duedate . nil)
                        (status . ((name . "Open"))))))))
      (ejira-test--with-org-buf
-      "* TODO [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:JiraPriorityId: p3\n:JiraPriorityName: Low\n:JiraPriorityRank: 3\n:Status: Open\n:END:\n** Description\n"
+      "* TODO [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:JiraPriorityId: p3\n:JiraPriorityName: Low\n:JiraPriorityRank: 3\n:Status: Open\n:END:\n"
       (let ((marker (progn (goto-char (point-min))
                            (re-search-forward org-heading-regexp)
                            (point-marker))))
         (org-with-point-at marker
-          (ejira--migrate-push-baseline)
+          (ejira--update-local-baseline)
           (should-not (ejira--locally-modified-p))
           (org-priority 1)
           (should (ejira--locally-modified-p)))
@@ -741,7 +720,7 @@ heading clean, with Jira's priority recorded."
                       (duedate . nil)
                       (status . ((name . "In Progress"))))))))
     (ejira-test--with-org-buf
-     "* DONE [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:Pushhash: WRONG\n:END:\n** Description\n"
+     "* DONE [#3] Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:LocalHash: WRONG\n:END:\n"
      (let ((marker (progn (goto-char (point-min))
                           (re-search-forward org-heading-regexp)
                           (point-marker))))
@@ -790,18 +769,19 @@ heading clean, with Jira's priority recorded."
                                                              (cdr (assoc 'priority (nth 4 create-call))))))))))))
 
 (ert-deftest ejira-push--rule-a/clean-issue-no-op ()
-  "Current Pushhash on ejira-issue produces no update op."
-  ;; Compute the real hash for a heading with no children/properties.
+  "A current local baseline on ejira-issue produces no update op."
+  ;; Compute the real baseline of a heading with no children.
   (let (real-hash)
     (ejira-test--with-org-buf
      "* TODO PROJ-1 Clean Issue\n:PROPERTIES:\n:TYPE:     ejira-issue\n:ID:       PROJ-1\n:END:\n"
      (goto-char (point-min))
      (re-search-forward org-heading-regexp nil t)
-     (setq real-hash (md5 (ejira--heading-pushable-content))))
+     (ejira--update-local-baseline)
+     (setq real-hash (org-entry-get nil "LocalHash")))
     (let ((ops (ejira-test--scan
                 (concat "* TODO PROJ-1 Clean Issue\n:PROPERTIES:\n"
                         ":TYPE:     ejira-issue\n:ID:       PROJ-1\n"
-                        ":Pushhash: " real-hash "\n:END:\n"))))
+                        ":LocalHash: " real-hash "\n:END:\n"))))
       (should (null (cl-remove-if-not
                      (lambda (op) (and (eq 'update (plist-get op :op))
                                        (eq 'issue  (plist-get op :object))))
@@ -822,7 +802,7 @@ heading clean, with Jira's priority recorded."
 :PROPERTIES:
 :TYPE:     ejira-comment
 :CommId:   77
-:Pushhash: WRONGHASH
+:LocalHash: WRONGHASH
 :END:
 Original body.
 ")))
@@ -845,7 +825,7 @@ Original body.
 *** Draft
 :PROPERTIES:
 :TYPE:     ejira-comment
-:Pushhash: WRONGHASH
+:LocalHash: WRONGHASH
 :END:
 Draft body.
 ")))
@@ -863,7 +843,7 @@ Draft body.
 :PROPERTIES:
 :TYPE:              ejira-issue
 :ID:                PROJ-1
-:Pushhash:          clean
+:LocalHash:          clean
 :PendingTransition: In Progress
 :END:
 ")))
@@ -882,7 +862,7 @@ Draft body.
 :PROPERTIES:
 :TYPE:             ejira-issue
 :ID:               PROJ-1
-:Pushhash:         clean
+:LocalHash:         clean
 :PendingIssuetype: Story
 :END:
 ")))
@@ -901,7 +881,7 @@ Draft body.
 :PROPERTIES:
 :TYPE:       ejira-issue
 :ID:         PROJ-1
-:Pushhash:   clean
+:LocalHash:   clean
 :PendingEpic: PROJ-E1
 :END:
 ")))
@@ -940,8 +920,8 @@ Body for Jira.
             (description (cadr (assoc "description" (plist-get plan :fields)))))
        (should (equal "Body for Jira.\n" description))))))
 
-(ert-deftest ejira-push--new-subtask/migrates-body-before-create ()
-  "Creating a subtask retains its direct body in the managed description."
+(ert-deftest ejira-push--new-subtask/sends-body-and-keeps-it ()
+  "Creating a subtask sends its body as the description and leaves it in place."
   (let ((ejira--assign-new-issues nil)
         created-description)
     (ejira-test--with-org-buf
@@ -969,10 +949,8 @@ Body for Jira.
          (ejira-test--as-confirmed (funcall (plist-get plan :send))))
        (should (equal "Body for Jira.\n" created-description))
        (org-with-point-at marker
-         (should (string-empty-p (string-trim (ejira--get-heading-own-body))))
-         (org-with-point-at (ejira--find-child-heading "Description")
-           (should (equal "Body for Jira."
-                          (string-trim (ejira--get-heading-body (point-marker)))))))))))
+         (should (equal "Body for Jira." (string-trim (ejira--jira-description))))
+         (should-not (ejira--find-child-heading "Description")))))))
 
 (ert-deftest ejira-push--create/priority-from-cookie ()
   "New issues are created with the priority their Org cookie names.
@@ -1070,7 +1048,6 @@ overwrote its parent's."
 :TYPE:     ejira-epic
 :ID:       TEST-1
 :Issuetype: Epic
-:EJIRA_DESCRIPTION_IN_BODY: t
 :END:
 ** TODO Parent task
 Parent body.
@@ -1269,7 +1246,7 @@ Draft from capture.
 :PROPERTIES:
 :TYPE:     ejira-comment
 :CommId:   55
-:Pushhash: clean
+:LocalHash: clean
 :END:
 Already on Jira.
 ")))
@@ -1788,28 +1765,41 @@ sibling -- an issue subtree in the generated project files."
          (should (org-goto-first-child))
          (should (equal "New body" (org-get-heading t t t t))))))))
 
+(ert-deftest ejira-find-child-heading/after-a-skipped-level ()
+  "A child after a section that skips an outline level is found.
+Regression: a description opening with an `h2.' section lies two levels
+below its task; the Comments container after it was missed, and every
+pull created another one."
+  (ejira-test--with-org-buf
+   "** TODO X\n:PROPERTIES:\n:ID: T-1\n:END:\n\nIntro.\n\n**** Part\n\nDetail.\n\n***** Deep\n\n*** Comments\n**** A comment\n"
+   (should (ejira--find-child-heading "Part"))
+   (should (ejira--find-child-heading "Comments"))
+   (should-not (ejira--find-child-heading "Deep"))
+   (should-not (ejira--find-child-heading "A comment"))
+   (let ((m (ejira--get-subheading (point-marker) ejira-comments-heading-name)))
+     (should (equal "Comments" (org-with-point-at m (org-get-heading t t t t))))
+     (should (= 1 (how-many "^\\*+ Comments$" (point-min) (point-max)))))))
+
 (ert-deftest ejira-description/pull-keeps-headings-contained ()
   "Repeated description pulls are idempotent, keep siblings and deep levels.
 Reproduces the corrupted epics: newlines collapsed, the body became
 one long paragraph, and later pulls saw an empty description."
-  (dolist (level '(2 7))
+  (dolist (level '(1 6))
     (ejira-test--with-org-buf
-     (format "%s TODO Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:END:\n%s Description\n\nOld body.\n%s TODO Child\n:PROPERTIES:\n:ID: TEST-2\n:END:\nKeep me.\n"
-             (make-string (1- level) ?*) (make-string level ?*)
-             (make-string level ?*))
+     (format "%s TODO Issue\n:PROPERTIES:\n:TYPE: ejira-issue\n:ID: TEST-1\n:END:\n\nOld body.\n\n%s TODO Child\n:PROPERTIES:\n:ID: TEST-2\n:END:\nKeep me.\n"
+             (make-string level ?*) (make-string (1+ level) ?*))
      (let* ((issue (point-marker))
-            (description (ejira--find-child-heading "Description"))
             (jira "h1. Outcome\nText.\n\nh2. Details\n* First\n* Second\n")
-            (expected (ejira--expected-org-body description jira)))
+            (expected (ejira--expected-jira-description issue jira)))
        (dotimes (_ 2)
-         (ejira--set-heading-body-jira-markup description jira)
-         (should (equal expected (string-trim (ejira--get-heading-body description))))
-         (should (equal expected (ejira--expected-jira-description issue jira)))
-         (org-with-point-at issue (ejira--update-push-baseline))
+         (org-with-point-at issue
+           (ejira--set-task-description (ejira--parse-body jira level)))
+         (should (equal expected (string-trim (ejira--jira-description issue))))
+         (org-with-point-at issue (ejira--update-local-baseline))
          (should-not (org-with-point-at issue (ejira--locally-modified-p)))
          (org-with-point-at issue
            (should (ejira--find-child-heading "Child")))
-         (goto-char description)
+         (goto-char issue)
          (should (org-goto-first-child))
          (should (= (1+ level) (org-current-level)))
          (should (equal "Outcome" (org-get-heading t t t t))))
@@ -1898,15 +1888,16 @@ The check used to read the stripped body value, so it rejected every
 freshly written body and could not see a doubled leading blank."
   (dolist (contents '("Body." "\n\nBody.\n\n\n" "" "\n\n"))
     (ejira-test--with-org-buf
-     "* TODO Task\n:PROPERTIES:\n:ID: X-1\n:END:\n** Description\n\n\n\nOld.\n** Comments\n"
-     (let ((d (progn (re-search-forward "^\\*\\* Description")
+     "* TODO Task\n:PROPERTIES:\n:ID: X-1\n:END:\n\n\n\nOld.\n** Comments\n*** A comment\n\n\n\nOld.\n"
+     (ejira--set-task-description contents)
+     (goto-char (point-min))
+     (should (ejira--body-shape-canonical-p (ejira--jira-description-raw)))
+     (let ((c (progn (re-search-forward "^\\*\\*\\* A comment")
                      (org-back-to-heading t)
                      (point-marker))))
-       (ejira--set-heading-body d contents)
-       (should (ejira--body-shape-canonical-p (ejira--heading-body-raw d)))
-       (goto-char (point-min))
-       (should (ejira--body-shape-canonical-p (ejira--jira-description-raw)))
-       (should-not (string-match-p "\n\n\n" (buffer-string)))))))
+       (ejira--set-heading-body c contents)
+       (should (ejira--body-shape-canonical-p (ejira--heading-body-raw c))))
+     (should-not (string-match-p "\n\n\n" (buffer-string))))))
 
 (ert-deftest ejira-trim-blank-lines/keeps-first-line-indentation ()
   "Only blank lines and trailing whitespace are trimmed."
@@ -1931,7 +1922,7 @@ freshly written body and could not see a doubled leading blank."
                   (save-excursion (search-forward "- note\n:END:\n") (point))))))
 
 (defconst ejira-test--logbook-comments-task
-  "* Parent\n:PROPERTIES:\n:EJIRA_DESCRIPTION_IN_BODY: t\n:END:\n\n\
+  "* Parent\n:PROPERTIES:\n:END:\n\n\
 ** TODO Task\n:PROPERTIES:\n:ID:       X-1\n:END:\n:LOGBOOK:\n- note\n:END:\n%s\
 *** Comments\n\n** TODO Sibling\n:PROPERTIES:\n:ID:       X-2\n:END:\n"
   "A body-mode task whose own body is empty: metadata, then Comments.
@@ -1978,37 +1969,12 @@ rewrite added one more."
 
 (ert-deftest ejira-description-set/empty-body-before-child-task ()
   "Blank lines before a protected child task collapse to one; the task stays."
-  (let ((ejira-description-in-body t))
+  (progn
     (ejira-test--with-org-buf
      "* TODO Task\n:PROPERTIES:\n:ID: X-1\n:END:\n\n\n\n** TODO Child\n:PROPERTIES:\n:ID: X-2\n:END:\n\nChild body.\n"
      (ejira--set-task-description "")
      (should (equal "* TODO Task\n:PROPERTIES:\n:ID: X-1\n:END:\n\n** TODO Child\n:PROPERTIES:\n:ID: X-2\n:END:\n\nChild body.\n"
                     (buffer-string))))))
-
-(ert-deftest ejira-new-issue-description/moved-body-leaves-canonical-spacing ()
-  "Moving a local body into Description leaves no doubled blank lines.
-The removed region used to start after the body's leading blank
-lines, which stayed behind next to the blank line the new heading
-brought; the untrimmed body tripled the blank lines after it."
-  (dolist (body '("\nBody.\n" "Body.\n" "\nBody.\n\n" "Body.\n\n" "\n\n\nBody.\n\n\n"))
-    (ejira-test--with-org-buf
-     (concat "* Parent\n\n** TODO Task\n:PROPERTIES:\n:ID:       X-1\n:END:\n:LOGBOOK:\n- note\n:END:\n"
-             body "** Next\n")
-     (ejira-test--goto-task)
-     (should (equal "Body." (string-trim (ejira--prepare-new-issue-description))))
-     (should (equal (concat "* Parent\n\n** TODO Task\n:PROPERTIES:\n:ID:       X-1\n:END:\n"
-                            ":LOGBOOK:\n- note\n:END:\n\n*** Description\n\nBody.\n\n** Next\n")
-                    (buffer-string))))))
-
-(ert-deftest ejira-new-issue-description/moved-body-before-child-task ()
-  "With a child task, one blank line is left between metadata and child."
-  (ejira-test--with-org-buf
-   "* TODO Task\n:PROPERTIES:\n:ID: X-1\n:END:\n\nBody.\n\n** TODO Child\n:PROPERTIES:\n:ID: X-2\n:END:\n\nChild body.\n"
-   (ejira--prepare-new-issue-description)
-   (should-not (string-match-p "\n\n\n" (buffer-string)))
-   (should (string-match-p ":ID: X-1\n:END:\n\n\\*\\* TODO Child\n" (buffer-string)))
-   (goto-char (point-min))
-   (should (equal "Body." (string-trim (ejira--jira-description))))))
 
 ;;; ── Body-as-description ownership ────────────────────────────────────────────
 
@@ -2087,7 +2053,7 @@ Nested body.
 
 Trailing section prose.
 "
-   (let ((ejira-description-in-body t))
+   (progn
      (goto-char (point-min))
      (let ((desc (ejira--get-task-description)))
        (should (string-match-p "Before prose." desc))
@@ -2148,55 +2114,28 @@ below the task; child tasks and Comments survive the import."
 Description child."
   (ejira-test--with-org-buf
    "* TODO Fresh task\n:PROPERTIES:\n:ID:       TEST-9\n:END:\n\nFresh body.\n"
-   (let ((ejira-description-in-body t))
+   (progn
      (goto-char (point-min))
      (should (equal "Fresh body.\n" (ejira--new-issue-description)))
-     (ejira--prepare-new-issue-description)
+     (ejira--new-issue-description)
      (should-not (string-match-p "^\\*\\* Description$" (buffer-string)))
      (should (string-match-p "Fresh body." (buffer-string))))))
 
-(ert-deftest ejira-body-desc/property-opt-in ()
-  "The inherited EJIRA_DESCRIPTION_IN_BODY property enables body mode
-without the global variable."
-  (ejira-test--with-org-buf
-   "* TODO Task\n:PROPERTIES:\n:ID:       TEST-1\n:EJIRA_DESCRIPTION_IN_BODY: t\n:END:\n\nBody prose.\n"
-   (should (ejira--description-in-body-p))
-   (goto-char (point-min))
-   (should (equal "Body prose.\n" (ejira--jira-description)))))
+;;; ── Local baseline: content and state ────────────────────────────────────────
 
-(ert-deftest ejira-body-desc/legacy-mode-still-uses-description-child ()
-  "Without body mode the legacy Description child is read and created."
-  (ejira-test--with-org-buf
-   "* TODO Task\n:PROPERTIES:\n:ID:       TEST-1\n:END:\n\nLegacy body.\n"
-   (let ((marker (point-min-marker)))
-     (cl-letf (((symbol-function 'ejira--find-heading)
-                (lambda (_id) marker)))
-       (should-not (ejira--description-in-body-p))
-       (goto-char (point-min))
-       (should (equal "Legacy body.\n" (ejira--new-issue-description)))
-       ;; Legacy prepare moves the body into a Description child.
-       (ejira--prepare-new-issue-description)
-       (should (string-match-p "^\\*\\* Description$" (buffer-string)))
-       (goto-char (point-min))
-       (should (equal "Legacy body."
-                      (string-trim (ejira--jira-description))))))))
-
-;;; ── v2 split baselines ───────────────────────────────────────────────────────
-
-(ert-deftest ejira-v2-baseline/light-pull-acks-state-only ()
+(ert-deftest ejira-local-baseline/light-pull-acks-state-only ()
   "A shallow pull acknowledges the state fields it fetched, and must
 not acknowledge unpushed local content edits."
   (ejira-test--with-project-dir ejira-test--project-content
                                 (let ((buf (find-file-noselect
                                             (expand-file-name "TEST.org" ejira-org-directory) t)))
                                   (with-current-buffer buf
-                                    ;; Establish v2 baselines, then make a local summary edit (the
-                                    ;; summary is a content field; in legacy mode body text is not
-                                    ;; pushable, so a body edit would not register at all).
+                                    ;; Establish the baselines, then make a local summary edit (the
+                                    ;; summary is a content field).
                                     (goto-char (point-min))
                                     (re-search-forward "^\\*\\* TODO An issue")
-                                    (ejira--migrate-push-baseline)
-                                    (should (ejira--v2-baseline-p))
+                                    (ejira--update-local-baseline)
+                                    (should (= 2 (length (ejira--local-baseline))))
                                     (beginning-of-line)
                                     (org-with-point-at (point-marker)
                                       (replace-regexp "TODO An issue" "TODO An issue edited" nil
@@ -2215,49 +2154,7 @@ not acknowledge unpushed local content edits."
                                     (should (ejira--content-modified-p))
                                     (should (ejira--locally-modified-p))))))
 
-(ert-deftest ejira-v2-baseline/legacy-light-pull-keeps-pending-edits ()
-  "A shallow pull must not acknowledge a legacy heading's pending edit.
-Regression: the legacy branch re-hashed the whole content, so any
-unpushed summary or description edit looked synced after the next
-background pull, and a later full pull overwrote it with Jira's text."
-  (ejira-test--with-project-dir ejira-test--project-content
-                                (let ((buf (find-file-noselect
-                                            (expand-file-name "TEST.org" ejira-org-directory) t)))
-                                  (with-current-buffer buf
-                                    (goto-char (point-min))
-                                    (re-search-forward "^\\*\\* TODO An issue")
-                                    (ejira--update-push-baseline)
-                                    (should-not (ejira--v2-baseline-p))
-                                    (beginning-of-line)
-                                    (org-with-point-at (point-marker)
-                                      (replace-regexp "TODO An issue" "TODO An issue edited" nil
-                                                      (point) (line-end-position)))
-                                    (should (ejira--locally-modified-p))
-                                    (cl-letf (((symbol-function 'ejira--my-fullname)
-                                               (lambda () "Test User")))
-                                      (ejira--update-task-light "TEST-1" "Done" "someone"))
-                                    ;; Nothing applied, nothing acknowledged.
-                                    (should (ejira--locally-modified-p))
-                                    (should (equal "TODO" (org-get-todo-state)))))))
-
-(ert-deftest ejira-v2-baseline/legacy-clean-light-pull-migrates ()
-  "A clean legacy heading takes the remote state and upgrades to v2."
-  (ejira-test--with-project-dir ejira-test--project-content
-                                (let ((buf (find-file-noselect
-                                            (expand-file-name "TEST.org" ejira-org-directory) t)))
-                                  (with-current-buffer buf
-                                    (goto-char (point-min))
-                                    (re-search-forward "^\\*\\* TODO An issue")
-                                    (ejira--update-push-baseline)
-                                    (should-not (ejira--v2-baseline-p))
-                                    (cl-letf (((symbol-function 'ejira--my-fullname)
-                                               (lambda () "Test User")))
-                                      (ejira--update-task-light "TEST-1" "Done" "someone"))
-                                    (should (ejira--v2-baseline-p))
-                                    (should (equal "Done" (org-entry-get nil "Status")))
-                                    (should-not (ejira--locally-modified-p))))))
-
-(ert-deftest ejira-v2-baseline/light-pull-keeps-pending-state-edit ()
+(ert-deftest ejira-local-baseline/light-pull-keeps-pending-state-edit ()
   "A pending local todo-state edit survives a shallow pull, still dirty."
   (ejira-test--with-project-dir ejira-test--project-content
                                 (let ((buf (find-file-noselect
@@ -2265,7 +2162,7 @@ background pull, and a later full pull overwrote it with Jira's text."
                                   (with-current-buffer buf
                                     (goto-char (point-min))
                                     (re-search-forward "^\\*\\* TODO An issue")
-                                    (ejira--migrate-push-baseline)
+                                    (ejira--update-local-baseline)
                                     (let ((org-inhibit-logging t)
                                           (org-log-done nil))
                                       (org-todo "DONE"))
@@ -2276,7 +2173,26 @@ background pull, and a later full pull overwrote it with Jira's text."
                                     (should (equal "DONE" (org-get-todo-state)))
                                     (should (ejira--state-modified-p))))))
 
-(ert-deftest ejira-v2-baseline/state-edits-are-detected ()
+(ert-deftest ejira-local-baseline/no-baseline-is-never-edited ()
+  "A heading without a local baseline is never seen as edited, and a
+shallow pull gives it none: only a full pull, which compares the
+content, may establish one."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let ((buf (find-file-noselect file t)))
+      (with-current-buffer buf
+        (goto-char (point-min))
+        (re-search-forward "^\\*\\* TODO An issue")
+        (should-not (ejira--local-baseline))
+        (org-back-to-heading t)
+        (re-search-forward "TODO An issue")
+        (replace-match "TODO An issue edited")
+        (should-not (ejira--locally-modified-p))
+        (cl-letf (((symbol-function 'ejira--my-fullname) (lambda () "Test User")))
+          (ejira--update-task-light "TEST-1" "Done" "someone"))
+        (should (equal "Done" (org-entry-get nil "Status")))
+        (should-not (ejira--local-baseline))))))
+
+(ert-deftest ejira-local-baseline/state-edits-are-detected ()
   "A local todo-state edit dirties the state baseline, not the
 content baseline."
   (ejira-test--with-project-dir ejira-test--project-content
@@ -2285,7 +2201,7 @@ content baseline."
                                   (with-current-buffer buf
                                     (goto-char (point-min))
                                     (re-search-forward "^\\*\\* TODO An issue")
-                                    (ejira--migrate-push-baseline)
+                                    (ejira--update-local-baseline)
                                     (should-not (ejira--locally-modified-p))
                                     (org-todo "DONE")
                                     (should (ejira--state-modified-p))
@@ -2301,7 +2217,7 @@ reviewed snapshot; later edits stay dirty."
                                   (with-current-buffer buf
                                     (goto-char (point-min))
                                     (re-search-forward "^\\*\\* TODO An issue")
-                                    (ejira--migrate-push-baseline)
+                                    (ejira--update-local-baseline)
                                     (beginning-of-line)
                                     (let ((marker (point-marker))
                                           (reviewed (md5 (ejira--heading-reviewed-hash))))
@@ -2315,6 +2231,170 @@ reviewed snapshot; later edits stay dirty."
                                       (setq reviewed (md5 (ejira--heading-reviewed-hash)))
                                       (ejira--push-finalize marker reviewed)
                                       (should-not (ejira--locally-modified-p)))))))
+
+;;; ── Asynchronous rounds ─────────────────────────────────────────────────────
+
+(defvar ejira-test--jira-requests nil
+  "Fake asynchronous Jira requests awaiting an answer, oldest first.
+Each is (KIND ARG SUCCESS ERROR): KIND `jql' with ARG (JQL . FIELDS),
+or `rest' with ARG the request path.")
+
+(defvar ejira-test--timers nil
+  "Calls queued by `run-at-time' under `ejira-test--with-async-jira'.")
+
+(defvar ejira-test--sync-calls nil
+  "Synchronous Jira calls made under `ejira-test--with-async-jira'.")
+
+(defmacro ejira-test--fake-jira (&rest body)
+  "Run BODY with asynchronous Jira requests and zero-delay timers held.
+Requests queue on `ejira-test--jira-requests' and timers on
+`ejira-test--timers'; `ejira-test--answer-jira' delivers both.  A
+synchronous Jira call is recorded in `ejira-test--sync-calls': an
+automatic cycle must never wait on Jira."
+  (declare (indent 0))
+  `(let ((ejira-test--jira-requests nil)
+         (ejira-test--timers nil)
+         (ejira-test--sync-calls nil))
+     (cl-letf (((symbol-function 'ejira--async-jql)
+                (lambda (jql fields success &optional error)
+                  (setq ejira-test--jira-requests
+                        (append ejira-test--jira-requests
+                                (list (list 'jql (cons jql fields) success error))))))
+               ((symbol-function 'ejira--request-async)
+                (lambda (path _type _data success error)
+                  (setq ejira-test--jira-requests
+                        (append ejira-test--jira-requests
+                                (list (list 'rest path success error))))))
+               ((symbol-function 'run-at-time)
+                (lambda (_time _repeat fn &rest args)
+                  (setq ejira-test--timers
+                        (append ejira-test--timers (list (cons fn args))))))
+               ((symbol-function 'jiralib2-jql-search)
+                (lambda (&rest args) (push (cons 'jql args) ejira-test--sync-calls) nil))
+               ((symbol-function 'jiralib2-session-call)
+                (lambda (&rest args) (push (cons 'rest args) ejira-test--sync-calls) nil)))
+       ,@body)))
+
+(defmacro ejira-test--with-async-jira (&rest body)
+  "Run BODY against a fake Jira (`ejira-test--fake-jira'), auto-sync state fresh."
+  (declare (indent 0))
+  `(let ((ejira--auto-sync-timer nil)
+         (ejira--auto-sync-round nil)
+         (ejira--auto-sync-queue nil)
+         (ejira--auto-sync-review-queue nil)
+         (ejira--auto-sync-full-queue nil)
+         (ejira--auto-sync-report-pending nil)
+         (ejira--auto-sync-mtimes (make-hash-table :test 'equal))
+         (ejira--auto-sync-attempts (make-hash-table :test 'equal))
+         (ejira--auto-sync-full-fetch-times (make-hash-table :test 'equal))
+         (ejira--auto-sync-held (make-hash-table :test 'equal))
+         (ejira--priority-scheme-cache (make-hash-table :test 'equal)))
+     (ejira-test--fake-jira ,@body)))
+
+(defun ejira-test--answer-jira (responder)
+  "Answer the pending fake requests with RESPONDER and run queued timers.
+Repeat until nothing is pending.  RESPONDER is called with KIND and ARG
+\(see `ejira-test--jira-requests') and returns (ok VALUE) or (error ERR).
+Return the requests answered, oldest first, as (KIND ARG)."
+  (let ((answered nil)
+        (n 0))
+    (while (or ejira-test--jira-requests ejira-test--timers)
+      (when (> (cl-incf n) 500)
+        (error "Fake Jira: the requests never end"))
+      (if ejira-test--jira-requests
+          (pcase-let ((`(,kind ,arg ,success ,fail) (pop ejira-test--jira-requests)))
+            (push (list kind arg) answered)
+            (pcase (funcall responder kind arg)
+              (`(ok ,value) (funcall success value))
+              (`(error ,err) (funcall fail err))))
+        (let ((call (pop ejira-test--timers)))
+          (apply (car call) (cdr call)))))
+    (nreverse answered)))
+
+(defun ejira-test--jql-keys (jql)
+  "Return the issue keys of the `key in (...)' clause of JQL."
+  (when (string-match "key in (\\([^)]*\\))" jql)
+    (split-string (match-string 1 jql) ", " t)))
+
+(defun ejira-test--light-p (request)
+  "Return non-nil when REQUEST, as answered, asked only for update times."
+  (and (eq (car request) 'jql) (equal (cdr (nth 1 request)) '("updated"))))
+
+(defun ejira-test--issue-item (key summary &optional updated comments)
+  "REST item for task KEY with SUMMARY, updated at UPDATED, with COMMENTS."
+  `((key . ,key)
+    (fields . ((summary . ,summary)
+               (description . "Body.")
+               (status . ((name . "Open")))
+               (issuetype . ((name . "Task")))
+               (project . ((key . "TEST")))
+               ,@(when updated `((updated . ,updated)))
+               ,@(when comments
+                   `((comment . ((comments . ,comments)
+                                 (maxResults . 1000)
+                                 (total . ,(length comments))))))))))
+
+(defun ejira-test--issue-heading (key summary item &optional updated extra)
+  "An issue heading KEY titled SUMMARY, with ITEM as its remote baseline.
+UPDATED, a Jira timestamp, dates the baseline; EXTRA is added to its
+property drawer."
+  (format "** TODO %s\n:PROPERTIES:\n:ID:       %s\n:TYPE:     ejira-issue\n:RemoteHash: %s\n%s%s:END:\n\nBody.\n"
+          summary key (md5 (ejira--remote-fields-identity item))
+          (if updated (format ":Modified: %s\n" (ejira--remote-time updated)) "")
+          (or extra "")))
+
+(defun ejira-test--time (n)
+  "A Jira update timestamp N minutes into a fixed day."
+  (format "2026-09-21T10:%02d:00.000+0000" n))
+
+(defconst ejira-test--project-heading
+  "* Project\n:PROPERTIES:\n:ID:       TEST\n:TYPE:     ejira-project\n:END:\n")
+
+(defun ejira-test--items-for (items)
+  "Return a fake Jira answering every search with the ITEMS it lists."
+  (lambda (kind arg)
+    (if (eq kind 'jql)
+        (let ((keys (ejira-test--jql-keys (car arg))))
+          (list 'ok (cl-remove-if-not (lambda (i) (member (alist-get 'key i) keys))
+                                      items)))
+      (list 'ok nil))))
+
+(defun ejira-test--reconcile (file &optional review fetch discover)
+  "Run a cycle of FILE to its end against a fake Jira; return its round.
+FETCH is called with the issue keys a search asks for and returns
+their REST items; DISCOVER with the discovery JQL, returning the
+children Jira finds.  Both default to finding nothing.  With REVIEW,
+the cycle offers what it holds for review.  The auto-sync state is
+the caller's: the cycle leaves its queues and counts there."
+  (let ((ejira--auto-sync-round nil)
+        (file (file-truename file))
+        round)
+    (ejira-test--fake-jira
+      (when review (ejira--auto-sync-enqueue file t))
+      (ejira--auto-sync-start-round (list file))
+      (setq round ejira--auto-sync-round)
+      (ejira-test--answer-jira
+       (lambda (kind arg)
+         (list 'ok
+               (when (eq kind 'jql)
+                 (if (string-prefix-p "key in (" (car arg))
+                     (and fetch (funcall fetch (ejira-test--jql-keys (car arg))))
+                   (and discover (funcall discover (car arg)))))))))
+    round))
+
+(defun ejira-test--audit (file &optional fetch discover)
+  "Audit FILE against a fake Jira (see `ejira-test--reconcile'); return the audit."
+  (let (audit)
+    (ejira-test--fake-jira
+      (ejira-sync-audit-file file (lambda (a) (setq audit a)))
+      (ejira-test--answer-jira
+       (lambda (kind arg)
+         (list 'ok
+               (when (eq kind 'jql)
+                 (if (string-prefix-p "key in (" (car arg))
+                     (and fetch (funcall fetch (ejira-test--jql-keys (car arg))))
+                   (and discover (funcall discover (car arg)))))))))
+    audit))
 
 ;;; ── Automatic reconciliation (auto-sync) ─────────────────────────────────────
 
@@ -2623,14 +2703,10 @@ review buffer.  Regression: the cycle pushed updates unattended."
        (goto-char (point-min))
        (re-search-forward "^\\*\\* TODO The epic$")
        (replace-match "** TODO The epic, edited")
-       (org-set-property "Remotehash" (md5 (ejira--remote-fields-identity item)))
-       (org-set-property "Pushhash" "stale")
+       (org-set-property "RemoteHash" (md5 (ejira--remote-fields-identity item)))
+       (org-set-property "LocalHash" "stale")
        (let ((ejira-push-on-save nil)) (save-buffer)))
-     (cl-letf* (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) (list item)))
-                ((symbol-function 'jiralib2-jql-search) (lambda (&rest _) (list item)))
-                ((symbol-function 'ejira--get-priority-scheme) (lambda (&rest _) nil))
-                ((symbol-function 'run-at-time)
-                 (lambda (_time _repeat fn &rest args) (apply fn args)))
+     (cl-letf* (((symbol-function 'ejira--get-priority-scheme) (lambda (&rest _) nil))
                 ((symbol-function 'ejira-confirm-show)
                  (lambda (plans) (setq shown (mapcar (lambda (p) (plist-get p :title)) plans)))))
        (dolist (fn (cons 'jiralib2-session-call ejira-test--jira-write-functions))
@@ -2643,7 +2719,9 @@ review buffer.  Regression: the cycle pushed updates unattended."
                    (lambda (what) (push what attempts))
                    '((name . ejira-test-record-attempt)))
        (unwind-protect
-           (ejira--auto-sync-reconcile file t)
+           (ejira-test--reconcile file t
+                                  (lambda (_keys) (list item))
+                                  (lambda (_jql) (list item)))
          (advice-remove 'ejira--assert-jira-write-authorized 'ejira-test-record-attempt)
          (dolist (fn (cons 'jiralib2-session-call ejira-test--jira-write-functions))
            (advice-remove fn 'ejira-test-record-write))))
@@ -2664,8 +2742,8 @@ whenever their file was saved."
     (should (ejira--synced-key-p "TEST-1"))
     (should-not (ejira--synced-key-p "OTHER-1"))
     (ejira-test--with-org-buf
-     (concat "* TODO Synced\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n:Pushhash: stale\n:END:\n"
-             "* TODO Not synced\n:PROPERTIES:\n:ID:       OTHER-1\n:TYPE:     ejira-issue\n:Pushhash: stale\n:END:\n"
+     (concat "* TODO Synced\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n:LocalHash: stale\n:END:\n"
+             "* TODO Not synced\n:PROPERTIES:\n:ID:       OTHER-1\n:TYPE:     ejira-issue\n:LocalHash: stale\n:END:\n"
              "** TODO New child of an unsynced issue\n"
              "** Comments\n*** A remark on an unsynced issue\n")
      (should (equal '("TEST-1") (ejira--buffer-issue-keys)))
@@ -2705,7 +2783,7 @@ whenever their file was saved."
 (defconst ejira-test--discover-content
   "* Project\n:PROPERTIES:\n:ID:       TEST\n:TYPE:     ejira-project\n:END:\n\
 ** TODO The epic\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-epic\n\
-:Issuetype: Epic\n:EJIRA_DESCRIPTION_IN_BODY: t\n:END:\n\nEpic body.\n")
+:Issuetype: Epic\n:END:\n\nEpic body.\n")
 
 (defun ejira-test--child-item (key description)
   "A REST item for task KEY in epic TEST-1 with DESCRIPTION."
@@ -2735,23 +2813,21 @@ cancelled issues were pulled on every cycle."
                                        (ejira-auto-sync-discover 'unresolved)
                                        (ejira-assigned-tagname nil)
                                        (jql nil))
-                                  (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
-                                            ((symbol-function 'jiralib2-jql-search)
-                                             (lambda (q &rest _)
-                                               (setq jql q)
-                                               (list (ejira-test--child-item "TEST-2" "Line with {{code}}.\n* (x) todo"))))
-                                            ((symbol-function 'ejira--push-scan-buffer) (lambda (_buf) nil)))
-                                    (ejira--auto-sync-reconcile file))
+                                  (cl-letf (((symbol-function 'ejira--push-scan-buffer) (lambda (_buf) nil)))
+                                    (ejira-test--reconcile
+                                     file nil nil
+                                     (lambda (q)
+                                       (setq jql q)
+                                       (list (ejira-test--child-item "TEST-2" "Line with {{code}}.\n* (x) todo")))))
                                   (should (string-match-p "cf\\[10857\\] in (TEST-1)" jql))
                                   (should (string-match-p "statusCategory != Done" jql))
                                   (with-current-buffer buf
                                     (goto-char (point-min))
                                     (should (re-search-forward "^\\*\\*\\* TODO Created in Jira" nil t))
                                     (should (equal "TEST-2" (org-entry-get nil "ID")))
-                                    (should (org-entry-get nil "Remotehash"))
+                                    (should (org-entry-get nil "RemoteHash"))
                                     (should-not (ejira--locally-modified-p))
-                                    ;; Body-as-description inherited from the epic: converted body,
-                                    ;; not a Description child and not raw markup.
+                                    ;; The converted body, not raw markup.
                                     (should (equal "Line with =code=.\n- [ ] todo"
                                                    (string-trim (ejira--jira-description)))))
                                   (with-current-buffer "*ejira sync log*"
@@ -2770,11 +2846,10 @@ cancelled issues were pulled on every cycle."
                                        (ejira-parser-patterns
                                         (cons (cons "boom" (lambda () (error "Rule failure")))
                                               ejira-parser-patterns)))
-                                  (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
-                                            ((symbol-function 'jiralib2-jql-search)
-                                             (lambda (&rest _) (list (ejira-test--child-item "TEST-3" "a boom"))))
-                                            ((symbol-function 'ejira--push-scan-buffer) (lambda (_buf) nil)))
-                                    (ejira--auto-sync-reconcile file))
+                                  (cl-letf (((symbol-function 'ejira--push-scan-buffer) (lambda (_buf) nil)))
+                                    (ejira-test--reconcile
+                                     file nil nil
+                                     (lambda (_jql) (list (ejira-test--child-item "TEST-3" "a boom")))))
                                   (with-current-buffer buf
                                     (should-not (string-match-p "TEST-3\\|ejira new heading" (buffer-string))))
                                   (should (= 1 (ejira-auto-sync-held-count)))
@@ -2820,30 +2895,30 @@ character for character."
        ;; TEST-3: baseline on the remote text, then edit locally.
        (goto-char (point-min))
        (re-search-forward "^\\*\\*\\* TODO Edited")
-       (ejira--migrate-push-baseline)
+       (ejira--update-local-baseline)
        (ejira--store-remote-baseline (funcall item "TEST-3" "Edited" "Remote body."))
        (re-search-forward "^Local body")
        (goto-char (point-min))
        (re-search-forward "^\\*\\*\\* TODO Edited")
-       (org-set-property "Pushhash" "v2:stale")
+       (org-set-property "LocalHash" "stale")
        ;; TEST-4: clean, with a baseline Jira has since moved past.
        (re-search-forward "^\\*\\*\\* TODO Stale")
-       (ejira--migrate-push-baseline)
+       (ejira--update-local-baseline)
        (ejira--store-remote-baseline (funcall item "TEST-4" "Stale" "Old body."))
        (save-buffer))
      (let ((before (with-current-buffer buf (buffer-string))))
-       (cl-letf (((symbol-function 'ejira--auto-sync-fetch)
-                  (lambda (_keys)
-                    (list `((key . "TEST-1")
-                            (fields . ((summary . "The epic") (description . "Epic body.")
-                                       (status . ((name . "Open")))
-                                       (issuetype . ((name . "Epic"))))))
-                          (funcall item "TEST-2" "Same" "Same body.")
-                          (funcall item "TEST-3" "Edited" "Remote body.")
-                          (funcall item "TEST-4" "Stale" "New remote body."))))
-                 ((symbol-function 'jiralib2-jql-search)
-                  (lambda (&rest _) (list (ejira-test--child-item "TEST-9" "x")))))
-         (let* ((audit (ejira-sync-audit-file file))
+       (progn
+         (let* ((audit (ejira-test--audit
+                        file
+                        (lambda (_keys)
+                          (list `((key . "TEST-1")
+                                  (fields . ((summary . "The epic") (description . "Epic body.")
+                                             (status . ((name . "Open")))
+                                             (issuetype . ((name . "Epic"))))))
+                                (funcall item "TEST-2" "Same" "Same body.")
+                                (funcall item "TEST-3" "Edited" "Remote body.")
+                                (funcall item "TEST-4" "Stale" "New remote body.")))
+                        (lambda (_jql) (list (ejira-test--child-item "TEST-9" "x")))))
                 (class (lambda (k) (plist-get (cdr (assoc k (plist-get audit :rows))) :class))))
            (should (eq 'identical (funcall class "TEST-1")))
            (should (eq 'identical (funcall class "TEST-2")))
@@ -2870,22 +2945,18 @@ and refiled it into the auto-sync file as a second heading."
                                       (progn
                                         (with-temp-file extra
                                           (insert "* TODO An issue\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n:END:\n"))
-                                        (cl-letf (((symbol-function 'ejira--auto-sync-fetch)
-                                                   (lambda (keys)
-                                                     (mapcar (lambda (k) (ejira-test--mock-item "An issue" "Done" nil)) keys)))
-                                                  ((symbol-function 'ejira--update-task)
+                                        (cl-letf (((symbol-function 'ejira--update-task)
                                                    (lambda (&rest _) (setq pulled t)))
                                                   ((symbol-function 'ejira--push-scan-buffer) (lambda (_buf) nil)))
-                                          (ejira--auto-sync-reconcile (file-truename extra)))
+                                          (ejira-test--reconcile
+                                           extra nil
+                                           (lambda (keys)
+                                             (mapcar (lambda (_k) (ejira-test--mock-item "An issue" "Done" nil)) keys))))
                                         (should-not pulled)
                                         (with-current-buffer "*ejira sync log*"
                                           (should (string-match-p "TEST-1: 2 headings carry this key"
                                                                   (buffer-string))))
-                                        (let ((audit (cl-letf (((symbol-function 'ejira--auto-sync-fetch)
-                                                                (lambda (_keys) nil))
-                                                               ((symbol-function 'jiralib2-jql-search)
-                                                                (lambda (&rest _) nil)))
-                                                       (ejira-sync-audit-file extra))))
+                                        (let ((audit (ejira-test--audit extra)))
                                           (should (assoc "TEST-1" (plist-get audit :duplicates)))))
                                     (when-let* ((b (get-file-buffer extra)))
                                       (with-current-buffer b (set-buffer-modified-p nil))
@@ -2900,29 +2971,29 @@ An external change runs the same cycle without opening anything."
    (let* ((file (file-truename (expand-file-name "TEST.org" ejira-org-directory)))
           (buf (find-file-noselect file t))
           (ejira-auto-sync-files (list file))
-          (ejira-auto-sync-async nil)
           (ejira-epic-field 'customfield_10857)
+          (ejira--auto-sync-round nil)
           (ejira--auto-sync-queue nil)
           (ejira--auto-sync-review-queue nil)
           (ejira--auto-sync-mtimes (make-hash-table :test 'equal))
+          (nothing (lambda (&rest _) (list 'ok nil)))
           (shown nil))
-     (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
-               ((symbol-function 'jiralib2-jql-search) (lambda (&rest _) nil))
-               ((symbol-function 'run-at-time)
-                (lambda (_time _repeat fn &rest args) (apply fn args)))
-               ((symbol-function 'ejira-confirm-show)
+     (cl-letf (((symbol-function 'ejira-confirm-show)
                 (lambda (plans) (setq shown (mapcar (lambda (p) (plist-get p :title)) plans)))))
-       ;; External change: no review.
-       (ejira--auto-sync-worker)
-       (should-not shown)
-       ;; A save in Emacs: review.
-       (with-current-buffer buf
-         (set-buffer-modified-p t)
-         (save-buffer))
-       (should (member file ejira--auto-sync-review-queue))
-       (ejira--auto-sync-worker)
-       (should (equal '("new task: Brand new task") shown))
-       (should-not ejira--auto-sync-review-queue)))))
+       (ejira-test--fake-jira
+         ;; External change: no review.
+         (ejira--auto-sync-worker)
+         (ejira-test--answer-jira nothing)
+         (should-not shown)
+         ;; A save in Emacs: review.
+         (with-current-buffer buf
+           (set-buffer-modified-p t)
+           (save-buffer))
+         (should (member file ejira--auto-sync-review-queue))
+         (ejira--auto-sync-worker)
+         (ejira-test--answer-jira nothing)
+         (should (equal '("new task: Brand new task") shown))
+         (should-not ejira--auto-sync-review-queue))))))
 
 (ert-deftest ejira-auto-sync/every-tracked-file-auto-syncs ()
   "Project files, extra scan files and buffers holding issue headings
@@ -2963,31 +3034,30 @@ auto-sync by default; nothing has to be listed."
                                         (kill-buffer b))
                                       (delete-file f))))))
 
-(ert-deftest ejira-auto-sync/worker-reconciles-one-file-per-call ()
-  "Without `ejira-auto-sync-async', each worker call reconciles one
-file, so input is not held up by a whole round of blocking cycles; the
-rest wait for the next idle call."
-  (let* ((a (make-temp-file "ejira-a-" nil ".org"))
-         (b (make-temp-file "ejira-b-" nil ".org"))
+(ert-deftest ejira-auto-sync/worker-starts-one-round-at-a-time ()
+  "A worker call starts one round for every due file, and none while a
+round runs.  A file its round reconciled is not due again until it
+changes."
+  (let* ((a (file-truename (make-temp-file "ejira-a-" nil ".org")))
+         (b (file-truename (make-temp-file "ejira-b-" nil ".org")))
          (ejira-auto-sync-tracked nil)
-         (ejira-auto-sync-async nil)
          (ejira-auto-sync-files (list a b))
          (ejira--auto-sync-queue nil)
          (ejira--auto-sync-round nil)
          (ejira--auto-sync-mtimes (make-hash-table :test 'equal))
-         (done nil))
+         (cycles nil))
     (unwind-protect
         (cl-letf (((symbol-function 'ejira--auto-sync-start-cycle)
-                   (lambda (cycle)
-                     (push (ejira--cycle-file cycle) done)
-                     (ejira--auto-sync-end-cycle cycle 'done))))
+                   (lambda (cycle) (push cycle cycles))))
           (ejira--auto-sync-worker)
-          (should (= 1 (length done)))
+          (should (equal (list a b) (sort (mapcar #'ejira--cycle-file cycles) #'string<)))
+          (should ejira--auto-sync-round)
+          (ejira--auto-sync-worker)
+          (should (= 2 (length cycles)))
+          (dolist (c cycles) (ejira--auto-sync-end-cycle c 'done))
           (should-not ejira--auto-sync-round)
           (ejira--auto-sync-worker)
-          (should (= 2 (length done)))
-          (ejira--auto-sync-worker)
-          (should (= 2 (length done))))
+          (should (= 2 (length cycles))))
       (delete-file a) (delete-file b))))
 
 (ert-deftest ejira-auto-sync/local-todos-are-not-held ()
@@ -2999,9 +3069,7 @@ it can never become an issue, so it is not held or counted."
            "*** DONE A subtask\n:PROPERTIES:\n:ID:       TEST-2\n:TYPE:     ejira-subtask\n:END:\n"
            "**** TODO Personal checklist item\n")
    (let ((file (file-truename (expand-file-name "TEST.org" ejira-org-directory))))
-     (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
-               ((symbol-function 'jiralib2-jql-search) (lambda (&rest _) nil)))
-       (ejira--auto-sync-reconcile file))
+     (ejira-test--reconcile file)
      (should (= 0 (ejira-auto-sync-held-count))))))
 
 (defconst ejira-test--journal-id "5A1C2C2E-0000-4000-8000-000000000001"
@@ -3033,13 +3101,9 @@ visiting the file and `shown' holding the plans the review offered."
               (ejira-todo-states-alist '(("Open" . 1)))
               (ejira--auto-sync-held (make-hash-table :test 'equal))
               (shown nil))
-         (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
-                   ((symbol-function 'jiralib2-jql-search) (lambda (&rest _) (list ,item)))
-                   ((symbol-function 'ejira--get-priority-scheme) (lambda (&rest _) nil))
-                   ((symbol-function 'run-at-time)
-                    (lambda (_time _repeat fn &rest args) (apply fn args)))
+         (cl-letf (((symbol-function 'ejira--get-priority-scheme) (lambda (&rest _) nil))
                    ((symbol-function 'ejira-confirm-show) (lambda (plans) (setq shown plans))))
-           (ejira--auto-sync-reconcile file t))
+           (ejira-test--reconcile file t nil (lambda (_jql) (list ,item))))
          (ignore shown)
          ,@body))))
 
@@ -3179,21 +3243,22 @@ the log that explains them instead of doing nothing visible."
               (ejira-test--journal "Never created" "2026-09-20T10:00:00+0000" "Body."))
     (let ((ejira-auto-sync-files nil)
           (ejira-auto-sync-tracked t)
-          (ejira-auto-sync-async nil)
           (ejira-epic-field 'customfield_10857)
+          (ejira--auto-sync-round nil)
+          (ejira--auto-sync-report-pending nil)
           (ejira--auto-sync-queue nil)
           (ejira--auto-sync-review-queue nil)
           (ejira--auto-sync-mtimes (make-hash-table :test 'equal))
           (ejira--auto-sync-held (make-hash-table :test 'equal))
           (reviewed nil)
           (log-shown nil))
-      (cl-letf (((symbol-function 'ejira--auto-sync-fetch) (lambda (_keys) nil))
-                ((symbol-function 'jiralib2-jql-search) (lambda (&rest _) nil))
-                ((symbol-function 'run-at-time)
-                 (lambda (_time _repeat fn &rest args) (apply fn args)))
-                ((symbol-function 'ejira-confirm-show) (lambda (_plans) (setq reviewed t)))
+      (cl-letf (((symbol-function 'ejira-confirm-show) (lambda (_plans) (setq reviewed t)))
                 ((symbol-function 'ejira-auto-sync-show-log) (lambda () (setq log-shown t))))
-        (ejira-auto-sync-review))
+        (ejira-test--fake-jira
+          (ejira-auto-sync-review)
+          ;; The command returns before Jira answers.
+          (should-not log-shown)
+          (ejira-test--answer-jira (lambda (&rest _) (list 'ok nil)))))
       (should-not reviewed)
       (should log-shown)
       (should (= 1 (ejira-auto-sync-held-count 'blocked))))))
@@ -3245,22 +3310,17 @@ holds as conflict, clean+unchanged does nothing."
                                     (re-search-forward "^\\*\\* TODO An issue")
                                     (ejira--store-remote-baseline old-item)
                                     (save-buffer))
-                                  (cl-letf (((symbol-function (quote ejira--auto-sync-fetch))
-                                             (lambda (_keys) (list new-item)))
-                                            ((symbol-function (quote ejira--update-task))
+                                  (cl-letf (((symbol-function (quote ejira--update-task))
                                              (lambda (task) (setq pulled (ejira-task-key task))))
                                             ((symbol-function (quote ejira--issue-comments-dirty-p))
                                              (lambda (_key) nil))
                                             ((symbol-function (quote ejira--push-scan-buffer))
                                              (lambda (_buf) nil)))
-                                    ;; Clean heading + remote change: pulled and re-baselined.
-                                    (ejira--auto-sync-reconcile file)
+                                    ;; Clean heading + remote change: pulled (the pull
+                                    ;; records the baselines: see
+                                    ;; `ejira-update-task/full-pull-records-both-baselines').
+                                    (ejira-test--reconcile file nil (lambda (_keys) (list new-item)))
                                     (should (equal "TEST-1" pulled))
-                                    (with-current-buffer buf
-                                      (goto-char (point-min))
-                                      (re-search-forward "^\\*\\* TODO An issue")
-                                      (should (equal (org-entry-get nil "Remotehash")
-                                                     (md5 (ejira--remote-fields-identity new-item)))))
                                     ;; Dirty heading + remote change: held as conflict.  Reset the
                                     ;; remote baseline to the old state, because the first cycle
                                     ;; legitimately re-baselined it to the new item.
@@ -3268,14 +3328,14 @@ holds as conflict, clean+unchanged does nothing."
                                     (with-current-buffer buf
                                       (goto-char (point-min))
                                       (re-search-forward "^\\*\\* TODO An issue")
-                                      (ejira--migrate-push-baseline)
+                                      (ejira--update-local-baseline)
                                       (ejira--store-remote-baseline old-item)
                                       (beginning-of-line)
                                       (org-with-point-at (point-marker)
                                         (replace-regexp "TODO An issue" "TODO An issue edited" nil
                                                         (point) (line-end-position)))
                                       (save-buffer))
-                                    (ejira--auto-sync-reconcile file)
+                                    (ejira-test--reconcile file nil (lambda (_keys) (list new-item)))
                                     (should-not pulled)
                                     (with-current-buffer "*ejira sync log*"
                                       (should (string-match-p
@@ -3284,7 +3344,8 @@ holds as conflict, clean+unchanged does nothing."
                                     ;; With nothing to push for it (the scan is mocked
                                     ;; empty), the conflict has nothing to review.
                                     (should (equal '(blocked)
-                                                   (mapcar #'car (gethash file ejira--auto-sync-held))))
+                                                   (mapcar #'car (gethash (file-truename file)
+                                                                          ejira--auto-sync-held))))
                                     ;; The dirty heading keeps its state for the push flow.
                                     (with-current-buffer buf
                                       (goto-char (point-min))
@@ -3451,7 +3512,7 @@ Comment body.\n")
 
 (ert-deftest ejira-description-boundary/empty-body-never-swallows-comments ()
   "An empty own body followed by Comments yields an empty owned region."
-  (let ((ejira-description-in-body t))
+  (progn
     (ejira-test--with-org-buf ejira-test--empty-body-comments-task
                               (goto-char (point-min))
                               (let ((region (ejira--task-description-region)))
@@ -3459,7 +3520,7 @@ Comment body.\n")
 
 (ert-deftest ejira-description-boundary/empty-body-never-swallows-child-task ()
   "An empty own body followed by a child task yields an empty owned region."
-  (let ((ejira-description-in-body t))
+  (progn
     (ejira-test--with-org-buf
      "* TODO TEST-1 Task\n:PROPERTIES:\n:ID: TEST-1\n:TYPE: ejira-issue\n:END:\n\
 ** TODO TEST-2 Child\n:PROPERTIES:\n:ID: TEST-2\n:TYPE: ejira-issue\n:END:\n\
@@ -3470,7 +3531,7 @@ Child body.\n"
 
 (ert-deftest ejira-description-boundary/plain-section-before-comments-is-owned ()
   "A plain section before the Comments container stays in the owned region."
-  (let ((ejira-description-in-body t))
+  (progn
     (ejira-test--with-org-buf
      ejira-test--empty-body-plain-before-comments-task
      (goto-char (point-min))
@@ -3493,7 +3554,7 @@ Child body.\n"
 
 (ert-deftest ejira-description-set/empty-body-preserves-comments ()
   "Rewriting the description of an empty-body task keeps the Comments container."
-  (let ((ejira-description-in-body t))
+  (progn
     (ejira-test--with-org-buf ejira-test--empty-body-comments-task
                               (goto-char (point-min))
                               (ejira--set-task-description "Fresh description")
@@ -3650,7 +3711,7 @@ pulls deferred as \"locally edited comments\"."
                               ;; Baseline both comments on their current bodies.
                               (goto-char (point-min))
                               (while (re-search-forward "^\\*\\*\\* \\[c" nil t)
-                                (ejira--update-push-baseline))
+                                (ejira--update-local-baseline))
                               (should-not (ejira--issue-comments-dirty-p "TEST-1"))
                               (goto-char (point-min))
                               (re-search-forward "^body2")
@@ -3702,13 +3763,13 @@ and becomes clean; without it the local edit is kept."
     (ejira-test--with-org-buf
      (concat "* TEST\n:PROPERTIES:\n:ID: TEST\n:TYPE: ejira-project\n:END:\n"
              "* TODO Local title\n:PROPERTIES:\n:ID: TEST-1\n:TYPE: ejira-issue\n"
-             ":EJIRA_DESCRIPTION_IN_BODY: t\n:Modified: 2026-09-01 00:00:00\n:END:\n\nLocal body.\n")
+             ":Modified: 2026-09-01 00:00:00\n:END:\n\nLocal body.\n")
      (goto-char (point-min))
      (re-search-forward org-heading-regexp)
      (puthash "TEST" (point-marker) ejira--heading-cache)
      (re-search-forward org-heading-regexp)
      (puthash "TEST-1" (point-marker) ejira--heading-cache)
-     (org-set-property "Pushhash" "v2:stale")
+     (org-set-property "LocalHash" "v2:stale")
      (org-set-property "Statehash" (md5 (ejira--heading-state-fields)))
      (should (ejira--locally-modified-p))
      (ejira--update-task task)
@@ -3923,7 +3984,7 @@ pull is simulated: it stamps the metadata a real pull writes."
                     (org-with-point-at marker
                       (should (equal new-key (org-entry-get nil "ID")))
                       (org-set-property "TYPE" "ejira-subtask")
-                      (org-set-property "Pushhash" "pulled")))))
+                      (org-set-property "LocalHash" "pulled")))))
          ,@body))))
 
 (ert-deftest ejira-durable/creation-identity-reaches-the-file ()
@@ -3941,7 +4002,7 @@ The journal is in the file while the request runs."
         (should (string-match-p "^:ID: +TEST-2$" disk))
         (should (string-match-p "^:ORIG_ID: +[0-9A-F-]+$" disk))
         (should (string-match-p "^:TYPE: +ejira-subtask$" disk))
-        (should (string-match-p "^:Pushhash: +pulled$" disk))
+        (should (string-match-p "^:LocalHash: +pulled$" disk))
         (should-not (string-match-p ":Creating:" disk))))))
 
 (ert-deftest ejira-durable/creation-survives-an-external-write ()
@@ -3955,7 +4016,7 @@ next pull imported the issue again."
     (let ((disk (ejira-test--file-string file)))
       (should (string-match-p "^\\* Agent note$" disk))
       (should (string-match-p "^:ID: +TEST-2$" disk))
-      (should (string-match-p "^:Pushhash: +pulled$" disk))
+      (should (string-match-p "^:LocalHash: +pulled$" disk))
       (should-not (string-match-p ":Creating:" disk))
       (with-current-buffer buf
         (should-not (buffer-modified-p))
@@ -3991,7 +4052,7 @@ which raised Emacs's \"changed on disk; really edit the buffer?\" prompt."
       (should (string-match-p "^:ID: +TEST-2$" disk))
       (should (string-match-p "^:TYPE: +ejira-subtask$" disk))
       (should (string-match-p "^:Status: +Open$" disk))
-      (should (string-match-p "^:Pushhash: +v2:" disk))
+      (should (string-match-p "^:LocalHash: +[0-9a-f]\\{32\\} [0-9a-f]\\{32\\}$" disk))
       (should-not (string-match-p ":Creating:" disk))
       (with-current-buffer buf
         (should-not (buffer-modified-p))
@@ -4010,7 +4071,7 @@ versions and the user's edits are neither saved nor reverted."
       (should (string-match-p "^\\* Agent note$" disk))
       (should-not (string-match-p "User draft" disk))
       (should (string-match-p "^:ID: +TEST-2$" disk))
-      (should (string-match-p "^:Pushhash: +pulled$" disk))
+      (should (string-match-p "^:LocalHash: +pulled$" disk))
       (should-not (string-match-p ":Creating:" disk)))
     (with-current-buffer buf
       (should (buffer-modified-p))
@@ -4121,15 +4182,16 @@ applied: the buffer is reloaded and the cycle queued again, review kept."
           (ejira--auto-sync-queue nil)
           (ejira--auto-sync-review-queue nil)
           (imported nil))
-      (cl-letf (((symbol-function 'ejira--auto-sync-fetch)
-                 (lambda (_keys)
-                   (ejira-test--append-externally file "* Agent note\n")
-                   (list (ejira-test--epic-item "Renamed in Jira"))))
-                ((symbol-function 'jiralib2-jql-search)
-                 (lambda (&rest _) (list (ejira-test--child-item "TEST-3" "Body"))))
-                ((symbol-function 'ejira--auto-sync-import)
+      (cl-letf (((symbol-function 'ejira--auto-sync-import)
                  (lambda (&rest _) (setq imported t))))
-        (ejira--auto-sync-reconcile (file-truename file) t))
+        ;; The file changes during every fetch: after the restarts, the
+        ;; cycle gives up and queues the file.
+        (ejira-test--reconcile
+         file t
+         (lambda (_keys)
+           (ejira-test--append-externally file "* Agent note\n")
+           (list (ejira-test--epic-item "Renamed in Jira")))
+         (lambda (_jql) (list (ejira-test--child-item "TEST-3" "Body")))))
       (should-not imported)
       (with-current-buffer buf
         (should-not (buffer-modified-p))
@@ -4245,19 +4307,20 @@ does not mistake the push for a remote change."
       (with-current-buffer buf
         (goto-char (point-min))
         (re-search-forward "^\\*\\* TODO An issue")
-        (ejira--migrate-push-baseline)
+        (ejira--update-local-baseline)
+        (org-set-property "Modified" "2026-09-21 10:01:00")
         (beginning-of-line)
         (let ((marker (point-marker))
               (reviewed (md5 (ejira--heading-reviewed-hash)))
-              (pushhash (org-entry-get nil "Pushhash")))
+              (local (org-entry-get nil "LocalHash")))
           (replace-regexp "TODO An issue" "TODO An issue edited" nil
                           (point) (line-end-position))
           (ejira--push-finalize marker reviewed "sent fields")
-          (should (equal (md5 "sent fields") (org-entry-get marker "Remotehash")))
-          ;; Jira's time after the push is unknown: the next cycle fetches.
-          (should (equal ejira-remote-updated-unknown
-                         (org-entry-get marker "Remoteupdated")))
-          (should (equal pushhash (org-entry-get marker "Pushhash")))
+          (should (equal (md5 "sent fields") (org-entry-get marker "RemoteHash")))
+          ;; Jira's time after the push is unknown: `Modified' keeps the
+          ;; last fetched one, which Jira's has moved past.
+          (should (equal "2026-09-21 10:01:00" (org-entry-get marker "Modified")))
+          (should (equal local (org-entry-get marker "LocalHash")))
           (should (ejira--locally-modified-p)))))))
 
 (ert-deftest ejira-durable/commit-keeps-what-another-writer-added ()
@@ -4302,122 +4365,6 @@ fails instead of asking whether to edit it."
 
 ;;; ── Asynchronous rounds ─────────────────────────────────────────────────────
 
-(defvar ejira-test--jira-requests nil
-  "Fake asynchronous Jira requests awaiting an answer, oldest first.
-Each is (KIND ARG SUCCESS ERROR): KIND `jql' with ARG (JQL . FIELDS),
-or `rest' with ARG the request path.")
-
-(defvar ejira-test--timers nil
-  "Calls queued by `run-at-time' under `ejira-test--with-async-jira'.")
-
-(defvar ejira-test--sync-calls nil
-  "Synchronous Jira calls made under `ejira-test--with-async-jira'.")
-
-(defmacro ejira-test--with-async-jira (&rest body)
-  "Run BODY with asynchronous Jira requests held until answered.
-Requests queue on `ejira-test--jira-requests' and zero-delay timers on
-`ejira-test--timers'; `ejira-test--answer-jira' delivers both.  A
-synchronous Jira call is recorded in `ejira-test--sync-calls': an
-asynchronous round must never wait on Jira."
-  (declare (indent 0))
-  `(let ((ejira-test--jira-requests nil)
-         (ejira-test--timers nil)
-         (ejira-test--sync-calls nil)
-         (ejira-auto-sync-async t)
-         (ejira--auto-sync-timer nil)
-         (ejira--auto-sync-round nil)
-         (ejira--auto-sync-queue nil)
-         (ejira--auto-sync-review-queue nil)
-         (ejira--auto-sync-full-queue nil)
-         (ejira--auto-sync-report-pending nil)
-         (ejira--auto-sync-mtimes (make-hash-table :test 'equal))
-         (ejira--auto-sync-attempts (make-hash-table :test 'equal))
-         (ejira--auto-sync-full-fetch-times (make-hash-table :test 'equal))
-         (ejira--auto-sync-held (make-hash-table :test 'equal))
-         (ejira--priority-scheme-cache (make-hash-table :test 'equal)))
-     (cl-letf (((symbol-function 'ejira--async-jql)
-                (lambda (jql fields success &optional error)
-                  (setq ejira-test--jira-requests
-                        (append ejira-test--jira-requests
-                                (list (list 'jql (cons jql fields) success error))))))
-               ((symbol-function 'ejira--request-async)
-                (lambda (path _type _data success error)
-                  (setq ejira-test--jira-requests
-                        (append ejira-test--jira-requests
-                                (list (list 'rest path success error))))))
-               ((symbol-function 'run-at-time)
-                (lambda (_time _repeat fn &rest args)
-                  (setq ejira-test--timers
-                        (append ejira-test--timers (list (cons fn args))))))
-               ((symbol-function 'jiralib2-jql-search)
-                (lambda (&rest args) (push (cons 'jql args) ejira-test--sync-calls) nil))
-               ((symbol-function 'jiralib2-session-call)
-                (lambda (&rest args) (push (cons 'rest args) ejira-test--sync-calls) nil)))
-       ,@body)))
-
-(defun ejira-test--answer-jira (responder)
-  "Answer the pending fake requests with RESPONDER and run queued timers.
-Repeat until nothing is pending.  RESPONDER is called with KIND and ARG
-\(see `ejira-test--jira-requests') and returns (ok VALUE) or (error ERR).
-Return the requests answered, oldest first, as (KIND ARG)."
-  (let ((answered nil)
-        (n 0))
-    (while (or ejira-test--jira-requests ejira-test--timers)
-      (when (> (cl-incf n) 500)
-        (error "Fake Jira: the requests never end"))
-      (if ejira-test--jira-requests
-          (pcase-let ((`(,kind ,arg ,success ,fail) (pop ejira-test--jira-requests)))
-            (push (list kind arg) answered)
-            (pcase (funcall responder kind arg)
-              (`(ok ,value) (funcall success value))
-              (`(error ,err) (funcall fail err))))
-        (let ((call (pop ejira-test--timers)))
-          (apply (car call) (cdr call)))))
-    (nreverse answered)))
-
-(defun ejira-test--jql-keys (jql)
-  "Return the issue keys of the `key in (...)' clause of JQL."
-  (when (string-match "key in (\\([^)]*\\))" jql)
-    (split-string (match-string 1 jql) ", " t)))
-
-(defun ejira-test--light-p (request)
-  "Return non-nil when REQUEST, as answered, asked only for update times."
-  (and (eq (car request) 'jql) (equal (cdr (nth 1 request)) '("updated"))))
-
-(defun ejira-test--issue-item (key summary &optional updated comments)
-  "REST item for task KEY with SUMMARY, updated at UPDATED, with COMMENTS."
-  `((key . ,key)
-    (fields . ((summary . ,summary)
-               (description . "Body.")
-               (status . ((name . "Open")))
-               (issuetype . ((name . "Task")))
-               (project . ((key . "TEST")))
-               ,@(when updated `((updated . ,updated)))
-               ,@(when comments
-                   `((comment . ((comments . ,comments)
-                                 (maxResults . 1000)
-                                 (total . ,(length comments))))))))))
-
-(defun ejira-test--issue-heading (key summary item &optional updated extra)
-  "An issue heading KEY titled SUMMARY, with ITEM as its remote baseline.
-UPDATED is its `Remoteupdated'; EXTRA is added to its property drawer."
-  (format "** TODO %s\n:PROPERTIES:\n:ID:       %s\n:TYPE:     ejira-issue\n:Remotehash: %s\n%s%s:END:\n\nBody.\n"
-          summary key (md5 (ejira--remote-fields-identity item))
-          (if updated (format ":Remoteupdated: %s\n" updated) "")
-          (or extra "")))
-
-(defconst ejira-test--project-heading
-  "* Project\n:PROPERTIES:\n:ID:       TEST\n:TYPE:     ejira-project\n:END:\n")
-
-(defun ejira-test--items-for (items)
-  "Return a fake Jira answering every search with the ITEMS it lists."
-  (lambda (kind arg)
-    (if (eq kind 'jql)
-        (let ((keys (ejira-test--jql-keys (car arg))))
-          (list 'ok (cl-remove-if-not (lambda (i) (member (alist-get 'key i) keys))
-                                      items)))
-      (list 'ok nil))))
-
 (ert-deftest ejira-auto-sync-async/review-opens-once-when-jira-answered ()
   "The review command returns at once: the cycles of every file wait on
 Jira in the background, their requests sent together.  When Jira has
@@ -4428,7 +4375,7 @@ and each file's review replaced the previous one."
          (item-b (cons '(key . "TEST-2") (cdr item-a)))
          (content (lambda (key item task)
                     (concat ejira-test--project-heading
-                            (format "** TODO The epic\n:PROPERTIES:\n:ID:       %s\n:TYPE:     ejira-epic\n:Issuetype: Epic\n:EJIRA_DESCRIPTION_IN_BODY: t\n:Remotehash: %s\n:END:\n\nEpic body.\n*** TODO %s\n"
+                            (format "** TODO The epic\n:PROPERTIES:\n:ID:       %s\n:TYPE:     ejira-epic\n:Issuetype: Epic\n:Remotehash: %s\n:END:\n\nEpic body.\n*** TODO %s\n"
                                     key (md5 (ejira--remote-fields-identity item)) task)))))
     (ejira-test--with-two-files
         (funcall content "TEST-1" item-a "Task in A")
@@ -4469,17 +4416,17 @@ fetches the issues whose time moved, those missing from the answer and
 those with local changes.  An issue fetched but unchanged gets its time
 recorded, so the next cycle skips it.  The scheme a push plan needs is
 cached in the background: the cycle never waits on Jira."
-  (let ((i1 (ejira-test--issue-item "TEST-1" "One" "T1"))
-        (i2 (ejira-test--issue-item "TEST-2" "Two" "T2-new"))
-        (i3 (ejira-test--issue-item "TEST-3" "Three" "T3"))
-        (i4 (ejira-test--issue-item "TEST-4" "Four" "T4")))
+  (let ((i1 (ejira-test--issue-item "TEST-1" "One" (ejira-test--time 1)))
+        (i2 (ejira-test--issue-item "TEST-2" "Two" (ejira-test--time 22)))
+        (i3 (ejira-test--issue-item "TEST-3" "Three" (ejira-test--time 3)))
+        (i4 (ejira-test--issue-item "TEST-4" "Four" (ejira-test--time 4))))
     (ejira-test--with-project-dir
         (concat ejira-test--project-heading
-                (ejira-test--issue-heading "TEST-1" "One" i1 "T1")
+                (ejira-test--issue-heading "TEST-1" "One" i1 (ejira-test--time 1))
                 ;; Jira's time moved, its fields did not.
-                (ejira-test--issue-heading "TEST-2" "Two" i2 "T2")
-                (ejira-test--issue-heading "TEST-3" "Three" i3 "T3" ":Pushhash: stale\n")
-                (ejira-test--issue-heading "TEST-4" "Four" i4 "T4"))
+                (ejira-test--issue-heading "TEST-2" "Two" i2 (ejira-test--time 2))
+                (ejira-test--issue-heading "TEST-3" "Three" i3 (ejira-test--time 3) ":LocalHash: stale\n")
+                (ejira-test--issue-heading "TEST-4" "Four" i4 (ejira-test--time 4)))
       (let ((file (file-truename file))
             (ejira-auto-sync-discover nil)
             (ejira-push-on-save nil)
@@ -4514,8 +4461,8 @@ cached in the background: the cycle never waits on Jira."
           (should (= 1 (ejira-auto-sync-held-count 'review)))
           (with-current-buffer (get-file-buffer file)
             (should-not (buffer-modified-p))
-            (should (equal "T2-new" (org-entry-get (ejira--find-heading "TEST-2") "Remoteupdated")))
-            (should (equal "T1" (org-entry-get (ejira--find-heading "TEST-1") "Remoteupdated"))))
+            (should (equal (ejira--remote-time (ejira-test--time 22)) (org-entry-get (ejira--find-heading "TEST-2") "Modified")))
+            (should (equal (ejira--remote-time (ejira-test--time 1)) (org-entry-get (ejira--find-heading "TEST-1") "Modified"))))
           ;; Not a full fetch: its time is left as it was.
           (should (= 1.0e12 (gethash file ejira--auto-sync-full-fetch-times)))
           ;; A full fetch asks for everything at once.
@@ -4533,11 +4480,11 @@ cached in the background: the cycle never waits on Jira."
 compares the comment with the page the fetch embedded instead of asking
 Jira again."
   (let* ((comments '(((id . "100") (body . "Remote text.") (updated . "C1"))))
-         (item (ejira-test--issue-item "TEST-1" "One" "T1" comments)))
+         (item (ejira-test--issue-item "TEST-1" "One" (ejira-test--time 1) comments)))
     (ejira-test--with-project-dir
         (concat ejira-test--project-heading
-                (ejira-test--issue-heading "TEST-1" "One" item "T1")
-                "*** Comments\n**** A comment\n:PROPERTIES:\n:TYPE:     ejira-comment\n:CommId:   100\n:Pushhash: stale\n:END:\n\nLocal edit.\n")
+                (ejira-test--issue-heading "TEST-1" "One" item (ejira-test--time 1))
+                "*** Comments\n**** A comment\n:PROPERTIES:\n:TYPE:     ejira-comment\n:CommId:   100\n:LocalHash: stale\n:END:\n\nLocal edit.\n")
       (let ((file (file-truename file))
             (ejira-auto-sync-discover nil)
             (ejira-push-on-save nil))
@@ -4557,7 +4504,7 @@ Jira again."
   "Answers about a buffer edited while Jira was asked are not applied:
 the cycle starts over on the new content.  A file that keeps changing
 is queued for a later round instead."
-  (let ((item (ejira-test--issue-item "TEST-1" "One" "T1")))
+  (let ((item (ejira-test--issue-item "TEST-1" "One" (ejira-test--time 1))))
     (ejira-test--with-project-dir
         (concat ejira-test--project-heading (ejira-test--issue-heading "TEST-1" "One" item))
       (let ((file (file-truename file))
@@ -4583,14 +4530,14 @@ is queued for a later round instead."
             (should-not (member file ejira--auto-sync-queue))
             (should (gethash file ejira--auto-sync-mtimes))
             (with-current-buffer (get-file-buffer file)
-              (should (equal "T1" (org-entry-get (ejira--find-heading "TEST-1") "Remoteupdated")))
+              (should (equal (ejira--remote-time (ejira-test--time 1)) (org-entry-get (ejira--find-heading "TEST-1") "Modified")))
               (should-not (buffer-modified-p)))
             ;; Always: given up after the restarts, queued for later.
             (setq edits 0)
             (clrhash ejira--auto-sync-mtimes)
             (with-current-buffer (get-file-buffer file)
               (org-with-point-at (ejira--find-heading "TEST-1")
-                (org-delete-property "Remoteupdated"))
+                (org-delete-property "Modified"))
               (save-buffer))
             (ejira--auto-sync-enqueue file)
             (ejira--auto-sync-worker)
@@ -4600,12 +4547,12 @@ is queued for a later round instead."
             (should (member file ejira--auto-sync-queue))
             (should-not (gethash file ejira--auto-sync-mtimes))
             (with-current-buffer (get-file-buffer file)
-              (should-not (org-entry-get (ejira--find-heading "TEST-1") "Remoteupdated")))))))))
+              (should-not (org-entry-get (ejira--find-heading "TEST-1") "Modified")))))))))
 
 (ert-deftest ejira-auto-sync-async/failed-request-ends-the-round ()
   "A failed request ends its cycle without applying anything.  The round
 ends, and the file stays due for a later round, attempts counted."
-  (let ((item (ejira-test--issue-item "TEST-1" "One" "T1")))
+  (let ((item (ejira-test--issue-item "TEST-1" "One" (ejira-test--time 1))))
     (ejira-test--with-project-dir
         (concat ejira-test--project-heading (ejira-test--issue-heading "TEST-1" "One" item))
       (let ((file (file-truename file))
@@ -4620,13 +4567,13 @@ ends, and the file stays due for a later round, attempts counted."
           (should (member file (ejira--auto-sync-due-files)))
           (with-current-buffer (get-file-buffer file)
             (should-not (buffer-modified-p))
-            (should-not (org-entry-get (ejira--find-heading "TEST-1") "Remoteupdated"))))))))
+            (should-not (org-entry-get (ejira--find-heading "TEST-1") "Modified"))))))))
 
 (ert-deftest ejira-auto-sync-async/no-second-round-while-one-runs ()
   "A round starts only when the previous one has ended; a save during a
 round waits for it.  A round that never ends is abandoned, its files
 queued again, and its late answers dropped."
-  (let ((item (ejira-test--issue-item "TEST-1" "One" "T1")))
+  (let ((item (ejira-test--issue-item "TEST-1" "One" (ejira-test--time 1))))
     (ejira-test--with-project-dir
         (concat ejira-test--project-heading (ejira-test--issue-heading "TEST-1" "One" item))
       (let ((file (file-truename file))
@@ -4648,18 +4595,18 @@ queued again, and its late answers dropped."
             (should (member file ejira--auto-sync-queue))
             (ejira-test--answer-jira (ejira-test--items-for (list item)))
             (with-current-buffer (get-file-buffer file)
-              (should-not (org-entry-get (ejira--find-heading "TEST-1") "Remoteupdated")))))))))
+              (should-not (org-entry-get (ejira--find-heading "TEST-1") "Modified")))))))))
 
 (ert-deftest ejira-auto-sync-async/snapshot-never-unfolds-the-buffer ()
   "Reading the baselines of every heading never shows the whole buffer.
 Regression: each heading's local-change check showed and refolded the
 whole buffer, and the snapshot of a large file blocked Emacs for two
 minutes -- long enough for the requests already sent to time out."
-  (let ((item (ejira-test--issue-item "TEST-1" "One" "T1")))
+  (let ((item (ejira-test--issue-item "TEST-1" "One" (ejira-test--time 1))))
     (ejira-test--with-project-dir
         (concat ejira-test--project-heading
-                (ejira-test--issue-heading "TEST-1" "One" item "T1" ":Pushhash: stale\n")
-                "*** Comments\n**** A comment\n:PROPERTIES:\n:TYPE:     ejira-comment\n:CommId:   100\n:Pushhash: stale\n:END:\n\nLocal edit.\n")
+                (ejira-test--issue-heading "TEST-1" "One" item (ejira-test--time 1) ":LocalHash: stale\n")
+                "*** Comments\n**** A comment\n:PROPERTIES:\n:TYPE:     ejira-comment\n:CommId:   100\n:LocalHash: stale\n:END:\n\nLocal edit.\n")
       (let ((shows 0)
             (cycle (ejira--cycle-make :file (file-truename file))))
         (cl-letf (((symbol-function 'outline-show-all)
@@ -4672,20 +4619,60 @@ minutes -- long enough for the requests already sent to time out."
         (should (= 0 shows))))))
 
 (ert-deftest ejira-auto-sync/remote-baseline-is-dated ()
-  "The remote baseline records the update time of the version it
-hashes, or none when the fetch did not give it."
+  "The remote baseline is the `RemoteHash' of a version and the `Modified'
+time of the same version, or no time when the fetch did not give it."
   (ejira-test--with-org-buf
    "* TODO An issue\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n:END:\n"
-   (let ((dated (ejira-test--issue-item "TEST-1" "An issue" "T1"))
+   (let ((dated (ejira-test--issue-item "TEST-1" "An issue" (ejira-test--time 1)))
          (undated (ejira-test--issue-item "TEST-1" "An issue")))
      (ejira--store-remote-baseline dated)
-     (should (equal "T1" (org-entry-get nil "Remoteupdated")))
+     (should (equal (md5 (ejira--remote-fields-identity dated))
+                    (org-entry-get nil "RemoteHash")))
+     (should (equal "2026-09-21 10:01:00" (org-entry-get nil "Modified")))
      (ejira--store-remote-baseline undated)
-     (should (org-entry-get nil "Remotehash"))
-     (should-not (org-entry-get nil "Remoteupdated"))
+     (should (org-entry-get nil "RemoteHash"))
+     (should-not (org-entry-get nil "Modified"))
      ;; Dating an unchanged baseline.
-     (ejira--note-remote-updated (point-marker) dated)
-     (should (equal "T1" (org-entry-get nil "Remoteupdated"))))))
+     (ejira--date-remote-baseline (point-marker) dated)
+     (should (equal "2026-09-21 10:01:00" (org-entry-get nil "Modified"))))))
+
+(ert-deftest ejira-update-task/full-pull-records-both-baselines ()
+  "A full pull records the version it applied as both baselines: the
+heading as the local one, the item's fields and time as the remote one.
+A heading with local edits keeps both, so the next cycle still sees the
+remote change its edits were made against."
+  (ejira-test--with-project-dir ejira-test--project-content
+    (let* ((buf (find-file-noselect file t))
+           (ejira-assigned-tagname nil)
+           (ejira-todo-states-alist '(("Open" . 1)))
+           (item (ejira-test--issue-item "TEST-1" "An issue" (ejira-test--time 5)))
+           (ejira--heading-cache (make-hash-table :test 'equal)))
+      (cl-letf (((symbol-function 'ejira--get-priority-scheme) (lambda (&rest _) nil)))
+        (should (ejira--update-task-or-hold item)))
+      (with-current-buffer buf
+        (goto-char (point-min))
+        (re-search-forward "^\\*\\* TODO An issue")
+        (should (equal (md5 (ejira--remote-fields-identity item))
+                       (org-entry-get nil "RemoteHash")))
+        (should (equal (ejira--remote-time (ejira-test--time 5))
+                       (org-entry-get nil "Modified")))
+        (should (= 2 (length (ejira--local-baseline))))
+        (should-not (ejira--locally-modified-p))
+        ;; A local edit, then a remote change: the pull keeps both baselines.
+        (org-back-to-heading t)
+        (re-search-forward "TODO An issue")
+        (replace-match "TODO An issue, edited")
+        (let ((newer (ejira-test--issue-item "TEST-1" "Renamed" (ejira-test--time 9)))
+              (ejira--force-full-update t))
+          (cl-letf (((symbol-function 'ejira--get-priority-scheme) (lambda (&rest _) nil)))
+            (ejira--update-task-or-hold newer)))
+        (goto-char (point-min))
+        (re-search-forward "^\\*\\* TODO An issue, edited")
+        (should (equal (md5 (ejira--remote-fields-identity item))
+                       (org-entry-get nil "RemoteHash")))
+        (should (equal (ejira--remote-time (ejira-test--time 5))
+                       (org-entry-get nil "Modified")))
+        (should (ejira--locally-modified-p))))))
 
 (provide (quote ejira-test))
 ;;; ejira-test.el ends here

@@ -157,7 +157,7 @@ which runs against a disposable test project."
          (buf (marker-buffer m)))
     (ejira-e2e--check "modify summary locally"
                       (ejira--set-heading-summary m "ejira-e2e-test: DO NOT EDIT — UPDATED")
-                      (org-with-point-at m (org-set-property "Pushhash" "DIRTY-FOR-E2E")))
+                      (org-with-point-at m (org-set-property "LocalHash" "DIRTY-FOR-E2E")))
     (ejira-e2e--check "scan+push content update to Jira"
                       (let ((n (ejira-e2e--push-buffer buf)))
                         (unless (> n 0) (error "No plans were pushed"))))
@@ -185,7 +185,7 @@ which runs against a disposable test project."
                           (org-priority (ejira--org-priority-for-rank rank))
                           (org-set-property ejira-priority-id-property (plist-get target :id))
                           (org-set-property ejira-priority-name-property (plist-get target :name))
-                          (org-set-property "Pushhash" "DIRTY-FOR-E2E"))))
+                          (org-set-property "LocalHash" "DIRTY-FOR-E2E"))))
     (ejira-e2e--check "push exact priority ID to Jira"
                       (let ((n (ejira-e2e--push-buffer buf)))
                         (unless (> n 0) (error "No plans were pushed for priority"))))
@@ -235,7 +235,7 @@ which runs against a disposable test project."
                                            (error "No CommId-stamped comment heading found"))))
                         (org-with-point-at comment-m
                           (ejira--set-heading-body comment-m "UPDATED by ejira-e2e-test.el.\n")
-                          (org-set-property "Pushhash" "DIRTY-FOR-E2E")))
+                          (org-set-property "LocalHash" "DIRTY-FOR-E2E")))
                       (let ((n (ejira-e2e--push-buffer buf)))
                         (unless (> n 0) (error "No plans pushed for comment update"))))
     (ejira-e2e--check "comment body updated on Jira"

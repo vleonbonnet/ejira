@@ -61,9 +61,7 @@ Example configuration with =use-package=. Note, that for Ejira to work =org-id-t
 ** Project file structure
 Each project will be synchronized into its own file, which is named as the project code with an =.org=-extension, and is located inside =ejira-org-directory=. All the data related to the project will be kept inside this project file.
 
-The project file can also contain extra org headings anywhere except inside the reserved "Description" and "Comments" headers. Ejira will not touch those headings but their clock entries get included in the total clocked hours for the task. This is useful, if for example one wishes to log the work hours from a meeting into a JIRA task, one can just refile the captured meeting notes under the specific Ejira ticket and the hours will be included. The meeting notes will also be visible when viewing the item with =ejira-focus-on-issue=.
-
-When a project in synced into a file, it's items get automatically refiled into a structure based on the hierarchy shown below. Not all levels need to be present, though, an issue or a story might not have an epic link, and thus will then be refiled directly under the project, for instance. The heading levels are dynamic, so the amount of asterisks for an issue depends on whether it has an epic link or not.
+When a project in synced into a file, it's items get automatically refiled into a structure based on the hierarchy shown below. Not all levels need to be present, though, an issue or a story might not have an epic link, and thus will then be refiled directly under the project, for instance. The heading levels are dynamic, so the amount of asterisks for an issue depends on whether it has an epic link or not. If the items are updated and these relationships change, the items are automatically refiled to reflect the structure in the server.
 
 #+BEGIN_SRC org
   ,* Project
@@ -73,14 +71,13 @@ When a project in synced into a file, it's items get automatically refiled into 
   ,**** Subtask
 #+END_SRC
 
-If the items are updated and these relationships change, the items are automatically refiled to reflect the structure in the server.
+** Task body
+A task's body is its Jira description: its own prose and its ordinary subheadings, down to its first child task or its reserved "Comments" heading.  Notes that must stay local belong under a child task, or in a projection (below).
+
+Clock entries anywhere in the subtree are included in the total clocked hours for the task. This is useful, if for example one wishes to log the work hours from a meeting into a JIRA task, one can just refile the captured meeting notes under the specific Ejira ticket and the hours will be included. The meeting notes will also be visible when viewing the item with =ejira-focus-on-issue=.
 
 ** Jira content projection
-
-An ejira heading normally uses its Org heading as the Jira summary and its
-=Description= child as the Jira description.  When a task needs detailed local
-notes but a compact external Jira presentation, add =JIRA_TITLE= and, if needed,
-a direct =JIRA_DESCRIPTION= child:
+An ejira heading normally uses its Org heading as the Jira summary and its body as the Jira description.  When a task needs detailed local notes but a compact external Jira presentation, add =JIRA_TITLE= and, if needed, a direct =JIRA_DESCRIPTION= child:
 
 #+BEGIN_SRC org
   ,*** STARTED Implement callback recovery
@@ -94,11 +91,7 @@ a direct =JIRA_DESCRIPTION= child:
   Concise Jira-facing progress description.
 #+END_SRC
 
-The property and child form a bidirectional Jira projection.  Ejira pushes only
-the projected title and description, pulls Jira edits back into those fields,
-and leaves the local heading, body, and ordinary =Description= subtree intact.
-With =JIRA_TITLE= but no =JIRA_DESCRIPTION= child, the Jira description is
-deliberately empty.
+The property and child form a bidirectional Jira projection.  Ejira pushes only the projected title and description, pulls Jira edits back into those fields, and leaves the local heading and body intact.  With =JIRA_TITLE= but no =JIRA_DESCRIPTION= child, the Jira description is deliberately empty.
 
 ** Usage
 *** Focus view
@@ -161,10 +154,13 @@ Ejira Push — 3 changes: 1 modified, 2 new
 - =C-c C-c= pushes the ticked items; failures are collected into one warning and the other items still go through. =C-c C-k= cancels.
 
 *** Automatic reconciliation
-Every Org file ejira tracks reconciles itself: the project files in =ejira-org-directory=, the files in =ejira-extra-scan-files=, any other Org buffer holding an issue heading when it is saved, and extra files listed in =ejira-auto-sync-files=.  Set =ejira-auto-sync-tracked= to nil to limit this to =ejira-auto-sync-files=.  Start the idle worker with =ejira--start-auto-sync=.  Each cycle compares the issues of the file with two baselines: the local one (=Pushhash=/=Statehash=, what was last pulled or pushed) and the remote one (=Remotehash=, what Jira held at that moment, dated by =Remoteupdated=, Jira's update time of that version).
+Every Org file ejira tracks reconciles itself: the project files in =ejira-org-directory=, the files in =ejira-extra-scan-files=, any other Org buffer holding an issue heading when it is saved, and extra files listed in =ejira-auto-sync-files=.  Set =ejira-auto-sync-tracked= to nil to limit this to =ejira-auto-sync-files=.  Start the idle worker with =ejira--start-auto-sync=.  Each cycle compares the issues of the file with two baselines, recorded at the last pull or push:
 
-- Emacs never waits on Jira for a cycle (=ejira-auto-sync-async=).  The cycles of every due file start together in a round; their requests go out at once (at most =ejira-max-concurrent-requests=, each abandoned after =ejira-request-timeout=), and each file is applied when its answers are in.  The mode line shows =Jira:syncing= meanwhile.  A buffer edited while Jira answered is reconciled again from scratch.
-- Between full fetches, a cycle first asks Jira only for the update time of each issue, and fetches the issues whose time moved, those with local changes (their own or a comment's) and those without a complete baseline.  Jira moves an issue's update time on every change, comments included, so the others still match their baseline.  A full fetch runs on the first cycle of each file in a session, every =ejira-auto-sync-full-fetch-interval= seconds (an hour by default), and with =C-u M-x ejira-auto-sync-review=.
+- =LocalHash=, the heading as it was then: two hashes, its content fields (summary, description, priority, deadline) and its state fields (todo state, assignee, status).  The parts are acknowledged apart: the shallow auto-pull fetches only the state, so it moves only that part, and a pull applies a remote description while a local state change waits for its push, and the other way round.  A comment's =LocalHash= is the hash of its body.
+- =RemoteHash=, what Jira held then: a hash of the synced fields, dated by =Modified=, Jira's update time of the same version.  It tells a change of a synced field in Jira from any other change there and from ejira's own pushes.
+
+- Emacs never waits on Jira for a cycle.  The cycles of every due file start together in a round; their requests go out at once (at most =ejira-max-concurrent-requests=, each abandoned after =ejira-request-timeout=), and each file is applied when its answers are in.  The mode line shows =Jira:syncing= meanwhile.  A buffer edited while Jira answered is reconciled again from scratch.
+- Between full fetches, a cycle first asks Jira only for the update time of each issue, and fetches the issues whose time moved past =Modified=, those with local changes (their own or a comment's) and those without a complete baseline.  Jira moves an issue's update time on every change, comments included, so the others still match their baseline.  A full fetch runs on the first cycle of each file in a session, every =ejira-auto-sync-full-fetch-interval= seconds (an hour by default), and with =C-u M-x ejira-auto-sync-review=.
 
 - Remote-only changes are pulled.  Local changes are never pushed by the cycle: every one of them waits for the review buffer.  Nothing reaches Jira without confirmation; every Jira write runs inside =ejira--jira-write=, which refuses to run outside the confirmed items of the review buffer.
 - An issue changed on both sides, or edited locally while its remote baseline is unknown, is held.  So is an issue whose Jira markup cannot be converted to Org: ejira never stores raw Jira markup in an Org body.
@@ -176,6 +172,8 @@ Every Org file ejira tracks reconciles itself: the project files in =ejira-org-d
 - Only issues of =ejira-projects= sync.  A heading of another project is neither pulled, pushed nor used for discovery, wherever it lives; removing a project from the list stops its sync even in files that still hold its headings.
 
 Shallow pulls (=ejira-auto-pull-shallow=) only ever acknowledge the state they fetched, and leave a heading with pending local edits untouched.
+
+Files written by earlier versions (a =Description= child heading, =EJIRA_DESCRIPTION_IN_BODY=, =Pushhash=, =Statehash=, =Remotehash=, =Remoteupdated=) are brought to this schema by =ejira-migrate-files= from =ejira-migrate.el=: run it first without its =APPLY= argument and read the reports.  Clean issues stay clean and pending edits stay pending.  A task whose own body or sections were local notes next to its =Description= becomes a projection; a section holding only a stale copy of the description is removed.
 
 **** Files changed by another writer
 Every edit ejira makes, by a pull, a cycle or a confirmed push, reaches the file.  Some edits are dropped on purpose because the next cycle recomputes them from Jira.  ejira never leaves a buffer holding its own unsaved edits.  Another writer (git, an agent, another editor) may change the file while ejira works on it:

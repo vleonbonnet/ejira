@@ -1,372 +1,405 @@
-;;; ejira-migrate.el --- One-shot Description-fold migration -*- lexical-binding: t; -*-
+;;; ejira-migrate.el --- Migrate Org files to ejira's current schema -*- lexical-binding: t; -*-
 
-;; Folds legacy `Description' child headings into task bodies (body mode)
-;; with PURE LINE-BASED construction: the file is parsed into a block
-;; tree, the new content is built as text, and the file is written once.
-;; No buffer mutation of the real file.
+;;; Commentary:
+
+;; `ejira-migrate-files' rewrites Org files written by earlier ejira
+;; versions into the current schema, in one pass per file:
 ;;
-;; Baselines: each task's v2 Pushhash is computed in a throwaway buffer
-;; rendering the REMOTE-EQUIVALENT body (the old description content as
-;; the task's body), so a fold that matches the remote state baselines
-;; clean, while union folds (own prose + description) stay dirty for
-;; their reviewed first push.
+;; - Descriptions live in the task body.  A legacy `Description' child
+;;   heading is folded into its task's body (one star less for its
+;;   subheadings), and the `EJIRA_DESCRIPTION_IN_BODY' opt-in goes.
+;; - The local baseline is one `LocalHash' property: an issue's content
+;;   and state hashes, a comment's body hash.  It replaces `Pushhash'
+;;   and `Statehash', and the legacy single-hash form of `Pushhash'.
+;; - The remote baseline is `RemoteHash', dated by `Modified';
+;;   `Remotehash' is renamed and `Remoteupdated' removed.
 ;;
-;; Set `ejira-migrate--apply' to t to write; nil = dry run.
+;; Whatever was clean stays clean, and whatever had local edits keeps
+;; them pending.  A legacy task whose own body or other sections were
+;; local notes next to its `Description' child would send them as its
+;; description in the body layout: it becomes a projection instead, its
+;; `Description' child its `JIRA_DESCRIPTION' (see
+;; `ejira-migrate--convert-at-point').  Sections holding only a stale
+;; copy of the description are removed first.
+;;
+;; The fold is built as text; the baselines are read from the original
+;; text with the formulas it was written with, and recorded in the new
+;; text with the current code.  Nothing is written without APPLY.
+
+;;; Code:
 
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
 (require 'ejira-push)
 
-(defvar ejira-migrate--apply nil)
-(defvar ejira-migrate--file "/Users/val/Documents/projects/pr-bot/secateur/todo.org")
-(defvar ejira-migrate--result nil)
+;;; Folding a legacy description
 
-(defun ejira-migrate--heading-level (line)
-  "Return the outline LEVEL of LINE, or nil when it is not a heading."
-  (when (string-match "^\\*+ " line)
-    (- (match-end 0) (match-beginning 0) 1)))
-
-(defun ejira-migrate--heading-title (line)
-  "Return the title text of heading LINE (stars, keyword, cookie kept)."
-  (when (string-match "^\\*+ " line)
-    (substring line (match-end 0))))
+(defun ejira-migrate--heading-line-p (line)
+  "Return non-nil when LINE is an Org heading."
+  (string-match-p "^\\*+ " line))
 
 (defun ejira-migrate--blank-p (line)
+  "Return non-nil when LINE holds only whitespace."
   (string-empty-p (string-trim line)))
 
-(defun ejira-migrate--dedent (lines)
-  "Remove one leading star from every heading line in LINES."
-  (mapcar (lambda (l)
-            (if (and (ejira-migrate--heading-level l)
-                     (string-prefix-p "*" l))
-                (substring l 1)
-              l))
-          lines))
+(defun ejira-migrate--trim (lines)
+  "Drop the leading and trailing blank lines of LINES."
+  (let ((lines (seq-drop-while #'ejira-migrate--blank-p lines)))
+    (nreverse (seq-drop-while #'ejira-migrate--blank-p (reverse lines)))))
 
-(defun ejira-migrate--trim-head (lines)
-  "Drop leading blank lines from LINES."
-  (while (and lines (ejira-migrate--blank-p (car lines)))
-    (setq lines (cdr lines)))
-  lines)
+(defun ejira-migrate--lines (beg end)
+  "Return the lines between BEG and END, without their newlines."
+  (split-string (buffer-substring-no-properties beg end) "\n"))
 
-(defun ejira-migrate--trim-tail (lines)
-  "Drop trailing blank lines from LINES."
-  (let ((n (length lines)))
-    (while (and (> n 0) (ejira-migrate--blank-p (nth (1- n) lines)))
-      (cl-decf n))
-    (seq-take lines n)))
+(defun ejira-migrate--comparable (text)
+  "Return TEXT reduced to what a copy of it keeps: no stars, drawers or wrapping."
+  (string-trim
+   (replace-regexp-in-string
+    "[ \t\n]+" " "
+    (replace-regexp-in-string
+     "^\\*+ " ""
+     (replace-regexp-in-string "^[ \t]*:[A-Za-z_-]+:.*$" "" text)))))
 
-(defun ejira-migrate--meta-end (lines)
-  "Index of the first line of LINES that is not planning/drawer metadata."
-  (let ((i 0) (n (length lines)))
-    (while (and (< i n) (string-match-p "^[A-Z]+:" (nth i lines)))
-      (cl-incf i))
-    (while (and (< i n) (string-match-p "^:[A-Za-z_]+:" (nth i lines)))
-      (while (and (< i n) (not (string-match-p "^:END:" (nth i lines))))
-        (cl-incf i))
-      (when (< i n) (cl-incf i)))
-    i))
+(defun ejira-migrate--subtree-text (marker)
+  "Return the subtree at MARKER as text."
+  (org-with-point-at marker
+    (buffer-substring-no-properties (point) (save-excursion (org-end-of-subtree t t) (point)))))
 
-(defun ejira-migrate--parse (lines level)
-  "Parse LINES into blocks at LEVEL.
-Returns (BLOCKS . REST); REST begins at the first line that is a
-heading shallower than LEVEL (or is nil).  Lines before the first
-LEVEL heading become a single (:level 0) verbatim block."
-  (let ((blocks nil))
-    (while (and lines
-                (let ((l (ejira-migrate--heading-level (car lines))))
-                  (or (null l) (>= l level))))
-      (let ((l (ejira-migrate--heading-level (car lines))))
-        (cond
-         ((null l)
-          (let ((take nil))
-            (while (and lines (null (ejira-migrate--heading-level (car lines))))
-              (push (car lines) take)
-              (setq lines (cdr lines)))
-            (push (list :level 0 :lines (nreverse take)) blocks)))
-         (t
-          (let* ((heading-line (car lines))
-                 (own nil)
-                 (rest (cdr lines)))
-            (while (and rest (null (ejira-migrate--heading-level (car rest))))
-              (push (car rest) own)
-              (setq rest (cdr rest)))
-            (setq own (nreverse own))
-            (let* ((meta-end (ejira-migrate--meta-end own))
-                   (meta (seq-take own meta-end))
-                   (prose (seq-drop own meta-end))
-                   (parsed (ejira-migrate--parse rest (1+ l))))
-              (push (list :level l
-                          :heading-line heading-line
-                          :title (string-trim
-                                  (or (ejira-migrate--heading-title
-                                       heading-line)
-                                      ""))
-                          :todo-keyword (and (string-match
-                                              "^\\*+ \\([A-Z]+\\) "
-                                              heading-line)
-                                             (match-string 1 heading-line))
-                          :meta meta
-                          :own prose
-                          :children (car parsed))
-                    blocks)
-              (setq lines (cdr parsed))))))))
-    (cons (nreverse blocks) lines)))
+(defun ejira-migrate--children ()
+  "Return markers on the direct children of the heading at point."
+  (save-excursion
+    (let (children)
+      (when (org-goto-first-child)
+        (push (point-marker) children)
+        (while (org-get-next-sibling)
+          (push (point-marker) children)))
+      (nreverse children))))
 
-(defun ejira-migrate--render-block (b)
-  "Flatten block B back into lines."
-  (if (= 0 (plist-get b :level))
-      (append (plist-get b :lines)
-              (apply #'append
-                     (mapcar #'ejira-migrate--render-block
-                             (plist-get b :children))))
-    (let ((body (append
-                 (plist-get b :own)
-                 (apply #'append
-                        (mapcar #'ejira-migrate--render-block
-                                (plist-get b :children))))))
-      (append (list (plist-get b :heading-line))
-              (plist-get b :meta)
-              (if (seq-some (lambda (l) (not (ejira-migrate--blank-p l)))
-                            body)
-                  (cons ""
-                        (append (ejira-migrate--trim-head
-                                 (ejira-migrate--trim-tail body))
-                                (list "")))
-                (list ""))))))
+(defun ejira-migrate--local-section-p (marker)
+  "Return non-nil when the child at MARKER is a local section of its task.
+Not a task, nor one of the headings ejira owns."
+  (org-with-point-at marker
+    (not (or (ejira--task-heading-p)
+             (member (org-get-heading t t t t)
+                     (list "Description" ejira-comments-heading-name
+                           ejira-jira-description-heading-name))))))
 
-(defun ejira-migrate--drawer-props (meta-lines)
-  "Return the alist of drawer properties in META-LINES."
-  (let ((props nil))
-    (dolist (l meta-lines)
-      (when (string-match "^:\\([A-Za-z_]+\\):[ \t]*\\(.*?\\)[ \t]*$" l)
-        (push (cons (match-string 1 l) (match-string 2 l)) props)))
-    (nreverse props)))
+(defun ejira-migrate--convert-at-point ()
+  "Bring the legacy task at point to the current layout.
+Return a plist: :action, `folded', `projection' or `none'; :desc-id,
+the `ID' of a removed `Description' heading; :dropped, the number of
+stale description copies removed.
 
-(defun ejira-migrate--task-p (b)
-  "Return non-nil when block B is a synchronized task heading."
-  (let* ((props (ejira-migrate--drawer-props (plist-get b :meta)))
-         (type (cdr (assoc "TYPE" props)))
-         (id (cdr (assoc "ID" props))))
-    (and id (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" id)
-         (or (plist-get b :todo-keyword)
-             (and type (member type ejira-pushable-types)
-                  (not (equal type "ejira-comment")))))))
-
-(defun ejira-migrate--projection-p (b)
-  "Return non-nil when task block B uses a Jira content projection."
-  (let* ((props (ejira-migrate--drawer-props (plist-get b :meta)))
-         (desc-child (cl-find-if
-                      (lambda (c)
-                        (and (> (plist-get c :level) 0)
-                             (equal (plist-get c :title)
-                                    "JIRA_DESCRIPTION")))
-                      (plist-get b :children))))
-    (or (cdr (assoc "JIRA_TITLE" props)) desc-child)))
-
-(defun ejira-migrate--fold (b)
-  "Fold task block B's Description child into its body.
-Returns (NEW-BLOCK . FOLD-INFO-OR-NIL)."
-  (let* ((props (ejira-migrate--drawer-props (plist-get b :meta)))
-         (key (cdr (assoc "ID" props)))
-         (title (plist-get b :title))
-         (children (plist-get b :children))
-         (desc-block (cl-find-if
-                      (lambda (c)
-                        (and (> (plist-get c :level) 0)
-                             (equal (plist-get c :title) "Description")))
-                      children)))
-    (if (not desc-block)
-        (cons b nil)
-      (let* ((dprops (ejira-migrate--drawer-props
-                      (plist-get desc-block :meta)))
-             (desc-id (cdr (assoc "ID" dprops)))
-             (own (ejira-migrate--trim-head
-                   (ejira-migrate--trim-tail (plist-get b :own))))
-             (desc-content-lines
-              (ejira-migrate--dedent
-               (append (plist-get desc-block :own)
-                       (apply #'append
-                              (mapcar #'ejira-migrate--render-block
-                                      (plist-get desc-block :children))))))
-             (desc-content (ejira-migrate--trim-head
-                            (ejira-migrate--trim-tail desc-content-lines)))
-             (desc-text (string-join desc-content "\n"))
-             (own-text (string-join own "\n"))
-             (folded
-              (cond
-               ((= (length desc-text) 0) own)
-               ((string-equal desc-text own-text) own)
-               ((= (length own-text) 0) desc-content)
-               (t (append own (cons "" desc-content)))))
-             (new-block (list :level (plist-get b :level)
-                              :heading-line (plist-get b :heading-line)
-                              :title title
-                              :todo-keyword (plist-get b :todo-keyword)
-                              :meta (plist-get b :meta)
-                              :own folded
-                              :children
-                              (cl-remove-if
-                               (lambda (c) (eq c desc-block))
-                               children)))
-             (remote-equiv-body
-              (if (or (= (length desc-text) 0)
-                      (string-equal desc-text own-text))
-                  own
-                desc-content)))
-        (cons new-block
-              (list :key key :title title :desc-id desc-id
-                    :action (cond ((string-equal desc-text own-text)
-                                   'dup)
-                                  ((= (length own-text) 0) 'desc-only)
-                                  (t 'diff))
-                    :baseline-heading (plist-get b :heading-line)
-                    :baseline-meta (plist-get b :meta)
-                    :baseline-body remote-equiv-body))))))
-
-(defun ejira-migrate--content-identity ()
-  "Return the canonical content identity for the heading at point.
-The description component comes from the body accessor; the caller
-binds `ejira-description-in-body'."
-  (concat
-   (ejira--push-normalize (ejira--jira-summary))
-   "\0"
-   (ejira--push-normalize (or (ejira--jira-description) ""))
-   "\0"
-   (ejira--push-normalize
-    (or (org-entry-get nil ejira-priority-id-property) ""))
-   "\0"
-   (ejira--push-normalize
-    (or (when-let* ((d (org-get-deadline-time (point-marker))))
-          (format-time-string "%Y-%m-%d" d))
-        ""))))
-
-(defun ejira-migrate--baselines (fold-info)
-  "Compute the v2 Pushhash and Statehash for FOLD-INFO."
-  (let ((ejira-description-in-body t))
-    (with-temp-buffer
-      (org-mode)
-      (insert (plist-get fold-info :baseline-heading) "\n")
-      (dolist (l (plist-get fold-info :baseline-meta))
-        (insert l "\n"))
-      (insert "\n")
-      (dolist (l (plist-get fold-info :baseline-body))
-        (insert l "\n"))
-      (goto-char (point-min))
-      (org-back-to-heading t)
-      (list :pushhash
-            (concat ejira-pushhash-v2-prefix
-                    (md5 (ejira-migrate--content-identity)))
-            :statehash (md5 (ejira--heading-state-fields))))))
-
-(defun ejira-migrate--set-props (meta-lines prop-alist)
-  "Set drawer properties in META-LINES from PROP-ALIST."
-  (let* ((lines (copy-sequence meta-lines))
-         (drawer-start (cl-position-if
-                        (lambda (l) (string-match-p "^:PROPERTIES:" l))
-                        lines)))
-    (dolist (p prop-alist)
-      (let ((pat (concat "^:" (regexp-quote (car p)) ":[ \t]*.*$"))
-            (found nil))
-        (setq lines
-              (mapcar (lambda (l)
-                        (if (and (string-match-p "^:[A-Za-z_]+:" l)
-                                 (string-match pat l))
-                            (progn (setq found t)
-                                   (format ":%s:     %s" (car p) (cdr p)))
-                          l))
-                      lines))
-        (unless found
-          (when drawer-start
-            (setq lines
-                  (append (seq-take lines (1+ drawer-start))
-                          (list (format ":%s:     %s" (car p) (cdr p)))
-                          (seq-drop lines (1+ drawer-start))))))))
-    lines))
-
-(defvar ejira-migrate--counts nil)
-(defvar ejira-migrate--journal nil)
-
-(defun ejira-migrate--transform (blocks)
-  "Fold Description children of task blocks in BLOCKS."
-  (let ((out nil))
-    (dolist (b blocks)
+A section next to the `Description' child holding nothing but a copy
+of the description (wrapping aside) is a leftover of an older pull: it
+is removed.  When the task then has neither own prose nor another
+local section, its `Description' child is folded into its body (its
+subheadings lose one star, one blank line around the body).
+Otherwise those are local notes, which the body layout would send as
+the description: the `Description' child becomes the task's
+`JIRA_DESCRIPTION' projection, and the notes stay local."
+  (let* ((desc (ejira--find-child-heading "Description"))
+         (desc-text (and desc (ejira-migrate--comparable
+                               (ejira-migrate--subtree-text desc))))
+         (dropped 0))
+    ;; Stale copies, last first so the earlier positions hold.
+    (when (and desc-text (not (string-empty-p desc-text)))
+      (dolist (m (reverse (ejira-migrate--children)))
+        (when (and (ejira-migrate--local-section-p m)
+                   (let ((copy (ejira-migrate--comparable (ejira-migrate--subtree-text m))))
+                     (and (not (string-empty-p copy))
+                          (string-search copy desc-text))))
+          (org-with-point-at m
+            (delete-region (point) (save-excursion (org-end-of-subtree t t) (point))))
+          (cl-incf dropped))))
+    (let ((own (ejira-migrate--trim
+                (ejira-migrate--lines (save-excursion (ejira--body-start))
+                                      (save-excursion
+                                        (org-back-to-heading t)
+                                        (if (org-goto-first-child)
+                                            (point)
+                                          (org-end-of-subtree t t)
+                                          (point))))))
+          (local (cl-some #'ejira-migrate--local-section-p (ejira-migrate--children))))
       (cond
-       ((= 0 (plist-get b :level))
-        (push b out))
-       ((and (ejira-migrate--task-p b)
-             (not (ejira-migrate--projection-p b)))
-        (let* ((folded (ejira-migrate--fold b))
-               (new-block (car folded))
-               (info (cdr folded)))
-          (when info
-            (cl-incf (plist-get ejira-migrate--counts :folded))
-            (cl-incf (plist-get ejira-migrate--counts
-                                (plist-get info :action)))
-            (when (plist-get info :desc-id)
-              (push (format "- [[id:%s][Description section of %s]]"
-                            (plist-get info :desc-id)
-                            (plist-get info :title))
-                    ejira-migrate--journal))
-            (let* ((hashes (ejira-migrate--baselines info))
-                   (meta-with-hash
-                    (ejira-migrate--set-props
-                     (plist-get new-block :meta)
-                     (list (cons "Pushhash"
-                                 (plist-get hashes :pushhash))
-                           (cons "Statehash"
-                                 (plist-get hashes :statehash))))))
-              (plist-put new-block :meta meta-with-hash)))
-          (push new-block out)))
-       (t
-        (plist-put b :children
-                   (mapcar (lambda (c)
-                             (car (ejira-migrate--transform (list c))))
-                           (plist-get b :children)))
-        (push b out))))
-    (nreverse out)))
+       ((or own local)
+        (if desc
+            (org-with-point-at desc (org-edit-headline ejira-jira-description-heading-name))
+          ;; No description: an empty projection keeps the notes local.
+          (save-excursion
+            (let ((level (1+ (org-current-level))))
+              (if (org-goto-first-child)
+                  (beginning-of-line)
+                (org-end-of-subtree t t))
+              (unless (bolp) (insert "\n"))
+              (insert (make-string level ?*) " " ejira-jira-description-heading-name "\n"))))
+        (list :action 'projection :dropped dropped))
+       (desc (list :action 'folded :desc-id (ejira-migrate--fold-description desc)
+                   :dropped dropped))
+       (t (list :action 'none :dropped dropped))))))
 
-(defun ejira-migrate--run ()
-  (let* ((orig-lines (split-string
-                      (with-temp-buffer
-                        (insert-file-contents ejira-migrate--file)
-                        (buffer-string))
-                      "\n") )
-         (parsed (ejira-migrate--parse orig-lines 0))
-         (ejira-migrate--counts
-          (list :folded 0 :dup 0 :desc-only 0 :diff 0 :none 0
-                :projections 0 :errors 0))
-         (ejira-migrate--journal nil)
-         (new-blocks (mapcar
-                      (lambda (b)
-                        (car (ejira-migrate--transform (list b))))
-                      (car parsed))))
-    (when ejira-migrate--apply
-      (let ((new-text (string-join
-                       (cons "#+PROPERTY: EJIRA_DESCRIPTION_IN_BODY t"
-                             (ejira-migrate--render-block
-                              (list :level 0 :lines nil :children new-blocks)))
-                       "\n")))
-        (with-temp-file ejira-migrate--file
-          (insert new-text "\n"))
-        (with-temp-file
-            (concat (file-name-directory ejira-migrate--file)
-                    "ejira-migration/migration-journal-2026-09-17.org")
-          (insert
-           "#+TITLE: ejira description-fold migration journal\n"
-           (format "#+DATE: %s\n\n" (format-time-string "%Y-%m-%d %H:%M"))
-           (format "- folded: %d (dup %d, desc-only %d, diff %d); projections kept: %d\n\n"
-                   (plist-get ejira-migrate--counts :folded)
-                   (plist-get ejira-migrate--counts :dup)
-                   (plist-get ejira-migrate--counts :desc-only)
-                   (plist-get ejira-migrate--counts :diff)
-                   (plist-get ejira-migrate--counts :projections))
-           "Removed Description section headings (IDs preserved for link recovery):\n"
-           (string-join ejira-migrate--journal "\n")))))
-    (setq ejira-migrate--result
-          (append ejira-migrate--counts
-                  (list :applied ejira-migrate--apply
-                        :journal (length ejira-migrate--journal))))))
+(defun ejira-migrate--fold-description (desc)
+  "Fold the `Description' child at DESC into the body of the task at point.
+The task has no own prose.  Return the `ID' of the removed heading."
+  (let* ((own-beg (save-excursion (ejira--body-start)))
+         (own-end (save-excursion
+                    (org-back-to-heading t)
+                    (org-goto-first-child)
+                    (point)))
+         (desc-id (org-entry-get desc "ID"))
+         (desc-beg (marker-position desc))
+         (desc-end (org-with-point-at desc (org-end-of-subtree t t) (point)))
+         (body (ejira-migrate--trim
+                (mapcar (lambda (l)
+                          (if (ejira-migrate--heading-line-p l) (substring l 1) l))
+                        (ejira-migrate--lines
+                         (org-with-point-at desc (ejira--body-start))
+                         desc-end)))))
+    ;; The description subtree lies after the own body: remove it
+    ;; first, so the body's positions still hold.
+    (delete-region desc-beg desc-end)
+    (delete-region own-beg own-end)
+    (goto-char own-beg)
+    (insert (if body (concat "\n" (string-join body "\n") "\n\n") "\n"))
+    desc-id))
+
+;;; Baselines as the old schema wrote them
+
+(defconst ejira-migrate--issue-types
+  '("ejira-issue" "ejira-story" "ejira-subtask" "ejira-epic")
+  "Heading TYPE values of Jira issues.")
+
+(defun ejira-migrate--issue-heading-p ()
+  "Return the key of the issue heading at point, or nil."
+  (let ((id (org-entry-get nil "ID")))
+    (and id
+         (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" id)
+         (member (org-entry-get nil "TYPE") ejira-migrate--issue-types)
+         id)))
+
+(defun ejira-migrate--content-fields (description)
+  "Content fields of the issue at point, with DESCRIPTION as its description.
+The formula of `ejira--heading-content-fields'."
+  (concat (ejira--push-normalize (ejira--jira-summary))
+          "\0"
+          (ejira--push-normalize description)
+          "\0"
+          (ejira--push-normalize
+           (or (org-entry-get nil ejira-priority-id-property) ""))
+          "\0"
+          (ejira--push-normalize
+           (or (when-let* ((d (org-get-deadline-time (point-marker))))
+                 (format-time-string "%Y-%m-%d" d))
+               ""))))
+
+(defun ejira-migrate--single-hash-content (description)
+  "The content the legacy single `Pushhash' hashed, for the issue at point.
+DESCRIPTION is its description as that layout held it."
+  (concat (ejira--push-normalize (ejira--jira-summary))
+          "\0"
+          (ejira--push-normalize description)
+          "\0"
+          (ejira--push-normalize (or (org-entry-get nil "Assignee") ""))
+          "\0"
+          (ejira--push-normalize
+           (or (save-excursion
+                 (org-back-to-heading t)
+                 (when (looking-at org-priority-regexp)
+                   (match-string 2)))
+               ""))
+          (or (when-let* ((priority-id (org-entry-get nil ejira-priority-id-property)))
+                (concat "\0" (ejira--push-normalize priority-id)))
+              "")
+          "\0"
+          (ejira--push-normalize
+           (or (when-let* ((d (org-get-deadline-time (point-marker))))
+                 (format-time-string "%Y-%m-%d" d))
+               ""))
+          "\0"
+          (ejira--push-normalize (or (org-get-todo-state) ""))))
+
+(defun ejira-migrate--old-issue ()
+  "Read the issue heading at point as the old schema held it.
+Return a plist: :layout (`body', `legacy' or `projection'), and
+:content and :state, the hashes its `LocalHash' takes: a hash string,
+`fresh' (recompute from the migrated heading: it had no pending edit),
+or nil (no baseline).  :content is `equivalent' for a clean legacy
+task, whose description moves: recomputed too.  :stuck is non-nil
+for a legacy single-hash issue with pending edits, which cannot be
+split into content and state.  :was-dirty is non-nil when the issue
+had pending local edits."
+  (let* ((layout (cond ((ejira--jira-projection-p) 'projection)
+                       ((equal "t" (org-entry-get nil "EJIRA_DESCRIPTION_IN_BODY" t)) 'body)
+                       (t 'legacy)))
+         (old-desc (or (pcase layout
+                         ('legacy (when-let* ((d (ejira--find-child-heading "Description")))
+                                    (ejira--get-heading-body d)))
+                         (_ (ejira--jira-description)))
+                       ""))
+         (pushhash (org-entry-get nil "Pushhash"))
+         (statehash (org-entry-get nil "Statehash"))
+         (fields (ejira-migrate--content-fields old-desc)))
+    (append
+     (list :layout layout)
+     (cond
+      ((null pushhash) (list :content nil :state nil))
+      ((and statehash (string-prefix-p "v2:" pushhash))
+       (let ((clean (equal pushhash (concat "v2:" (md5 fields)))))
+         (list :content (if (and clean (eq layout 'legacy)) 'equivalent
+                          (substring pushhash 3))
+               :state statehash
+               :was-dirty (or (not clean)
+                              (not (equal statehash (md5 (ejira--heading-state-fields))))
+                              (ejira--priority-cookie-modified-p)))))
+      ((equal pushhash (md5 (ejira-migrate--single-hash-content old-desc)))
+       (list :content (if (eq layout 'legacy) 'equivalent 'fresh)
+             :state 'fresh))
+      (t (list :stuck t :was-dirty t))))))
+
+;;; Migration
+
+(defun ejira-migrate--org-buffer (text)
+  "Return a new Org buffer holding TEXT, outside any file and hook."
+  (let ((buf (generate-new-buffer " *ejira-migrate*")))
+    (with-current-buffer buf
+      (insert text)
+      (let ((org-mode-hook nil))
+        (delay-mode-hooks (org-mode)))
+      (setq-local org-startup-indented nil))
+    buf))
+
+(defun ejira-migrate--map-headings (fn)
+  "Call FN with point on each heading of the current buffer, in order."
+  (org-with-wide-buffer
+   (goto-char (point-min))
+   (while (re-search-forward org-heading-regexp nil t)
+     (save-excursion
+       (beginning-of-line)
+       (funcall fn))
+     (goto-char (line-end-position)))))
+
+(defun ejira-migrate-file (file)
+  "Return the migration of FILE: (TEXT . REPORT), nothing written.
+TEXT is the migrated content; REPORT a plist describing it, including
+:stuck, issues whose pending edits block the migration."
+  (let* ((old (make-hash-table :test 'equal))
+         (report (list :file file :issues 0 :folded 0 :clean 0 :dirty 0 :dirty-before 0
+                       :no-baseline 0 :comments 0 :dropped 0 :projections nil
+                       :stuck nil
+                       :description-ids nil :duplicate-ids nil))
+         (legacy nil)
+         (ejira--pre-scanning t)
+         text)
+    ;; Read the old baselines, then fold the legacy descriptions, from
+    ;; the last task up so that every fold leaves the positions above it.
+    (let ((buf (ejira-migrate--org-buffer
+                (with-temp-buffer (insert-file-contents file) (buffer-string)))))
+      (unwind-protect
+          (with-current-buffer buf
+            (ejira-migrate--map-headings
+             (lambda ()
+               (when-let* ((key (ejira-migrate--issue-heading-p)))
+                 (if (gethash key old)
+                     (push key (plist-get report :duplicate-ids))
+                   (let ((info (ejira-migrate--old-issue)))
+                     (puthash key info old)
+                     (when (plist-get info :was-dirty)
+                       (cl-incf (plist-get report :dirty-before)))
+                     (when (plist-get info :stuck)
+                       (push key (plist-get report :stuck)))
+                     (when (eq (plist-get info :layout) 'legacy)
+                       (push (point-marker) legacy)))))))
+            ;; `legacy' holds the markers last first.
+            (dolist (m legacy)
+              (goto-char m)
+              (let* ((key (org-entry-get nil "ID"))
+                     (done (ejira-migrate--convert-at-point)))
+                (cl-incf (plist-get report :dropped) (plist-get done :dropped))
+                (pcase (plist-get done :action)
+                  ('folded
+                   (cl-incf (plist-get report :folded))
+                   (when-let* ((desc-id (plist-get done :desc-id)))
+                     (push (cons desc-id key) (plist-get report :description-ids))))
+                  ('projection
+                   (push key (plist-get report :projections))))))
+            (setq text (buffer-substring-no-properties (point-min) (point-max))))
+        (kill-buffer buf)))
+    ;; Drop the layout opt-in and the dated-baseline property, rename
+    ;; the remote hash.
+    (setq text (replace-regexp-in-string
+                "^\\(?:#\\+PROPERTY:[ \t]+EJIRA_DESCRIPTION_IN_BODY\\|[ \t]*:EJIRA_DESCRIPTION_IN_BODY:\\|[ \t]*:Remoteupdated:\\).*\n"
+                "" text))
+    (setq text (replace-regexp-in-string "^\\([ \t]*\\):Remotehash:" "\\1:RemoteHash:" text t))
+    ;; Record the local baselines with the current code.
+    (let ((buf (ejira-migrate--org-buffer text)))
+      (unwind-protect
+          (with-current-buffer buf
+            (ejira-migrate--map-headings
+             (lambda ()
+               (cond
+                ((ejira--comment-heading-p)
+                 (when-let* ((hash (org-entry-get nil "Pushhash")))
+                   (cl-incf (plist-get report :comments))
+                   (org-set-property ejira-local-hash-property hash)
+                   (org-delete-property "Pushhash")))
+                ((when-let* ((key (ejira-migrate--issue-heading-p))
+                             (info (gethash key old)))
+                   (cl-incf (plist-get report :issues))
+                   (ejira-migrate--record-local-baseline info report)
+                   t))
+                ;; Any other heading has no baseline to keep.
+                (t (org-delete-property "Pushhash")
+                   (org-delete-property "Statehash")))))
+            (cons (buffer-substring-no-properties (point-min) (point-max))
+                  report))
+        (kill-buffer buf)))))
+
+(defun ejira-migrate--record-local-baseline (info report)
+  "Write the `LocalHash' of the issue at point from its old baselines INFO.
+See `ejira-migrate--old-issue' for INFO; REPORT is updated."
+  (let ((content (plist-get info :content))
+        (state (plist-get info :state)))
+    ;; A converted task's description is its old one: folded only when
+    ;; the body held nothing else, kept apart as a projection otherwise.
+    ;; Its text moved, so its hash is recomputed.
+    (when (memq content '(fresh equivalent))
+      (setq content (md5 (ejira--heading-content-fields))))
+    (when (eq state 'fresh)
+      (setq state (md5 (ejira--heading-state-fields))))
+    (org-delete-property "Pushhash")
+    (org-delete-property "Statehash")
+    (cond
+     ((plist-get info :stuck))
+     ((and content state)
+      (org-set-property ejira-local-hash-property (concat content " " state))
+      (if (ejira--locally-modified-p)
+          (cl-incf (plist-get report :dirty))
+        (cl-incf (plist-get report :clean))))
+     (t (cl-incf (plist-get report :no-baseline))))))
+
+(defun ejira-migrate-files (files &optional apply)
+  "Migrate FILES to the current schema; write them with APPLY.
+See the commentary of ejira-migrate.el.  Without APPLY, nothing is
+written.  Refuses to write when an issue cannot be migrated (see
+:stuck in the reports) or carries a duplicate ID within its file.
+Return the list of reports."
+  (let* ((results (mapcar (lambda (f) (cons f (ejira-migrate-file f))) files))
+         (reports (mapcar (lambda (r) (cddr r)) results))
+         (blocking (cl-remove-if-not (lambda (r) (or (plist-get r :stuck)
+                                                     (plist-get r :duplicate-ids)))
+                                     reports)))
+    (when (and apply blocking)
+      (user-error "ejira-migrate: not written, issues need a hand first: %S"
+                  (mapcar (lambda (r) (list (plist-get r :file)
+                                            :stuck (plist-get r :stuck)
+                                            :duplicates (plist-get r :duplicate-ids)))
+                          blocking)))
+    (when apply
+      (dolist (r results)
+        (let ((coding-system-for-write 'utf-8-unix))
+          (write-region (cadr r) nil (car r) nil 'silent))))
+    reports))
 
 (provide 'ejira-migrate)
+;;; ejira-migrate.el ends here

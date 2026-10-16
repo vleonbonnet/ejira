@@ -504,126 +504,6 @@ comments. With SHALLOW, only update todo status and assignee."
         (org-fold-core-regions vis-save :override t))))))
     (setq ejira--sync-in-progress nil)))
 
-(defun ejira-repair-descriptions (&optional apply)
-  "Re-render every locally stored JIRA description with the current parser.
-
-Intended as a one-shot migration after parser fixes: it deliberately
-ignores the `Modified' timestamp that normally makes pulls skip
-unchanged issues, because the locally stored body -- not the remote
-text -- is what the fix corrects.  It also normalizes
-`ejira-jira-description-heading-name' projections and creates a
-missing description child.
-
-Only clean headings are touched.  When the pushhash shows unpushed
-local edits the issue is skipped and reported, so local work is never
-overwritten.  Baselines are refreshed from the repaired content, so a
-later push scan sees a clean issue.
-
-Headings whose trimmed content already matches the remote are still
-rewritten when their blank-line boundaries are not canonical: legacy
-bodies carry accumulated leading blanks (one was added on every pull
-by the old narrow-to-body) and a Comments child glued to the last
-paragraph.  The rewrite changes only whitespace around the content,
-so the push baseline stays valid and nothing is sent to Jira.
-
-Without APPLY (or a prefix argument when interactive) nothing is
-written; the report lists what would change.  Returns a plist with
-:repaired, :dirty, :unchanged and :missing keys.
-
-The server is queried by the issue keys that exist locally, in
-batches, rather than by whole projects: projects like SECBUG hold
-thousands of issues, and remote-only issues have nothing to repair."
-  (interactive "P")
-  (ejira--with-transaction
-    (let* ((prefixes (mapcar (lambda (p) (concat p "-")) ejira-projects))
-           (keys (cl-loop for id being the hash-keys of org-id-locations
-                          when (and (stringp id)
-                                    (cl-some (lambda (p) (string-prefix-p p id))
-                                             prefixes))
-                          collect id))
-           (apply-p (and apply t))
-           (local-count (length keys))
-           (repaired nil) (dirty nil) (unchanged 0) (missing-keys nil) (fetched 0)
-           (body-mode-count 0)
-           (buffers nil)
-           (ejira-auto-pull-interval nil)
-           (ejira--syncing t)
-           (ejira--pushing t))
-      (while keys
-    (let* ((batch (seq-take keys 100))
-               (items (apply #'jiralib2-jql-search
-                             (format "key in (%s)" (s-join ", " batch))
-                             '("key" "description"))))
-          (setq keys (nthcdr (length batch) keys))
-          (dolist (item items)
-            (cl-incf fetched)
-            (let* ((key (ejira--alist-get item 'key))
-                   (markup (ejira--alist-get item 'fields 'description))
-                   (m (ejira--find-heading key)))
-              (cond
-               ((not m) (push key missing-keys))
-               ;; Body-as-description headings have no stored description
-               ;; child to re-render; their layout is owned by the new
-               ;; reconcile flow, not this legacy repair path.
-               ((org-with-point-at m (ejira--description-in-body-p))
-        (cl-incf body-mode-count))
-               ((org-with-point-at m (ejira--locally-modified-p))
-        (push key dirty))
-               (t
-        (let ((current (or (ejira--jira-description m) ""))
-                      (expected (condition-case nil
-                                    (let ((ejira-parser-signal-failures t))
-                                      (or (ejira--expected-jira-description m markup) ""))
-                                  (ejira-parser-error :unconvertible))))
-                  (cond
-                   ;; Never re-render into raw markup: report it as dirty
-                   ;; (needs attention) instead.
-                   ((eq expected :unconvertible) (push key dirty))
-                   ((and (equal (string-trim (ejira-parser-inactivate-timestamps current))
-                (string-trim expected))
-             ;; The shape lives in the stored region: `current'
-             ;; has its leading newline stripped.  A missing
-             ;; description child has no shape to repair.
-             (let ((raw (ejira--jira-description-raw m)))
-                           (or (null raw) (ejira--body-shape-canonical-p raw))))
-                    (cl-incf unchanged))
-                   (t
-                    (push key repaired)
-                    (when apply-p
-                      (ejira--set-jira-description-jira-markup key markup)
-                      (cl-pushnew (marker-buffer m) buffers :test #'eq)))))))))))
-      ;; Baselines are recorded after saving: a `before-save-hook' like
-      ;; `whitespace-cleanup' may still adjust the buffer during the save,
-      ;; and a baseline computed before that cleanup would immediately
-      ;; look stale.  Save, re-baseline on the cleaned content, save again.
-      (when apply-p
-    (dolist (buf buffers)
-          (with-current-buffer buf (ejira--save-buffer-safe)))
-    (dolist (key repaired)
-          (let ((m (ejira--find-heading key)))
-            (when m
-              (org-with-point-at m (ejira--update-push-baseline)))))
-    (dolist (buf buffers)
-          (with-current-buffer buf (ejira--save-buffer-safe))))
-      (setq repaired (nreverse repaired) dirty (nreverse dirty))
-      (message "ejira repair%s: %d re-rendered, %d unchanged, %d with local edits (skipped); %d/%d local keys resolved%s"
-               (if apply-p " applied" " preview")
-               (length repaired) unchanged (length dirty)
-               fetched local-count
-               (if (> body-mode-count 0)
-                   (format "; %d body-as-description headings skipped"
-                           body-mode-count)
-         ""))
-      (when dirty
-    (message "ejira repair: skipped pending local push: %s"
-         (s-join ", " (seq-take dirty 10))))
-      (when missing-keys
-    (message "ejira repair: local index entries without a heading: %s"
-         (s-join ", " (seq-take (nreverse missing-keys) 10))))
-      (list :repaired repaired :dirty dirty
-            :unchanged unchanged :missing (nreverse missing-keys) :fetched fetched
-            :local-count local-count :applied apply-p))))
-
 ;;;###autoload
 (defun ejira-update-my-projects (&optional shallow)
   "Synchronize data on projects listed in `ejira-projects'.
@@ -838,21 +718,14 @@ counts its held items in the mode line.")
 (defvar ejira--auto-sync-review-plans nil
   "Plans the running cycle held for review, bound by the cycle.")
 
-(defcustom ejira-auto-sync-async t
-  "When non-nil, automatic reconciliation waits on Jira in the background.
-Each cycle sends its requests at once, and Emacs stays responsive
-until every answer is in; then the cycle is applied.  When nil, the
-requests run one after the other and Emacs waits for them; the idle
-worker then reconciles one file per call.  Meant for debugging."
-  :group 'ejira
-  :type 'boolean)
-
 (defcustom ejira-auto-sync-full-fetch-interval 3600
   "Seconds between the cycles of a file that fetch every issue from Jira.
 In between, a cycle first asks Jira only for the update time of each
-issue, and fetches the issues whose time moved since their stored
-remote baseline (see `ejira-remote-updated-property'), the issues with
-local changes and those without a baseline.  A full fetch also catches
+issue, and fetches the issues whose time moved since their remote
+baseline (`Modified', see `ejira-remote-hash-property'), the issues
+with local changes and those without a baseline.  The time is stored to
+the second, so two Jira changes within the same second as the stored
+one wait for the next full fetch.  A full fetch also catches
 a change Jira made without moving the update time.  The first cycle of
 each file in a session is full, and so is `ejira-auto-sync-review'
 with a prefix argument.  nil means only those."
@@ -878,7 +751,7 @@ Set by `ejira-auto-sync-review'.")
   (file nil :documentation "The file's true name.")
   (review nil :documentation "Non-nil: what the cycle holds is offered for review.")
   (full nil :documentation "Non-nil: fetch every issue, not only those Jira changed.")
-  (async nil :documentation "Non-nil: wait on Jira in the background.")
+  (audit nil :documentation "Non-nil: a read-only audit; nothing is applied.")
   (round nil :documentation "The `ejira--round' running the cycle, or nil.")
   (mtime nil :documentation "The file's modification time when the cycle started.")
   (restarts 0 :documentation "Times the buffer changed during the fetch.")
@@ -938,7 +811,7 @@ of projects outside `ejira-projects': ejira does not sync them."
   "Return the remote baselines of the issue headings in the buffer.
 One (KEY . PLIST) per key of `ejira--buffer-issue-keys', in buffer
 order, for the first heading carrying KEY.  PLIST holds :hash, the
-`Remotehash'; :updated, the `Remoteupdated'; :dirty, non-nil when
+`RemoteHash'; :updated, the `Modified' dating it; :dirty, non-nil when
 the heading has local changes to push; and :comments-dirty, non-nil
 when one of its comments has."
   (let (res comment-keys)
@@ -958,26 +831,13 @@ when one of its comments has."
                 (ejira--synced-key-p id)
                 (not (assoc id res)))
            (push (cons id (list :hash (org-entry-get nil ejira-remote-hash-property)
-                                :updated (org-entry-get nil ejira-remote-updated-property)
+                                :updated (org-entry-get nil "Modified")
                                 :dirty (and (ejira--locally-modified-p) t)))
                  res))))))
     (dolist (entry res)
       (when (member (car entry) comment-keys)
         (setcdr entry (plist-put (cdr entry) :comments-dirty t))))
     (nreverse res)))
-
-(defun ejira--auto-sync-fetch (keys)
-  "Fetch issues KEYS from Jira in batches, as item alists."
-  (let (items)
-    (while keys
-      (let ((batch (seq-take keys ejira--auto-sync-batch-size)))
-        (setq keys (seq-drop keys ejira--auto-sync-batch-size))
-        (setq items
-              (append items
-                      (apply #'jiralib2-jql-search
-                             (format "key in (%s)" (s-join ", " batch))
-                             (ejira--get-fields-to-sync nil))))))
-    items))
 
 ;;; Held-issue indicator
 
@@ -1062,8 +922,7 @@ and for issues changed on both sides, in all the files; see
 FULL, fetch every issue from Jira instead of only those Jira changed
 \(see `ejira-auto-sync-full-fetch-interval').
 
-With `ejira-auto-sync-async', the command returns at once; the review
-opens when Jira has answered."
+The command returns at once; the review opens when Jira has answered."
   (interactive "P")
   (dolist (file (ejira--auto-sync-files))
     (ejira--auto-sync-enqueue file t)
@@ -1078,8 +937,7 @@ opens when Jira has answered."
     (message "ejira auto-sync: a Jira sync is running; the review follows it")
     (ejira--auto-sync-kick))
    ((ejira--auto-sync-due-files)
-    (when ejira-auto-sync-async
-      (message "ejira auto-sync: asking Jira%s..." (if full " for every issue" "")))
+    (message "ejira auto-sync: asking Jira%s..." (if full " for every issue" ""))
     (ejira--auto-sync-start-round (ejira--auto-sync-due-files)))
    (t (setq ejira--auto-sync-report-pending nil)
       (message "ejira auto-sync: no file to sync"))))
@@ -1284,19 +1142,10 @@ Return nil when BUF has no issue that can have children."
   (cl-remove-if (lambda (item) (member (ejira--alist-get item 'key) present))
                 items))
 
-(defun ejira--auto-sync-discover-items (buf)
-  "Return REST items that belong under issues of BUF but are absent from it.
-Children are found by epic link (for epic headings) and by parent (for
-the other issue headings); see `ejira-auto-sync-discover'."
-  (when-let* ((query (ejira--auto-sync-discover-query buf)))
-    (ejira--auto-sync-discover-missing
-     (apply #'jiralib2-jql-search (car query) (ejira--get-fields-to-sync nil))
-     (cdr query))))
-
 (defun ejira--auto-sync-import (item buf &optional on-hold)
   "Import REST ITEM under its parent heading in BUF; return non-nil on success.
-The heading is created directly under the parent so it inherits the
-file's layout (body-as-description), then pulled and baselined.  An
+The heading is created directly under the parent, then pulled, which
+records its baselines.  An
 issue already present in another file is pulled, which refiles it
 here.  An issue created by a creation whose response was lost is
 pulled onto the journaled heading (see `ejira--adopt-creation-journal').
@@ -1314,9 +1163,7 @@ A conversion failure is reported through ON-HOLD (see
                                    (ejira--creation-journal-for (ejira--parse-item item))))
                        (ejira--new-heading buf parent key))))
         (if (ejira--update-task-or-hold item on-hold)
-            (when-let* ((m (ejira--find-heading key)))
-              (org-with-point-at m (ejira--store-remote-baseline item))
-              t)
+            (and (ejira--find-heading key) t)
           ;; Held: remove the empty placeholder so the next cycle retries
           ;; discovery instead of seeing a heading with no content.
           (when created
@@ -1401,26 +1248,25 @@ timestamp is active (JIRA dates import as inactive timestamps)."
         (push (format "comment %s missing in Jira" (car l)) diffs)))
     (nreverse diffs)))
 
-(defun ejira-sync-audit-file (file)
-  "Compare every ejira heading of FILE with Jira, without changing anything.
-Return a plist:
+(defun ejira--sync-audit-report (buf items missing)
+  "Compare the ejira headings of BUF with REST ITEMS, Jira's version of them.
+MISSING are the REST items of the unresolved Jira children absent from
+BUF.  Return a plist:
   :rows      one (KEY :class CLASS :diffs DIFFS :dirty D :baseline B)
              per issue heading, CLASS being `identical', `local-newer'
              (differs, edited locally, remote unchanged since the
              baseline), `unknown-baseline' (differs, edited locally, no
              remote baseline), `remote-newer' (differs, no local edit),
              `both-changed', `unconvertible' or `missing-in-jira';
-  :missing   REST keys of unresolved Jira children absent from FILE;
+  :missing   keys of MISSING;
   :local-only titles of TODO headings with no Jira identity;
   :duplicates (KEY . FILES) for keys carried by more than one heading;
   :summary   counts per class."
-  (let* ((buf (find-file-noselect file t))
-         (ejira--heading-cache (make-hash-table :test 'equal))
-         rows missing local-only duplicates)
+  (let ((ejira--heading-cache (make-hash-table :test 'equal))
+        rows local-only duplicates)
     (with-current-buffer buf
       (org-with-wide-buffer
        (let* ((keys (ejira--buffer-issue-keys))
-              (items (ejira--auto-sync-fetch keys))
               (by-key (mapcar (lambda (i) (cons (ejira--alist-get i 'key) i)) items)))
          (dolist (key keys)
            (let ((item (cdr (assoc key by-key)))
@@ -1482,9 +1328,6 @@ Return a plist:
            (dolist (key keys)
              (when (> (length (gethash key locations)) 1)
                (push (cons key (gethash key locations)) duplicates))))
-         (let ((ejira-auto-sync-discover 'unresolved))
-           (setq missing (mapcar (lambda (i) (ejira--alist-get i 'key))
-                                 (ejira--auto-sync-discover-items buf))))
          (goto-char (point-min))
          (while (re-search-forward org-heading-regexp nil t)
            (when (and (org-get-todo-state)
@@ -1496,41 +1339,78 @@ Return a plist:
       (dolist (r rows)
         (let ((c (plist-get (cdr r) :class)))
           (setf (alist-get c summary) (1+ (alist-get c summary 0)))))
-      (list :rows rows :missing missing :local-only (nreverse local-only)
+      (list :rows rows
+            :missing (mapcar (lambda (i) (ejira--alist-get i 'key)) missing)
+            :local-only (nreverse local-only)
             :duplicates duplicates :summary summary))))
+
+(defun ejira-sync-audit-file (file done)
+  "Compare every ejira heading of FILE with Jira, without changing anything.
+Jira is asked in the background, every issue of FILE and its unresolved
+children at once; DONE is then called with the audit plist (see
+`ejira--sync-audit-report'), or with (:error MESSAGE) when a request
+failed."
+  (let* ((buf (find-file-noselect file t))
+         (cycle (ejira--cycle-make :file file :full t :audit t))
+         (snap (list :buf buf
+                     :keys (with-current-buffer buf (ejira--buffer-issue-keys))
+                     :discover (let ((ejira-auto-sync-discover 'unresolved))
+                                 (ejira--auto-sync-discover-query buf)))))
+    (ejira--auto-sync-gather
+     cycle snap
+     (lambda (remote)
+       (run-at-time 0 nil
+                    (lambda ()
+                      (funcall done (ejira--sync-audit-report
+                                     buf (plist-get remote :items)
+                                     (plist-get remote :discovered))))))
+     (lambda (err)
+       (run-at-time 0 nil done (list :error (error-message-string err)))))))
+
+(defun ejira--sync-audit-show (audits)
+  "Show AUDITS, a list of (FILE . AUDIT), in the `*ejira sync audit*' buffer."
+  (with-current-buffer (get-buffer-create "*ejira sync audit*")
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (dolist (a audits)
+        (let ((r (cdr a)))
+          (insert (format "* %s\n" (car a)))
+          (if-let* ((err (plist-get r :error)))
+              (insert (format "  failed: %s\n" err))
+            (insert (format "  summary: %S\n" (plist-get r :summary)))
+            (dolist (row (plist-get r :rows))
+              (unless (eq (plist-get (cdr row) :class) 'identical)
+                (insert (format "  %-12s %-16s %s\n" (car row)
+                                (plist-get (cdr row) :class)
+                                (s-join "; " (plist-get (cdr row) :diffs))))))
+            (dolist (k (plist-get r :missing))
+              (insert (format "  %-12s %-16s\n" k 'missing-locally)))
+            (dolist (d (plist-get r :duplicates))
+              (insert (format "  %-12s %-16s %s\n" (car d) 'duplicate
+                              (s-join ", " (cdr d)))))
+            (dolist (h (plist-get r :local-only))
+              (insert (format "  %-12s %-16s %s\n" "-" 'local-only h)))))))
+    (goto-char (point-min))
+    (special-mode))
+  (pop-to-buffer "*ejira sync audit*"))
 
 (defun ejira-sync-audit (&optional file)
   "Audit FILE (default: each auto-sync file) against Jira.
-Read-only: nothing is pulled, pushed or baselined.  Show the report in
-the `*ejira sync audit*' buffer and return the audit plists."
+Read-only: nothing is pulled, pushed or baselined.  Jira is asked in
+the background; the report opens in the `*ejira sync audit*' buffer
+when every file has its answers."
   (interactive)
   (let* ((files (if file (list file) (ejira--auto-sync-files)))
-         (audits (mapcar (lambda (f) (cons f (ejira-sync-audit-file f))) files)))
-    (when (called-interactively-p 'any)
-      (with-current-buffer (get-buffer-create "*ejira sync audit*")
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (dolist (a audits)
-            (let ((r (cdr a)))
-              (insert (format "* %s
-" (car a)))
-              (insert (format "  summary: %S\n" (plist-get r :summary)))
-              (dolist (row (plist-get r :rows))
-                (unless (eq (plist-get (cdr row) :class) 'identical)
-                  (insert (format "  %-12s %-16s %s\n" (car row)
-                                  (plist-get (cdr row) :class)
-                                  (s-join "; " (plist-get (cdr row) :diffs))))))
-              (dolist (k (plist-get r :missing))
-                (insert (format "  %-12s %-16s\n" k 'missing-locally)))
-              (dolist (d (plist-get r :duplicates))
-                (insert (format "  %-12s %-16s %s\n" (car d) 'duplicate
-                                (s-join ", " (cdr d)))))
-              (dolist (h (plist-get r :local-only))
-                (insert (format "  %-12s %-16s %s\n" "-" 'local-only h))))))
-        (goto-char (point-min))
-        (special-mode))
-      (pop-to-buffer "*ejira sync audit*"))
-    audits))
+         (audits nil)
+         (pending (length files)))
+    (message "ejira: auditing %d file(s) against Jira..." pending)
+    (dolist (f files)
+      (ejira-sync-audit-file
+       f (lambda (audit)
+           (push (cons f audit) audits)
+           (when (= (cl-decf pending) 0)
+             (ejira--sync-audit-show
+              (mapcar (lambda (f) (assoc f audits)) files))))))))
 
 (defun ejira--auto-sync-hold-line (plan)
   "Return the held-item line describing push PLAN."
@@ -1593,10 +1473,10 @@ when the cycle opens the review buffer itself."
 ;; file: the issue keys it holds and their baselines.  The fetch asks
 ;; Jira about them and changes nothing.  The apply step checks that the
 ;; buffer is still the one the snapshot read, then pulls, imports and
-;; holds against the answers.  With `ejira-auto-sync-async' the fetch
-;; runs in the background, its requests in parallel, so Emacs never
-;; waits on Jira for a cycle.  A round runs the cycles of several files
-;; together and opens a single review for all of them.
+;; holds against the answers.  The fetch runs in the background, its
+;; requests in parallel, so Emacs never waits on Jira for a cycle.  A
+;; round runs the cycles of several files together and opens a single
+;; review for all of them.
 
 (defconst ejira--auto-sync-restart-limit 2
   "Times a round restarts a cycle whose buffer changed during the fetch.
@@ -1657,62 +1537,53 @@ file changed on disk is reloaded first."
             (< (gethash (ejira--alist-get a 'key) pos most-positive-fixnum)
                (gethash (ejira--alist-get b 'key) pos most-positive-fixnum))))))
 
-(defun ejira--auto-sync-fetch-issues (cycle keys k fail)
-  "Fetch issues KEYS for CYCLE with the synced fields; call K with the items.
-An asynchronous CYCLE sends one search per batch of
-`ejira--auto-sync-batch-size' keys, all at once, and calls FAIL with
-the error of the first that fails."
-  (if (not (ejira--cycle-async cycle))
-      (funcall k (ejira--auto-sync-fetch keys))
-    (let* ((batches (seq-partition keys ejira--auto-sync-batch-size))
-           (pending (length batches))
-           (results (make-vector pending nil))
-           (failed nil))
-      (if (= pending 0)
-          (funcall k nil)
-        (cl-loop
-         for batch in batches
-         for i from 0
-         do (let ((i i))
-              (ejira--async-jql
-               (format "key in (%s)" (s-join ", " batch))
-               (ejira--get-fields-to-sync nil)
-               (lambda (items)
-                 (unless failed
-                   (aset results i items)
-                   (when (= (cl-decf pending) 0)
-                     (funcall k (apply #'append (append results nil))))))
-               (lambda (err)
-                 (unless failed
-                   (setq failed t)
-                   (funcall fail err))))))))))
+(defun ejira--auto-sync-fetch-issues (keys k fail)
+  "Fetch issues KEYS with the synced fields; call K with the items.
+One search per batch of `ejira--auto-sync-batch-size' keys, all sent
+at once; FAIL is called with the error of the first that fails."
+  (let* ((batches (seq-partition keys ejira--auto-sync-batch-size))
+         (pending (length batches))
+         (results (make-vector pending nil))
+         (failed nil))
+    (if (= pending 0)
+        (funcall k nil)
+      (cl-loop
+       for batch in batches
+       for i from 0
+       do (let ((i i))
+            (ejira--async-jql
+             (format "key in (%s)" (s-join ", " batch))
+             (ejira--get-fields-to-sync nil)
+             (lambda (items)
+               (unless failed
+                 (aset results i items)
+                 (when (= (cl-decf pending) 0)
+                   (funcall k (apply #'append (append results nil))))))
+             (lambda (err)
+               (unless failed
+                 (setq failed t)
+                 (funcall fail err)))))))))
 
-(defun ejira--auto-sync-fetch-updated (cycle keys k fail)
-  "Fetch the update time of issues KEYS for CYCLE; call K with the items.
-An asynchronous CYCLE calls FAIL with the error of a failed search."
-  (let ((jql (format "key in (%s)" (s-join ", " keys))))
-    (if (ejira--cycle-async cycle)
-        (ejira--async-jql jql '("updated") k fail)
-      (funcall k (jiralib2-jql-search jql "updated")))))
+(defun ejira--auto-sync-fetch-updated (keys k fail)
+  "Fetch the update time of issues KEYS; call K with the items, or FAIL."
+  (ejira--async-jql (format "key in (%s)" (s-join ", " keys)) '("updated") k fail))
 
-(defun ejira--auto-sync-fetch-discovered (cycle snap k fail)
+(defun ejira--auto-sync-fetch-discovered (snap k fail)
   "Fetch the Jira children missing from the file of SNAP; call K with them.
-See `ejira-auto-sync-discover'.  An asynchronous CYCLE calls FAIL with
-the error of a failed search."
-  (if (ejira--cycle-async cycle)
-      (let ((query (plist-get snap :discover)))
-        (ejira--async-jql (car query) (ejira--get-fields-to-sync nil)
-                          (lambda (items)
-                            (funcall k (ejira--auto-sync-discover-missing
-                                        items (cdr query))))
-                          fail))
-    (funcall k (ejira--auto-sync-discover-items (plist-get snap :buf)))))
+See `ejira-auto-sync-discover'.  FAIL is called with the error of a
+failed search."
+  (let ((query (plist-get snap :discover)))
+    (ejira--async-jql (car query) (ejira--get-fields-to-sync nil)
+                      (lambda (items)
+                        (funcall k (ejira--auto-sync-discover-missing
+                                    items (cdr query))))
+                      fail)))
 
 (defun ejira--auto-sync-scheme-keys (items discovered baselines)
   "Return the keys whose priority scheme an apply step may ask Jira for.
 A push plan asks for the scheme of every dirty issue among the REST
 ITEMS.  A pull or an import asks for it when the item carries a
-priority: the ITEMS differing from their `Remotehash' in BASELINES,
+priority: the ITEMS differing from their `RemoteHash' in BASELINES,
 and the DISCOVERED items."
   (delete-dups
    (delq nil
@@ -1763,25 +1634,24 @@ again, and reports the failure, when the scheme is needed."
                (funcall k)))))))))
 
 (defun ejira--auto-sync-gather (cycle snap done fail)
-  "Ask Jira what CYCLE needs to know about SNAP.
+  "Ask Jira, in the background, what CYCLE needs to know about SNAP.
 Call DONE with a plist: :items, the REST items of the fetched issues
 in file order, and :discovered, the Jira children missing from the
 file (see `ejira-auto-sync-discover').  Or call FAIL with the error of
 a failed request: never both, and each at most once.
 
-Unless the cycle is full, an issue whose `Remoteupdated' still equals
-Jira's update time is not fetched.  Jira moves that time on every
-change of the issue, comments included, so its fields still hash to
-the stored `Remotehash', and the apply step would do nothing with it.
+Unless the cycle is full, an issue whose `Modified' still equals Jira's
+update time is not fetched.  Jira moves that time on every change of
+the issue, comments included, so its fields still hash to the stored
+`RemoteHash', and the apply step would do nothing with it.
 One light search asks for the update times of all such issues.  An
 issue with local changes (its own or its comments'), or lacking either
 property, is always fetched: the apply step classifies it, and push
 plans compare against it.
 
-With an asynchronous CYCLE every search is sent at once, DONE and FAIL
-run later from the requests' callbacks, and the priority schemes the
-apply step will need are cached first, so it never waits on Jira.
-Otherwise the searches run in turn, and DONE runs before this returns."
+Every search is sent at once, and DONE and FAIL run from the requests'
+callbacks.  Unless CYCLE is an audit, the priority schemes the apply
+step will need are cached first, so that it never waits on Jira."
   (let* ((keys (plist-get snap :keys))
          (baselines (plist-get snap :baselines))
          (candidates
@@ -1796,11 +1666,11 @@ Otherwise the searches run in turn, and DONE runs before this returns."
              keys)))
          (direct (cl-remove-if (lambda (k) (member k candidates)) keys))
          ;; One count per awaited answer, plus one held until every
-         ;; request is sent: answers given at once (synchronous cycles)
-         ;; must not end the gathering early.
+         ;; request is sent: an answer given at once (a request that
+         ;; failed to start) must not end the gathering early.
          (pending 1)
          (failed nil)
-         (schemes-cached (not (ejira--cycle-async cycle)))
+         (schemes-cached (ejira--cycle-audit cycle))
          (fetched nil)
          (discovered nil))
     (cl-labels
@@ -1823,7 +1693,7 @@ Otherwise the searches run in turn, and DONE runs before this returns."
            (when ks
              (cl-incf pending)
              (ejira--auto-sync-fetch-issues
-              cycle ks
+              ks
               (answer (lambda (items) (setq fetched (append fetched items))))
               #'abort)))
          (settle ()
@@ -1840,13 +1710,13 @@ Otherwise the searches run in turn, and DONE runs before this returns."
       (when (plist-get snap :discover)
         (cl-incf pending)
         (ejira--auto-sync-fetch-discovered
-         cycle snap
+         snap
          (answer (lambda (items) (setq discovered items)))
          #'abort))
       (when candidates
         (cl-incf pending)
         (ejira--auto-sync-fetch-updated
-         cycle candidates
+         candidates
          (answer
           (lambda (items)
             ;; Fetch those whose time moved, and those Jira left out.
@@ -1855,9 +1725,10 @@ Otherwise the searches run in turn, and DONE runs before this returns."
                       (let ((item (cl-find k items
                                            :key (lambda (i) (ejira--alist-get i 'key))
                                            :test #'equal)))
-                        (and item
-                             (equal (ejira--alist-get item 'fields 'updated)
-                                    (plist-get (cdr (assoc k baselines)) :updated)))))
+                        (when-let* ((updated (and item (ejira--alist-get
+                                                        item 'fields 'updated))))
+                          (equal (ejira--remote-time updated)
+                                 (plist-get (cdr (assoc k baselines)) :updated)))))
                     candidates))))
          #'abort))
       (fetch direct)
@@ -1963,12 +1834,12 @@ again."
                   ;; and has not moved: with no baseline, "not changed
                   ;; remotely" is UNKNOWN, and an automatic push could
                   ;; overwrite unseen remote work.  Fail closed.  The
-                  ;; baseline still holds: date it.
+                  ;; remote baseline still holds: date it.
                   ((and dirty (not remote-unknown-p) (not remote-changed-p))
-                   (ejira--note-remote-updated m item))
+                   (ejira--date-remote-baseline m item))
                   ;; Remote-only change, or no baseline yet: a pull
-                  ;; applies the remote state and establishes the
-                  ;; baseline (a no-op fetch for unchanged issues).
+                  ;; applies the remote state and records both
+                  ;; baselines (a no-op fetch for unchanged issues).
                   ((and (not dirty)
                         (or remote-changed-p remote-unknown-p))
                    (push item pulls))
@@ -1987,7 +1858,7 @@ again."
                   ;; Clean and unchanged: the baseline still holds.
                   ;; Dated, the next cycles need not fetch it.
                   ((and m stored)
-                   (ejira--note-remote-updated m item)))))
+                   (ejira--date-remote-baseline m item)))))
              ;; Imports and pulls rewrite whole subtrees: they run
              ;; on the shown buffer.  Reading, dating baselines and
              ;; building plans need no unfolding, which costs a large
@@ -2013,12 +1884,9 @@ again."
                                                   (format "%s: locally edited comments; pull deferred"
                                                           key))
                                             conflicts))
-                             (when (let ((ejira--force-full-update t))
-                                     (ejira--update-task-or-hold item on-hold))
-                               ;; The heading may have been refiled; re-find it.
-                               (when-let* ((m (ejira--find-heading key)))
-                                 (org-with-point-at m
-                                   (ejira--store-remote-baseline item))))))))
+                             ;; The pull records both baselines.
+                             (let ((ejira--force-full-update t))
+                               (ejira--update-task-or-hold item on-hold))))))
                    (org-fold-core-regions vis :override t))))
              ;; Pulls and imports reach the file before the plans
              ;; are built.
@@ -2117,33 +1985,6 @@ again."
                    (ejira--save-buffer-safe))))))))
       'done)))
 
-(defun ejira--auto-sync-reconcile (file &optional review full)
-  "Run one reconciliation cycle for FILE now, waiting on Jira.
-With REVIEW, open the review buffer for what it holds; with FULL,
-fetch every issue (see `ejira-auto-sync-full-fetch-interval').  See
-`ejira--auto-sync-apply' for what the cycle does.  When the buffer
-changed while Jira answered, the answers are dropped, and the file is
-queued for another cycle.  An error is signaled.  Return the outcome:
-`done', `restart', or nil when the cycle was deferred.  The automatic
-rounds run cycles through `ejira--auto-sync-start-cycle' instead."
-  (let* ((cycle (ejira--cycle-make :file file :review review
-                                   :full (and (or full (ejira--auto-sync-full-due-p file)) t)))
-         (snap (ejira--auto-sync-snapshot cycle))
-         (outcome nil))
-    (when (consp snap)
-      (ejira--auto-sync-gather
-       cycle snap
-       (lambda (remote) (setq outcome (ejira--auto-sync-apply cycle snap remote)))
-       (lambda (err) (signal (car err) (cdr err)))))
-    (pcase outcome
-      ('restart (ejira--auto-sync-enqueue file review))
-      ('done
-       (when (ejira--cycle-full cycle)
-         (puthash file (float-time) ejira--auto-sync-full-fetch-times))
-       (when-let* ((plans (ejira--cycle-plans cycle)))
-         (run-at-time 0 nil #'ejira--auto-sync-show-review plans))))
-    outcome))
-
 ;;; Rounds
 
 (defun ejira--auto-sync-ready-p ()
@@ -2182,7 +2023,6 @@ for review, and fetches every issue when that is due."
                     :file file
                     :review (and (member file ejira--auto-sync-review-queue) t)
                     :full (and (ejira--auto-sync-full-due-p file) t)
-                    :async ejira-auto-sync-async
                     :round round
                     :mtime (ignore-errors
                              (file-attribute-modification-time (file-attributes file))))))
@@ -2191,14 +2031,11 @@ for review, and fetches every issue when that is due."
               ejira--auto-sync-full-queue (delete file ejira--auto-sync-full-queue))
         (ejira--auto-sync-start-cycle cycle)))))
 
-(defun ejira--auto-sync-continue (cycle fn &rest args)
-  "Call FN with ARGS to continue CYCLE once Jira answered.
-A synchronous cycle continues at once.  An asynchronous one continues
-from a timer: Jira's answers arrive in a process sentinel, where
-quitting is inhibited and errors are lost."
-  (if (ejira--cycle-async cycle)
-      (apply #'run-at-time 0 nil fn args)
-    (apply fn args)))
+(defun ejira--auto-sync-continue (fn &rest args)
+  "Call FN with ARGS from a timer, once Jira answered.
+Jira's answers arrive in a process sentinel, where quitting is
+inhibited and errors are lost."
+  (apply #'run-at-time 0 nil fn args))
 
 (defun ejira--auto-sync-start-cycle (cycle)
   "Take the snapshot of CYCLE and send its fetch.
@@ -2211,10 +2048,10 @@ The apply step follows when every answer is in; see
           (ejira--auto-sync-gather
            cycle snap
            (lambda (remote)
-             (ejira--auto-sync-continue cycle #'ejira--auto-sync-finish-cycle
+             (ejira--auto-sync-continue #'ejira--auto-sync-finish-cycle
                                         cycle snap remote))
            (lambda (err)
-             (ejira--auto-sync-continue cycle #'ejira--auto-sync-end-cycle
+             (ejira--auto-sync-continue #'ejira--auto-sync-end-cycle
                                         cycle 'error err)))))
     (error (ejira--auto-sync-end-cycle cycle 'error err))))
 
@@ -2318,8 +2155,7 @@ Then have the worker run again if files became due meanwhile."
 Files saved or changed during a round wait for it to end, and the
 repeating idle timer only runs again after the next input.  A file
 whose buffer holds unsaved edits waits for its save instead."
-  (when (and ejira-auto-sync-async
-             ejira--auto-sync-timer
+  (when (and ejira--auto-sync-timer
              (cl-some (lambda (f)
                         (let ((b (get-file-buffer f)))
                           (not (and b (buffer-modified-p b)))))
@@ -2341,20 +2177,16 @@ are dropped."
       (ejira--auto-sync-indicator-update))))
 
 (defun ejira--auto-sync-worker ()
-  "Start a round for the auto-sync files due for a cycle.
-An asynchronous round takes every due file at once.  A synchronous one
-takes one file per call, so input between files is never held up by a
-whole round of blocking cycles; the idle timer calls again.  Each call
-first refreshes the indicator: a buffer may have come to conflict with
-its file since the last call."
+  "Start a round for every auto-sync file due for a cycle.
+Each call first refreshes the indicator: a buffer may have come to
+conflict with its file since the last call."
   (ejira--auto-sync-indicator-update)
   (ejira--auto-sync-expire-round)
   (when (and (ejira--auto-sync-files)
              (not ejira--auto-sync-round)
              (ejira--auto-sync-ready-p))
     (when-let* ((files (ejira--auto-sync-due-files)))
-      (ejira--auto-sync-start-round
-       (if ejira-auto-sync-async files (list (car files)))))))
+      (ejira--auto-sync-start-round files))))
 
 (defun ejira--start-auto-sync ()
   "Start the automatic reconciliation timer for the auto-sync files.
