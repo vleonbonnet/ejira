@@ -566,7 +566,11 @@ the same way."
                                     (md5 (ejira--heading-reviewed-hash)))))))
       (when remote-identity
         (org-set-property ejira-remote-hash-property
-                          (md5 remote-identity)))
+                          (md5 remote-identity))
+        ;; Hashed from the values sent, not from a fetch: Jira's update
+        ;; time after the push is unknown until the next fetch.
+        (org-set-property ejira-remote-updated-property
+                          ejira-remote-updated-unknown))
       (when priority
         (ejira--record-priority-identity priority))
       (if changed
@@ -884,8 +888,27 @@ the same way."
          (ejira--push-scan-buffer (find-file-noselect f t))))
      (org-agenda-files))))
 
-(defun ejira--push-build-plans (pending-ops)
-  "Build plan plists from PENDING-OPS."
+(defun ejira--embedded-comment (items issue-key commid)
+  "Return comment COMMID of ISSUE-KEY as embedded in the REST ITEMS, or nil.
+A search fetching the `comment' field embeds the issue's comment page.
+nil when no item is ISSUE-KEY's, or when its page is incomplete: the
+caller then fetches the comment itself."
+  (when-let* ((item (cl-find issue-key items
+                             :key (lambda (i) (ejira--alist-get i 'key))
+                             :test #'equal))
+              (page (ejira--alist-get item 'fields 'comment))
+              (comments (alist-get 'comments page)))
+    (when (or (null (alist-get 'total page))
+              (= (length comments) (alist-get 'total page)))
+      (cl-find (format "%s" commid) comments
+               :key (lambda (c) (format "%s" (ejira--alist-get c 'id)))
+               :test #'equal))))
+
+(defun ejira--push-build-plans (pending-ops &optional remote-items)
+  "Build plan plists from PENDING-OPS.
+REMOTE-ITEMS are REST items the caller already fetched with the synced
+fields (an automatic cycle fetched them a moment ago); the issues and
+comments they do not cover are fetched here."
   (let ((plans nil)
         (issue-update-ops nil)
         (other-ops nil))
@@ -896,12 +919,24 @@ the same way."
         (push op other-ops)))
     (when issue-update-ops
       (let* ((keys (mapcar (lambda (op) (plist-get op :key)) issue-update-ops))
+             (known (cl-remove-if-not
+                     (lambda (i) (member (ejira--alist-get i 'key) keys))
+                     remote-items))
+             (missing (cl-remove-if
+                       (lambda (k)
+                         (cl-find k known :key (lambda (i) (ejira--alist-get i 'key))
+                                  :test #'equal))
+                       keys))
              (remote-items
-              (apply #'jiralib2-jql-search
-                     (format "key in (%s)" (s-join ", " keys))
-                     ;; `comment' feeds the remote identity stored on success.
-                     '("summary" "description" "assignee" "priority" "duedate" "status"
-                       "comment"))))
+              (append
+               known
+               (when missing
+                 (apply #'jiralib2-jql-search
+                        (format "key in (%s)" (s-join ", " missing))
+                        ;; `comment' feeds the remote identity stored on
+                        ;; success, `updated' the time it dates from.
+                        '("summary" "description" "assignee" "priority" "duedate" "status"
+                          "comment" "updated"))))))
         (dolist (op issue-update-ops)
           (let* ((key (plist-get op :key))
                  (marker (plist-get op :marker))
@@ -922,9 +957,9 @@ the same way."
                                (if (ejira--description-in-body-p)
                                    (org-current-level)
                                  (when-let* ((d (ejira--find-child-heading
-                                                (if (ejira--jira-projection-p)
-                                                    ejira-jira-description-heading-name
-                                                  ejira-description-heading-name))))
+                                                 (if (ejira--jira-projection-p)
+                                                     ejira-jira-description-heading-name
+                                                   ejira-description-heading-name))))
                                    (ejira--heading-body-level d)))))
                  (local-assignee (or (org-entry-get marker "Assignee") ""))
                  (priority-scheme (when item (ejira--get-priority-scheme key)))
@@ -1123,7 +1158,8 @@ the same way."
          ((and (eq op-type 'update) (eq object 'comment))
           (let* ((issue-key (plist-get data :issue-key))
                  (commid (plist-get data :commid))
-                 (comment-data (jiralib2-get-comment issue-key commid))
+                 (comment-data (or (ejira--embedded-comment remote-items issue-key commid)
+                                   (jiralib2-get-comment issue-key commid)))
                  (remote-body (when comment-data (ejira--alist-get comment-data 'body)))
                  (remote-org (when comment-data
                                (ejira--expected-org-body marker remote-body)))

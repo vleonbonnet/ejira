@@ -2900,6 +2900,7 @@ An external change runs the same cycle without opening anything."
    (let* ((file (file-truename (expand-file-name "TEST.org" ejira-org-directory)))
           (buf (find-file-noselect file t))
           (ejira-auto-sync-files (list file))
+          (ejira-auto-sync-async nil)
           (ejira-epic-field 'customfield_10857)
           (ejira--auto-sync-queue nil)
           (ejira--auto-sync-review-queue nil)
@@ -2963,20 +2964,26 @@ auto-sync by default; nothing has to be listed."
                                       (delete-file f))))))
 
 (ert-deftest ejira-auto-sync/worker-reconciles-one-file-per-call ()
-  "Each worker call reconciles one file, so input is not held up by a
-whole round of cycles; the rest wait for the next idle call."
+  "Without `ejira-auto-sync-async', each worker call reconciles one
+file, so input is not held up by a whole round of blocking cycles; the
+rest wait for the next idle call."
   (let* ((a (make-temp-file "ejira-a-" nil ".org"))
          (b (make-temp-file "ejira-b-" nil ".org"))
          (ejira-auto-sync-tracked nil)
+         (ejira-auto-sync-async nil)
          (ejira-auto-sync-files (list a b))
          (ejira--auto-sync-queue nil)
+         (ejira--auto-sync-round nil)
          (ejira--auto-sync-mtimes (make-hash-table :test 'equal))
          (done nil))
     (unwind-protect
-        (cl-letf (((symbol-function 'ejira--auto-sync-reconcile)
-                   (lambda (file &rest _) (push file done))))
+        (cl-letf (((symbol-function 'ejira--auto-sync-start-cycle)
+                   (lambda (cycle)
+                     (push (ejira--cycle-file cycle) done)
+                     (ejira--auto-sync-end-cycle cycle 'done))))
           (ejira--auto-sync-worker)
           (should (= 1 (length done)))
+          (should-not ejira--auto-sync-round)
           (ejira--auto-sync-worker)
           (should (= 2 (length done)))
           (ejira--auto-sync-worker)
@@ -3172,6 +3179,7 @@ the log that explains them instead of doing nothing visible."
               (ejira-test--journal "Never created" "2026-09-20T10:00:00+0000" "Body."))
     (let ((ejira-auto-sync-files nil)
           (ejira-auto-sync-tracked t)
+          (ejira-auto-sync-async nil)
           (ejira-epic-field 'customfield_10857)
           (ejira--auto-sync-queue nil)
           (ejira--auto-sync-review-queue nil)
@@ -4246,6 +4254,9 @@ does not mistake the push for a remote change."
                           (point) (line-end-position))
           (ejira--push-finalize marker reviewed "sent fields")
           (should (equal (md5 "sent fields") (org-entry-get marker "Remotehash")))
+          ;; Jira's time after the push is unknown: the next cycle fetches.
+          (should (equal ejira-remote-updated-unknown
+                         (org-entry-get marker "Remoteupdated")))
           (should (equal pushhash (org-entry-get marker "Pushhash")))
           (should (ejira--locally-modified-p)))))))
 
@@ -4288,6 +4299,393 @@ fails instead of asking whether to edit it."
                       (car (should-error (insert "x")))))))
       (with-current-buffer buf
         (should-not (buffer-modified-p))))))
+
+;;; ── Asynchronous rounds ─────────────────────────────────────────────────────
+
+(defvar ejira-test--jira-requests nil
+  "Fake asynchronous Jira requests awaiting an answer, oldest first.
+Each is (KIND ARG SUCCESS ERROR): KIND `jql' with ARG (JQL . FIELDS),
+or `rest' with ARG the request path.")
+
+(defvar ejira-test--timers nil
+  "Calls queued by `run-at-time' under `ejira-test--with-async-jira'.")
+
+(defvar ejira-test--sync-calls nil
+  "Synchronous Jira calls made under `ejira-test--with-async-jira'.")
+
+(defmacro ejira-test--with-async-jira (&rest body)
+  "Run BODY with asynchronous Jira requests held until answered.
+Requests queue on `ejira-test--jira-requests' and zero-delay timers on
+`ejira-test--timers'; `ejira-test--answer-jira' delivers both.  A
+synchronous Jira call is recorded in `ejira-test--sync-calls': an
+asynchronous round must never wait on Jira."
+  (declare (indent 0))
+  `(let ((ejira-test--jira-requests nil)
+         (ejira-test--timers nil)
+         (ejira-test--sync-calls nil)
+         (ejira-auto-sync-async t)
+         (ejira--auto-sync-timer nil)
+         (ejira--auto-sync-round nil)
+         (ejira--auto-sync-queue nil)
+         (ejira--auto-sync-review-queue nil)
+         (ejira--auto-sync-full-queue nil)
+         (ejira--auto-sync-report-pending nil)
+         (ejira--auto-sync-mtimes (make-hash-table :test 'equal))
+         (ejira--auto-sync-attempts (make-hash-table :test 'equal))
+         (ejira--auto-sync-full-fetch-times (make-hash-table :test 'equal))
+         (ejira--auto-sync-held (make-hash-table :test 'equal))
+         (ejira--priority-scheme-cache (make-hash-table :test 'equal)))
+     (cl-letf (((symbol-function 'ejira--async-jql)
+                (lambda (jql fields success &optional error)
+                  (setq ejira-test--jira-requests
+                        (append ejira-test--jira-requests
+                                (list (list 'jql (cons jql fields) success error))))))
+               ((symbol-function 'ejira--request-async)
+                (lambda (path _type _data success error)
+                  (setq ejira-test--jira-requests
+                        (append ejira-test--jira-requests
+                                (list (list 'rest path success error))))))
+               ((symbol-function 'run-at-time)
+                (lambda (_time _repeat fn &rest args)
+                  (setq ejira-test--timers
+                        (append ejira-test--timers (list (cons fn args))))))
+               ((symbol-function 'jiralib2-jql-search)
+                (lambda (&rest args) (push (cons 'jql args) ejira-test--sync-calls) nil))
+               ((symbol-function 'jiralib2-session-call)
+                (lambda (&rest args) (push (cons 'rest args) ejira-test--sync-calls) nil)))
+       ,@body)))
+
+(defun ejira-test--answer-jira (responder)
+  "Answer the pending fake requests with RESPONDER and run queued timers.
+Repeat until nothing is pending.  RESPONDER is called with KIND and ARG
+\(see `ejira-test--jira-requests') and returns (ok VALUE) or (error ERR).
+Return the requests answered, oldest first, as (KIND ARG)."
+  (let ((answered nil)
+        (n 0))
+    (while (or ejira-test--jira-requests ejira-test--timers)
+      (when (> (cl-incf n) 500)
+        (error "Fake Jira: the requests never end"))
+      (if ejira-test--jira-requests
+          (pcase-let ((`(,kind ,arg ,success ,fail) (pop ejira-test--jira-requests)))
+            (push (list kind arg) answered)
+            (pcase (funcall responder kind arg)
+              (`(ok ,value) (funcall success value))
+              (`(error ,err) (funcall fail err))))
+        (let ((call (pop ejira-test--timers)))
+          (apply (car call) (cdr call)))))
+    (nreverse answered)))
+
+(defun ejira-test--jql-keys (jql)
+  "Return the issue keys of the `key in (...)' clause of JQL."
+  (when (string-match "key in (\\([^)]*\\))" jql)
+    (split-string (match-string 1 jql) ", " t)))
+
+(defun ejira-test--light-p (request)
+  "Return non-nil when REQUEST, as answered, asked only for update times."
+  (and (eq (car request) 'jql) (equal (cdr (nth 1 request)) '("updated"))))
+
+(defun ejira-test--issue-item (key summary &optional updated comments)
+  "REST item for task KEY with SUMMARY, updated at UPDATED, with COMMENTS."
+  `((key . ,key)
+    (fields . ((summary . ,summary)
+               (description . "Body.")
+               (status . ((name . "Open")))
+               (issuetype . ((name . "Task")))
+               (project . ((key . "TEST")))
+               ,@(when updated `((updated . ,updated)))
+               ,@(when comments
+                   `((comment . ((comments . ,comments)
+                                 (maxResults . 1000)
+                                 (total . ,(length comments))))))))))
+
+(defun ejira-test--issue-heading (key summary item &optional updated extra)
+  "An issue heading KEY titled SUMMARY, with ITEM as its remote baseline.
+UPDATED is its `Remoteupdated'; EXTRA is added to its property drawer."
+  (format "** TODO %s\n:PROPERTIES:\n:ID:       %s\n:TYPE:     ejira-issue\n:Remotehash: %s\n%s%s:END:\n\nBody.\n"
+          summary key (md5 (ejira--remote-fields-identity item))
+          (if updated (format ":Remoteupdated: %s\n" updated) "")
+          (or extra "")))
+
+(defconst ejira-test--project-heading
+  "* Project\n:PROPERTIES:\n:ID:       TEST\n:TYPE:     ejira-project\n:END:\n")
+
+(defun ejira-test--items-for (items)
+  "Return a fake Jira answering every search with the ITEMS it lists."
+  (lambda (kind arg)
+    (if (eq kind 'jql)
+        (let ((keys (ejira-test--jql-keys (car arg))))
+          (list 'ok (cl-remove-if-not (lambda (i) (member (alist-get 'key i) keys))
+                                      items)))
+      (list 'ok nil))))
+
+(ert-deftest ejira-auto-sync-async/review-opens-once-when-jira-answered ()
+  "The review command returns at once: the cycles of every file wait on
+Jira in the background, their requests sent together.  When Jira has
+answered, one review buffer offers what all the files hold.
+Regression: the command froze Emacs for the whole sequence of requests,
+and each file's review replaced the previous one."
+  (let* ((item-a (ejira-test--epic-item "The epic"))
+         (item-b (cons '(key . "TEST-2") (cdr item-a)))
+         (content (lambda (key item task)
+                    (concat ejira-test--project-heading
+                            (format "** TODO The epic\n:PROPERTIES:\n:ID:       %s\n:TYPE:     ejira-epic\n:Issuetype: Epic\n:EJIRA_DESCRIPTION_IN_BODY: t\n:Remotehash: %s\n:END:\n\nEpic body.\n*** TODO %s\n"
+                                    key (md5 (ejira--remote-fields-identity item)) task)))))
+    (ejira-test--with-two-files
+        (funcall content "TEST-1" item-a "Task in A")
+        (funcall content "TEST-2" item-b "Task in B")
+      (let ((ejira-auto-sync-files nil)
+            (ejira-auto-sync-discover nil)
+            (ejira-epic-field 'customfield_10857)
+            (shown nil)
+            (shows 0))
+        (ejira-test--with-async-jira
+          (cl-letf (((symbol-function 'ejira-confirm-show)
+                     (lambda (plans)
+                       (cl-incf shows)
+                       (setq shown (mapcar (lambda (p) (plist-get p :title)) plans)))))
+            (ejira-auto-sync-review)
+            ;; Returned without waiting: both searches are out.
+            (should ejira--auto-sync-round)
+            (should (= 2 (length ejira-test--jira-requests)))
+            (should (= 0 shows))
+            (should (string-match-p "Jira:syncing" (ejira--auto-sync-mode-line)))
+            (ejira-test--answer-jira (ejira-test--items-for (list item-a item-b)))
+            (should-not ejira--auto-sync-round)
+            (should (= 1 shows))
+            (should (member "new task: Task in A" shown))
+            (should (member "new task: Task in B" shown))
+            (should (= 2 (ejira-auto-sync-held-count 'review)))
+            (should-not ejira-test--sync-calls)
+            ;; The first cycle of each file fetched everything.
+            (should (gethash (file-truename file-a) ejira--auto-sync-full-fetch-times))
+            (should (gethash (file-truename file-b) ejira--auto-sync-full-fetch-times))
+            (should (gethash (file-truename file-a) ejira--auto-sync-mtimes))
+            (dolist (b (list buf-a buf-b))
+              (should-not (buffer-modified-p b)))))))))
+
+(ert-deftest ejira-auto-sync-async/fetches-only-what-jira-changed ()
+  "Between full fetches a cycle first asks Jira for update times, then
+fetches the issues whose time moved, those missing from the answer and
+those with local changes.  An issue fetched but unchanged gets its time
+recorded, so the next cycle skips it.  The scheme a push plan needs is
+cached in the background: the cycle never waits on Jira."
+  (let ((i1 (ejira-test--issue-item "TEST-1" "One" "T1"))
+        (i2 (ejira-test--issue-item "TEST-2" "Two" "T2-new"))
+        (i3 (ejira-test--issue-item "TEST-3" "Three" "T3"))
+        (i4 (ejira-test--issue-item "TEST-4" "Four" "T4")))
+    (ejira-test--with-project-dir
+        (concat ejira-test--project-heading
+                (ejira-test--issue-heading "TEST-1" "One" i1 "T1")
+                ;; Jira's time moved, its fields did not.
+                (ejira-test--issue-heading "TEST-2" "Two" i2 "T2")
+                (ejira-test--issue-heading "TEST-3" "Three" i3 "T3" ":Pushhash: stale\n")
+                (ejira-test--issue-heading "TEST-4" "Four" i4 "T4"))
+      (let ((file (file-truename file))
+            (ejira-auto-sync-discover nil)
+            (ejira-push-on-save nil)
+            (full (ejira-test--items-for (list i1 i2 i3 i4)))
+            ;; The light search leaves TEST-4 out.
+            (light (ejira-test--items-for (list i1 i2))))
+        (ejira-test--with-async-jira
+          (puthash file 1.0e12 ejira--auto-sync-full-fetch-times)
+          (ejira--auto-sync-enqueue file)
+          (ejira--auto-sync-worker)
+          (let* ((asked (ejira-test--answer-jira
+                         (lambda (kind arg)
+                           (cond
+                            ((eq kind 'rest)
+                             (list 'ok '((fields . ((priority . ((allowedValues . (((id . "3") (name . "Major")))))))))))
+                            ((equal (cdr arg) '("updated")) (funcall light kind arg))
+                            (t (funcall full kind arg))))))
+                 (lights (cl-remove-if-not #'ejira-test--light-p asked))
+                 (fulls (cl-remove-if (lambda (r) (or (ejira-test--light-p r) (eq (car r) 'rest)))
+                                      asked)))
+            (should (= 1 (length lights)))
+            (should (equal '("TEST-1" "TEST-2" "TEST-4")
+                           (ejira-test--jql-keys (car (nth 1 (car lights))))))
+            (should (equal '("TEST-2" "TEST-3" "TEST-4")
+                           (sort (mapcan (lambda (r) (ejira-test--jql-keys (car (nth 1 r))))
+                                         fulls)
+                                 #'string<)))
+            (should (equal '((rest "/rest/api/2/issue/TEST-3/editmeta"))
+                           (cl-remove-if-not (lambda (r) (eq (car r) 'rest)) asked))))
+          (should-not ejira-test--sync-calls)
+          (should-not ejira--auto-sync-round)
+          (should (= 1 (ejira-auto-sync-held-count 'review)))
+          (with-current-buffer (get-file-buffer file)
+            (should-not (buffer-modified-p))
+            (should (equal "T2-new" (org-entry-get (ejira--find-heading "TEST-2") "Remoteupdated")))
+            (should (equal "T1" (org-entry-get (ejira--find-heading "TEST-1") "Remoteupdated"))))
+          ;; Not a full fetch: its time is left as it was.
+          (should (= 1.0e12 (gethash file ejira--auto-sync-full-fetch-times)))
+          ;; A full fetch asks for everything at once.
+          (setq ejira--auto-sync-full-queue (list file))
+          (ejira--auto-sync-enqueue file)
+          (ejira--auto-sync-worker)
+          (let ((asked (ejira-test--answer-jira full)))
+            (should-not (cl-some #'ejira-test--light-p asked))
+            (should (equal '("TEST-1" "TEST-2" "TEST-3" "TEST-4")
+                           (ejira-test--jql-keys (car (nth 1 (car asked)))))))
+          (should (< (gethash file ejira--auto-sync-full-fetch-times) 1.0e12)))))))
+
+(ert-deftest ejira-auto-sync-async/edited-comment-is-compared-to-the-fetched-page ()
+  "An issue with an edited comment is always fetched, and its review
+compares the comment with the page the fetch embedded instead of asking
+Jira again."
+  (let* ((comments '(((id . "100") (body . "Remote text.") (updated . "C1"))))
+         (item (ejira-test--issue-item "TEST-1" "One" "T1" comments)))
+    (ejira-test--with-project-dir
+        (concat ejira-test--project-heading
+                (ejira-test--issue-heading "TEST-1" "One" item "T1")
+                "*** Comments\n**** A comment\n:PROPERTIES:\n:TYPE:     ejira-comment\n:CommId:   100\n:Pushhash: stale\n:END:\n\nLocal edit.\n")
+      (let ((file (file-truename file))
+            (ejira-auto-sync-discover nil)
+            (ejira-push-on-save nil))
+        (ejira-test--with-async-jira
+          (puthash file 1.0e12 ejira--auto-sync-full-fetch-times)
+          (ejira--auto-sync-enqueue file)
+          (ejira--auto-sync-worker)
+          (let ((asked (ejira-test--answer-jira (ejira-test--items-for (list item)))))
+            (should-not (cl-some #'ejira-test--light-p asked))
+            (should (equal '((jql "TEST-1"))
+                           (mapcar (lambda (r) (list (car r) (car (ejira-test--jql-keys (car (nth 1 r))))))
+                                   asked))))
+          (should-not ejira-test--sync-calls)
+          (should (= 1 (ejira-auto-sync-held-count 'review))))))))
+
+(ert-deftest ejira-auto-sync-async/edit-during-fetch-restarts-the-cycle ()
+  "Answers about a buffer edited while Jira was asked are not applied:
+the cycle starts over on the new content.  A file that keeps changing
+is queued for a later round instead."
+  (let ((item (ejira-test--issue-item "TEST-1" "One" "T1")))
+    (ejira-test--with-project-dir
+        (concat ejira-test--project-heading (ejira-test--issue-heading "TEST-1" "One" item))
+      (let ((file (file-truename file))
+            (ejira-auto-sync-discover nil)
+            (ejira-push-on-save nil))
+        (ejira-test--with-async-jira
+          (let* ((edits 0)
+                 (editor (lambda (max)
+                           (lambda (_kind _arg)
+                             ;; The user edits and saves while Jira answers.
+                             (when (< edits max)
+                               (cl-incf edits)
+                               (with-current-buffer (get-file-buffer file)
+                                 (goto-char (point-max))
+                                 (insert "Note.\n")
+                                 (save-buffer)))
+                             (list 'ok (list item))))))
+            ;; Twice: the third answer is about the content as it stays.
+            (ejira--auto-sync-enqueue file)
+            (ejira--auto-sync-worker)
+            (should (= 3 (length (ejira-test--answer-jira (funcall editor 2)))))
+            (should-not ejira--auto-sync-round)
+            (should-not (member file ejira--auto-sync-queue))
+            (should (gethash file ejira--auto-sync-mtimes))
+            (with-current-buffer (get-file-buffer file)
+              (should (equal "T1" (org-entry-get (ejira--find-heading "TEST-1") "Remoteupdated")))
+              (should-not (buffer-modified-p)))
+            ;; Always: given up after the restarts, queued for later.
+            (setq edits 0)
+            (clrhash ejira--auto-sync-mtimes)
+            (with-current-buffer (get-file-buffer file)
+              (org-with-point-at (ejira--find-heading "TEST-1")
+                (org-delete-property "Remoteupdated"))
+              (save-buffer))
+            (ejira--auto-sync-enqueue file)
+            (ejira--auto-sync-worker)
+            (should (= (1+ ejira--auto-sync-restart-limit)
+                       (length (ejira-test--answer-jira (funcall editor 100)))))
+            (should-not ejira--auto-sync-round)
+            (should (member file ejira--auto-sync-queue))
+            (should-not (gethash file ejira--auto-sync-mtimes))
+            (with-current-buffer (get-file-buffer file)
+              (should-not (org-entry-get (ejira--find-heading "TEST-1") "Remoteupdated")))))))))
+
+(ert-deftest ejira-auto-sync-async/failed-request-ends-the-round ()
+  "A failed request ends its cycle without applying anything.  The round
+ends, and the file stays due for a later round, attempts counted."
+  (let ((item (ejira-test--issue-item "TEST-1" "One" "T1")))
+    (ejira-test--with-project-dir
+        (concat ejira-test--project-heading (ejira-test--issue-heading "TEST-1" "One" item))
+      (let ((file (file-truename file))
+            (ejira-auto-sync-discover nil))
+        (ejira-test--with-async-jira
+          (ejira--auto-sync-enqueue file)
+          (ejira--auto-sync-worker)
+          (ejira-test--answer-jira (lambda (&rest _) (list 'error '(error "HTTP 500"))))
+          (should-not ejira--auto-sync-round)
+          (should (= 1 (gethash file ejira--auto-sync-attempts)))
+          (should-not (gethash file ejira--auto-sync-mtimes))
+          (should (member file (ejira--auto-sync-due-files)))
+          (with-current-buffer (get-file-buffer file)
+            (should-not (buffer-modified-p))
+            (should-not (org-entry-get (ejira--find-heading "TEST-1") "Remoteupdated"))))))))
+
+(ert-deftest ejira-auto-sync-async/no-second-round-while-one-runs ()
+  "A round starts only when the previous one has ended; a save during a
+round waits for it.  A round that never ends is abandoned, its files
+queued again, and its late answers dropped."
+  (let ((item (ejira-test--issue-item "TEST-1" "One" "T1")))
+    (ejira-test--with-project-dir
+        (concat ejira-test--project-heading (ejira-test--issue-heading "TEST-1" "One" item))
+      (let ((file (file-truename file))
+            (ejira-auto-sync-discover nil))
+        (ejira-test--with-async-jira
+          (ejira--auto-sync-enqueue file)
+          (ejira--auto-sync-worker)
+          (let ((round ejira--auto-sync-round))
+            (should round)
+            (ejira--auto-sync-enqueue file t)
+            (ejira--auto-sync-worker)
+            (should (eq round ejira--auto-sync-round))
+            (should (= 1 (length ejira-test--jira-requests)))
+            ;; Never answered: abandoned.
+            (setf (ejira--round-started round) 0)
+            (cl-letf (((symbol-function 'ejira--auto-sync-start-round) #'ignore))
+              (ejira--auto-sync-worker))
+            (should-not ejira--auto-sync-round)
+            (should (member file ejira--auto-sync-queue))
+            (ejira-test--answer-jira (ejira-test--items-for (list item)))
+            (with-current-buffer (get-file-buffer file)
+              (should-not (org-entry-get (ejira--find-heading "TEST-1") "Remoteupdated")))))))))
+
+(ert-deftest ejira-auto-sync-async/snapshot-never-unfolds-the-buffer ()
+  "Reading the baselines of every heading never shows the whole buffer.
+Regression: each heading's local-change check showed and refolded the
+whole buffer, and the snapshot of a large file blocked Emacs for two
+minutes -- long enough for the requests already sent to time out."
+  (let ((item (ejira-test--issue-item "TEST-1" "One" "T1")))
+    (ejira-test--with-project-dir
+        (concat ejira-test--project-heading
+                (ejira-test--issue-heading "TEST-1" "One" item "T1" ":Pushhash: stale\n")
+                "*** Comments\n**** A comment\n:PROPERTIES:\n:TYPE:     ejira-comment\n:CommId:   100\n:Pushhash: stale\n:END:\n\nLocal edit.\n")
+      (let ((shows 0)
+            (cycle (ejira--cycle-make :file (file-truename file))))
+        (cl-letf (((symbol-function 'outline-show-all)
+                   (lambda (&rest _) (cl-incf shows))))
+          (let ((snap (ejira--auto-sync-snapshot cycle)))
+            (should (consp snap))
+            (should (plist-get (cdr (assoc "TEST-1" (plist-get snap :baselines))) :dirty))
+            (should (plist-get (cdr (assoc "TEST-1" (plist-get snap :baselines)))
+                               :comments-dirty))))
+        (should (= 0 shows))))))
+
+(ert-deftest ejira-auto-sync/remote-baseline-is-dated ()
+  "The remote baseline records the update time of the version it
+hashes, or none when the fetch did not give it."
+  (ejira-test--with-org-buf
+   "* TODO An issue\n:PROPERTIES:\n:ID:       TEST-1\n:TYPE:     ejira-issue\n:END:\n"
+   (let ((dated (ejira-test--issue-item "TEST-1" "An issue" "T1"))
+         (undated (ejira-test--issue-item "TEST-1" "An issue")))
+     (ejira--store-remote-baseline dated)
+     (should (equal "T1" (org-entry-get nil "Remoteupdated")))
+     (ejira--store-remote-baseline undated)
+     (should (org-entry-get nil "Remotehash"))
+     (should-not (org-entry-get nil "Remoteupdated"))
+     ;; Dating an unchanged baseline.
+     (ejira--note-remote-updated (point-marker) dated)
+     (should (equal "T1" (org-entry-get nil "Remoteupdated"))))))
 
 (provide (quote ejira-test))
 ;;; ejira-test.el ends here

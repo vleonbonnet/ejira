@@ -1743,6 +1743,22 @@ local copy changed\".  Written by the auto-sync cycle after applying a
 pull, and by push finalization with the identity of the values that
 were just sent.  A missing hash means unknown, not unchanged.")
 
+(defconst ejira-remote-updated-property "Remoteupdated"
+  "Property holding Jira's update time of the issue `Remotehash' hashes.
+Jira moves an issue's update time on every change of the issue,
+comments included.  While Jira still reports this time, the issue's
+fields still hash to `Remotehash', and the automatic sync does not
+need to fetch them (see `ejira-auto-sync-full-fetch-interval').  The
+two properties describe one fetched version of the issue: whatever
+writes `Remotehash' from another source writes
+`ejira-remote-updated-unknown' here.")
+
+(defconst ejira-remote-updated-unknown "unknown"
+  "`Remoteupdated' value of a `Remotehash' that no fetch produced.
+Push finalization hashes the values it sent; Jira's update time after
+the push is not known until the next fetch.  No Jira time equals it, so
+the next cycle fetches the issue and records the actual time.")
+
 (defconst ejira-remote-identity-unknown "?status-unknown?"
   "Placeholder for the status component of a sent-fields identity when
 the push performed a state transition whose resulting status name is
@@ -1790,10 +1806,26 @@ stayed the same.  The fetch must request the `comment' field."
              ","))
 
 (defun ejira--store-remote-baseline (item)
-  "Store the :Remotehash: of remote issue ITEM on the heading at point."
+  "Store the remote baseline of remote issue ITEM on the heading at point.
+That is its `Remotehash', and the `Remoteupdated' it belongs to.  An
+ITEM fetched without its update time leaves no `Remoteupdated': the
+pair must describe one version of the issue."
   (org-set-property
    ejira-remote-hash-property
-   (md5 (ejira--remote-fields-identity item))))
+   (md5 (ejira--remote-fields-identity item)))
+  (if-let* ((updated (ejira--alist-get item 'fields 'updated)))
+      (org-set-property ejira-remote-updated-property updated)
+    (org-delete-property ejira-remote-updated-property)))
+
+(defun ejira--note-remote-updated (marker item)
+  "Record remote ITEM's update time on the heading at MARKER.
+Only for a heading whose `Remotehash' ITEM still matches: the time then
+dates the stored baseline, and the next cycles need not fetch the issue
+while Jira reports the same time."
+  (when-let* ((updated (ejira--alist-get item 'fields 'updated)))
+    (unless (equal updated (org-entry-get marker ejira-remote-updated-property))
+      (org-with-point-at marker
+        (org-set-property ejira-remote-updated-property updated)))))
 
 (defun ejira--remote-changed-p (item)
   "Return non-nil when remote issue ITEM differs from its known baseline.
@@ -2301,7 +2333,8 @@ stale index misses, through `ejira--find-heading'."
 (defconst ejira--sync-properties
   '("ID" "ORIG_ID" "TYPE" "CommId" "Author" "Status" "Reporter" "Assignee"
     "Issuetype" "Created" "Modified" "Effort" "Left" "Pushhash" "Statehash"
-    "Remotehash" "JiraPriorityId" "JiraPriorityName" "JiraPriorityRank")
+    "Remotehash" "Remoteupdated" "JiraPriorityId" "JiraPriorityName"
+    "JiraPriorityRank")
   "Properties ejira writes as sync metadata.
 `ejira--commit-heading' carries the values the heading holds to the file.")
 
