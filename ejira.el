@@ -143,6 +143,51 @@ at once."
                   (list 'error (format "Jira request %s failed: %s"
                                        (car args) (error-message-string err)))))))))
 
+(defconst ejira--curl-exit-reasons
+  '((5 . "could not resolve the proxy")
+    (6 . "could not resolve the host")
+    (7 . "could not connect")
+    (16 . "HTTP/2 framing error")
+    (18 . "transfer ended early")
+    (28 . "timed out")
+    (35 . "TLS handshake failed")
+    (47 . "too many redirects")
+    (52 . "empty reply from the server")
+    (55 . "failed sending data")
+    (56 . "failed receiving data")
+    (58 . "client certificate problem")
+    (60 . "server certificate not trusted")
+    (92 . "HTTP/2 stream error"))
+  "What the curl exit codes a Jira request meets mean; see EXIT CODES in curl(1).")
+
+(defun ejira--request-failure-message (path symbol-status error-thrown response)
+  "Return the error message of the failed Jira request PATH.
+SYMBOL-STATUS, ERROR-THROWN and RESPONSE are what `request' reports.
+When curl itself failed, the request never got an answer: `request'
+reports it as a `parse-error' of the empty reply, with curl's exit
+code as the error, so the message names the network failure instead
+\(see `ejira--curl-exit-reasons').  Regression: a failed TLS handshake
+read \"failed (parse-error): exited abnormally with code 35\"."
+  (let ((detail (pcase error-thrown
+                  (`(,_ . ,(and msg (pred stringp))) (string-trim msg))
+                  ;; An HTTP error status: the status says it all, and
+                  ;; `error-message-string' made it "peculiar error: 500".
+                  (`(,_ http . ,_) nil)
+                  (`(,_ . ,_) (error-message-string error-thrown))
+                  (_ (format "%s" error-thrown)))))
+    (if (and detail
+             (string-match "\\`exited abnormally with code \\([0-9]+\\)\\'" detail))
+        (let ((code (string-to-number (match-string 1 detail))))
+          (format "Jira request %s failed: network error, %s (curl exit %d)"
+                  path (alist-get code ejira--curl-exit-reasons "see curl(1)") code))
+      (format "Jira request %s failed (%s%s)%s"
+              path symbol-status
+              (if-let* ((code (or (and response (request-response-status-code response))
+                                  (pcase error-thrown (`(,_ http ,code . ,_) code)))))
+                  (format ", HTTP %s" code)
+                "")
+              (if detail (concat ": " detail) "")))))
+
 (defun ejira--request-send (path type data on-success on-error)
   "Send the request of `ejira--request-async' (PATH TYPE DATA ON-SUCCESS ON-ERROR)."
   (request (concat jiralib2-url path)
@@ -165,17 +210,8 @@ at once."
                  (funcall on-success data)
                (funcall on-error
                         (list 'error
-                              (format "Jira request %s failed (%s%s): %s"
-                                      path symbol-status
-                                      (if-let* ((code (and response
-                                                           (request-response-status-code
-                                                            response))))
-                                          (format ", HTTP %s" code)
-                                        "")
-                                      (pcase error-thrown
-                                        (`(,_ . ,(and msg (pred stringp))) msg)
-                                        (`(,_ . ,_) (error-message-string error-thrown))
-                                        (_ error-thrown)))))))
+                              (ejira--request-failure-message
+                               path symbol-status error-thrown response)))))
          (ejira--request-pump))))))
 
 (defun ejira--async-jql (jql fields success-fn &optional error-fn)
@@ -703,11 +739,23 @@ Creations, like every other local change, wait for the review buffer.")
 (defvar ejira--auto-sync-attempts (make-hash-table :test 'equal)
   "Consecutive failed reconcile attempts per file, for retry capping.")
 (defcustom ejira-auto-sync-retry-limit 3
-  "Consecutive failed attempts per file before auto-sync gives up and
-reports, instead of retrying on every idle cycle.  The next successful
-save or external change resets the counter."
+  "Consecutive failed attempts per file before auto-sync gives up.
+A failed cycle is retried after `ejira-auto-sync-retry-delay'; once this
+many attempts failed in a row, the failure is reported and the file
+waits for its next save or external change, which resets the count."
   :type 'integer
   :group 'ejira)
+
+(defcustom ejira-auto-sync-retry-delay 30
+  "Seconds before a failed cycle of a file is retried.
+Each further retry of the same file waits twice as long as the one
+before, so a Jira or network outage of a minute or two is ridden out
+within `ejira-auto-sync-retry-limit' attempts."
+  :type 'integer
+  :group 'ejira)
+
+(defvar ejira--auto-sync-retry-timers (make-hash-table :test 'equal)
+  "Map an auto-sync file to the timer of its pending retry.")
 
 (defvar ejira--auto-sync-review-queue nil
   "Auto-sync files whose next cycle must open the review buffer.
@@ -1146,16 +1194,28 @@ Return nil when BUF has no issue that can have children."
   "Import REST ITEM under its parent heading in BUF; return non-nil on success.
 The heading is created directly under the parent, then pulled, which
 records its baselines.  An
-issue already present in another file is pulled, which refiles it
-here.  An issue created by a creation whose response was lost is
+issue already present in another file of `ejira-org-directory' is
+pulled, which refiles it here.  One the user placed in a file outside
+it is left where it is, to the cycles of that file: no pull would move
+it, so there is nothing to import, and return nil.  An issue created
+by a creation whose response was lost is
 pulled onto the journaled heading (see `ejira--adopt-creation-journal').
 A conversion failure is reported through ON-HOLD (see
 `ejira--update-task-or-hold') and leaves no heading behind."
   (let* ((key (ejira--alist-get item 'key))
          (parent (ejira--item-parent-key item))
-         (parent-m (and parent (ejira--find-heading parent))))
-    (when (and parent-m (eq (marker-buffer parent-m) buf))
-      (let ((created (unless (or (ejira--find-heading key)
+         (parent-m (and parent (ejira--find-heading parent)))
+         (existing (ejira--find-heading key)))
+    ;; Regression: an issue whose heading lives in a user's file, under
+    ;; an epic held in the project file, was "imported" by every cycle
+    ;; of the project file, each one pulling over the heading outside
+    ;; its own file's reconciliation, and never moving it.
+    (when (and parent-m (eq (marker-buffer parent-m) buf)
+               (not (and existing
+                         (not (eq (marker-buffer existing) buf))
+                         (not (ejira--file-in-org-directory-p
+                               (buffer-file-name (marker-buffer existing)))))))
+      (let ((created (unless (or existing
                                  ;; The outcome of a creation journal: the
                                  ;; pull gives the journaled heading the key,
                                  ;; and a placeholder would duplicate it.
@@ -1173,45 +1233,6 @@ A conversion failure is reported through ON-HOLD (see
           nil)))))
 
 ;;; Read-only audit
-
-(defun ejira--audit-state-match-p (local-state status resolution)
-  "Return non-nil when Org LOCAL-STATE corresponds to Jira STATUS/RESOLUTION.
-Several Org keywords can map to one Jira status (and one status to
-several keywords), so compare through `ejira-todo-states-alist' both
-ways rather than by index alone."
-  (let* ((remote-index (funcall ejira-todo-state-fn status resolution))
-         (local-index (1+ (or (cl-position local-state org-todo-keywords-1
-                                           :test #'equal)
-                              -2))))
-    (or (= remote-index local-index)
-        (and (not (equal status "Closed"))
-             (member status
-                     (mapcar #'car
-                             (cl-remove-if-not
-                              (lambda (e) (= (cdr e) local-index))
-                              ejira-todo-states-alist)))))))
-
-(defun ejira--audit-normalize (s)
-  "Normalize Org text S for the audit's local/remote comparison.
-Drops what the Jira export cannot carry or renders equivalently, so the
-audit reports content differences only: drawers (a LOGBOOK under a
-description subheading is never exported), blank lines (the exporter
-separates every element with one), the brackets of a bare link
-\\=(a plain URL exports as [url] and imports as [[url]]), and whether a
-timestamp is active (JIRA dates import as inactive timestamps)."
-  (let ((s (ejira--push-normalize (ejira-parser-inactivate-timestamps (or s "")))))
-    (setq s (replace-regexp-in-string
-             "^[ \t]*:[A-Za-z_]+:[ \t]*\n\\(?:.*\n\\)*?[ \t]*:END:[ \t]*$" "" s))
-    (setq s (replace-regexp-in-string "\\[\\[\\(https?://[^]\n]+\\)\\]\\]" "\\1" s))
-    (setq s (replace-regexp-in-string "\n\\(?:[ \t]*\n\\)+" "\n" s))
-    (string-trim s)))
-
-(defun ejira--audit-convert (markup level)
-  "Convert JIRA MARKUP at LEVEL, or return `:unconvertible'."
-  (condition-case nil
-      (let ((ejira-parser-signal-failures t))
-        (ejira--parse-body markup level))
-    (ejira-parser-error :unconvertible)))
 
 (defun ejira--audit-comments (key item)
   "Return a list of comment differences for issue KEY against REST ITEM."
@@ -1231,14 +1252,14 @@ timestamp is active (JIRA dates import as inactive timestamps)."
              (l (assoc id local)))
         (if (not l)
             (push (format "comment %s missing locally" id) diffs)
-          (let ((expected (ejira--audit-convert (ejira--alist-get c 'body)
-                                                (org-with-point-at (nth 1 l)
-                                                  (org-current-level)))))
+          (let ((expected (ejira--convert-or-unconvertible
+                           (ejira--alist-get c 'body)
+                           (org-with-point-at (nth 1 l) (org-current-level)))))
             (cond
              ((eq expected :unconvertible)
               (push (format "comment %s unconvertible" id) diffs))
-             ((not (equal (ejira--audit-normalize expected)
-                          (ejira--audit-normalize
+             ((not (equal (ejira--content-normalize expected)
+                          (ejira--content-normalize
                            (ejira--get-heading-body (nth 1 l)))))
               (push (format "comment %s differs%s" id
                             (if (nth 2 l) " (edited locally)" ""))
@@ -1256,8 +1277,10 @@ BUF.  Return a plist:
              per issue heading, CLASS being `identical', `local-newer'
              (differs, edited locally, remote unchanged since the
              baseline), `unknown-baseline' (differs, edited locally, no
-             remote baseline), `remote-newer' (differs, no local edit),
-             `both-changed', `unconvertible' or `missing-in-jira';
+             remote baseline), `never-synced' (differs, and was never
+             synced: see `ejira--never-synced-p'), `remote-newer'
+             (differs, no local edit), `both-changed', `unconvertible'
+             or `missing-in-jira';
   :missing   keys of MISSING;
   :local-only titles of TODO headings with no Jira identity;
   :duplicates (KEY . FILES) for keys carried by more than one heading;
@@ -1280,43 +1303,16 @@ BUF.  Return a plist:
                                         ((equal stored (md5 (ejira--remote-fields-identity item)))
                                          'match)
                                         (t 'moved)))
-                        (rsum (ejira--audit-convert
-                               (ejira--alist-get item 'fields 'summary) nil))
-                        (rdesc (condition-case nil
-                                   (let ((ejira-parser-signal-failures t))
-                                     (ejira--expected-jira-description
-                                      m (ejira--alist-get item 'fields 'description)))
-                                 (ejira-parser-error :unconvertible)))
-                        (status (ejira--alist-get item 'fields 'status 'name))
-                        (resolution (ejira--alist-get item 'fields 'resolution 'name))
-                        (rprio (ejira--priority-id-string
-                                (ejira--alist-get item 'fields 'priority 'id)))
-                        (lprio (org-entry-get nil ejira-priority-id-property))
                         (diffs
                          (append
-                          (delq nil
-                                (list
-                                 (cond ((eq rsum :unconvertible) "summary unconvertible")
-                                       ((not (equal (ejira--push-normalize rsum)
-                                                    (ejira--push-normalize (ejira--jira-summary))))
-                                        "summary"))
-                                 (cond ((eq rdesc :unconvertible) "description unconvertible")
-                                       ((not (equal (ejira--audit-normalize rdesc)
-                                                    (ejira--audit-normalize
-                                                     (ejira--jira-description))))
-                                        "description"))
-                                 (unless (ejira--audit-state-match-p
-                                          (substring-no-properties (or (org-get-todo-state) ""))
-                                          status resolution)
-                                   (format "state %s vs %s" (org-get-todo-state) status))
-                                 (when (and lprio rprio (not (equal lprio rprio)))
-                                   (format "priority %s vs %s" lprio rprio))))
+                          (mapcar #'cdr (ejira--item-remote-differences item))
                           (ejira--audit-comments key item)))
                         (class
                          (cond
                           ((cl-some (lambda (d) (string-match-p "unconvertible" d)) diffs)
                            'unconvertible)
                           ((null diffs) 'identical)
+                          ((ejira--never-synced-p) 'never-synced)
                           ((and dirty (eq baseline 'moved)) 'both-changed)
                           ((and dirty (eq baseline 'none)) 'unknown-baseline)
                           (dirty 'local-newer)
@@ -1775,6 +1771,9 @@ again."
          ;; Conversion holds: keep the issue's pushes out of the cycle
          ;; and report it with the other held issues.
          (unreviewable-keys nil)
+         ;; Never-synced headings that differ from Jira: offered as
+         ;; pushes, see `ejira--never-synced-push-keys'.
+         (never-synced-keys nil)
          (ejira--auto-sync-review-plans nil)
          (on-hold (lambda (key line)
                     (push key held-keys)
@@ -1828,8 +1827,24 @@ again."
                                               item))))))
                       (remote-unknown-p (and m (not stored)))
                       (dirty (and m (org-with-point-at m
-                                      (ejira--locally-modified-p)))))
+                                      (ejira--locally-modified-p))))
+                      ;; A heading never synced has no baseline to tell
+                      ;; an edit: compared with Jira instead.
+                      (never-synced (and m (org-with-point-at m
+                                             (ejira--never-synced-differences
+                                              item)))))
                  (cond
+                  ;; Written by hand for an existing issue, and different
+                  ;; from Jira: a pull would replace that text unseen.
+                  ;; Held, and offered for review as a push.
+                  (never-synced
+                   (push key held-keys)
+                   (push key never-synced-keys)
+                   (push (list 'issue key
+                               (format "%s: never synced, and differs from Jira (%s); review to send it, or keep the local text with a %s child"
+                                       key (mapconcat #'cdr never-synced ", ")
+                                       ejira-jira-description-heading-name))
+                         conflicts))
                   ;; Push candidate only when a remote baseline exists
                   ;; and has not moved: with no baseline, "not changed
                   ;; remotely" is UNKNOWN, and an automatic push could
@@ -1892,7 +1907,8 @@ again."
              ;; are built.
              (ejira--save-buffer-safe)
              ;; ── hold local changes for review; never push ──
-             (let* ((ops (ejira--with-pre-scan buf
+             (let* ((ejira--never-synced-push-keys never-synced-keys)
+                    (ops (ejira--with-pre-scan buf
                            (ejira--push-scan-buffer buf)))
                     (blocked (cl-remove-if-not
                               (lambda (op) (eq (plist-get op :op) 'blocked))
@@ -2103,6 +2119,7 @@ time of a full fetch; and failed attempts, capped by
                       (ejira--cycle-mtime cycle))
                   ejira--auto-sync-mtimes)
          (remhash file ejira--auto-sync-attempts)
+         (ejira--auto-sync-cancel-retry file)
          (when (ejira--cycle-full cycle)
            (puthash file (float-time) ejira--auto-sync-full-fetch-times)))
         ('deferred
@@ -2110,9 +2127,12 @@ time of a full fetch; and failed attempts, capped by
         ('restarted
          (setq note (format "%s kept changing during the sync; queued again" name)))
         ('error
-         ;; The time is recorded only after a successful cycle: a
-         ;; transient failure leaves it stale, so the next round retries
-         ;; the file instead of silently dropping it.
+         ;; The time is recorded only after a successful cycle, and the
+         ;; failed one is queued again: a file in the round because it
+         ;; was queued (a review asked for, a push confirmed) has not
+         ;; changed, so its time alone would never bring it back.
+         ;; Regression: "attempt 1/3" was reported for a TLS handshake
+         ;; failure, and no attempt 2 ever ran.
          (let ((n (1+ (gethash file ejira--auto-sync-attempts 0)))
                (msg (error-message-string err)))
            (puthash file n ejira--auto-sync-attempts)
@@ -2123,8 +2143,10 @@ time of a full fetch; and failed attempts, capped by
                  (remhash file ejira--auto-sync-attempts)
                  (message "ejira auto-sync: giving up on %s after %d attempts: %s"
                           file n msg))
-             (message "ejira auto-sync: %s failed (attempt %d/%d): %s"
-                      file n ejira-auto-sync-retry-limit msg))
+             (let ((delay (ejira--auto-sync-schedule-retry
+                           file n (ejira--cycle-review cycle) (ejira--cycle-full cycle))))
+               (message "ejira auto-sync: %s failed (attempt %d/%d), retrying in %ds: %s"
+                        file n ejira-auto-sync-retry-limit delay msg)))
            (setq note (format "%s failed: %s" name msg)))))
       (when (and round (eq round ejira--auto-sync-round))
         (when (eq outcome 'done)
@@ -2137,6 +2159,36 @@ time of a full fetch; and failed attempts, capped by
               (delete file (ejira--round-pending round)))
         (unless (ejira--round-pending round)
           (ejira--auto-sync-end-round round))))))
+
+(defun ejira--auto-sync-cancel-retry (file)
+  "Cancel the pending retry of FILE, if any."
+  (when-let* ((timer (gethash file ejira--auto-sync-retry-timers)))
+    (when (timerp timer)
+      (cancel-timer timer))
+    (remhash file ejira--auto-sync-retry-timers)))
+
+(defun ejira--auto-sync-schedule-retry (file attempt review full)
+  "Queue FILE for another cycle after the ATTEMPT-th failure in a row.
+The cycle runs again after `ejira-auto-sync-retry-delay' seconds,
+doubled for each earlier failure; return that delay.  REVIEW and FULL
+carry the failed cycle's requests over: the retry opens the review a
+save or `ejira-auto-sync-review' asked for, and fetches every issue
+when the failed cycle was to.  A retry already pending for FILE is
+replaced."
+  (let ((delay (* ejira-auto-sync-retry-delay (expt 2 (1- attempt)))))
+    (ejira--auto-sync-cancel-retry file)
+    (puthash file
+             (run-at-time delay nil #'ejira--auto-sync-retry file review full)
+             ejira--auto-sync-retry-timers)
+    delay))
+
+(defun ejira--auto-sync-retry (file review full)
+  "Queue FILE again after a failed cycle; see `ejira--auto-sync-schedule-retry'."
+  (remhash file ejira--auto-sync-retry-timers)
+  (ejira--auto-sync-enqueue file review)
+  (when full
+    (cl-pushnew file ejira--auto-sync-full-queue :test #'equal))
+  (ejira--auto-sync-kick))
 
 (defun ejira--auto-sync-end-round (round)
   "End ROUND: open one review for what its cycles hold, and report.
@@ -2207,10 +2259,13 @@ See `ejira-auto-sync-tracked' and `ejira-auto-sync-files'."
              (length (ejira--auto-sync-files)))))
 
 (defun ejira--stop-auto-sync ()
-  "Tear down the automatic reconciliation timer."
+  "Tear down the automatic reconciliation timer, and any pending retries."
   (when ejira--auto-sync-timer
     (cancel-timer ejira--auto-sync-timer)
     (setq ejira--auto-sync-timer nil))
+  (let (files)
+    (maphash (lambda (file _timer) (push file files)) ejira--auto-sync-retry-timers)
+    (mapc #'ejira--auto-sync-cancel-retry files))
   (setq global-mode-string
         (delete ejira--auto-sync-mode-line-construct global-mode-string))
   ;; The indicator left the mode line: announce it.

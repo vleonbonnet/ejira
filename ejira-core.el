@@ -105,6 +105,10 @@ local-only.")
 Unlike an Org property, this heading supports a full Org body and therefore
 round-trips arbitrary Jira markup without flattening it into one line.")
 
+(defconst ejira--new-heading-title "<ejira new heading>"
+  "Title of the placeholder `ejira--new-heading' writes for an import.
+The first pull replaces it with the issue's summary.")
+
 (defconst ejira-local-hash-property "LocalHash"
   "Property holding the local baseline of a heading: itself at its last sync.
 For an issue, two hashes separated by a space: its content fields
@@ -745,10 +749,17 @@ something a background auto-pull should ever do."
     ;; with a pending local state edit is left entirely alone: applying
     ;; the remote state and re-baselining would silently acknowledge work
     ;; that was never pushed.  The full reconcile or the push flow
-    ;; resolves it.
-    (let ((pending (ejira--with-point-on issue-key (ejira--state-modified-p))))
+    ;; resolves it.  So is a heading never synced (`ejira--never-synced-p'):
+    ;; nothing tells whether its state is older than Jira's, and the full
+    ;; reconcile compares it.
+    (let ((pending (ejira--with-point-on issue-key
+                     (cond ((ejira--state-modified-p) 'edited)
+                           ((ejira--never-synced-p) 'never-synced)))))
       (if pending
-          (message "ejira: %s has unpushed local edits; shallow pull skipped" issue-key)
+          (message (if (eq pending 'edited)
+                       "ejira: %s has unpushed local edits; shallow pull skipped"
+                     "ejira: %s was never synced; shallow pull skipped")
+                   issue-key)
         (ejira--with-point-on issue-key
           (unless (equal (org-entry-get (point-marker) "Status") status)
             (org-set-property "Status" status))
@@ -888,18 +899,40 @@ converted to Org; callers hold the issue and report it."
                     (not (equal (org-entry-get key-m "Modified")
                                 (format-time-string "%Y-%m-%d %H:%M:%S"
                                                     updated "UTC")))))
+               ;; A heading written by hand for an existing issue has no
+               ;; baseline, so nothing marks its text as edited, and the
+               ;; pull used to replace it with Jira's (observed: an
+               ;; issue's release notes and checklist, written in the
+               ;; file, gave way to its original description, and
+               ;; another's to an empty one).  What differs is kept, as
+               ;; unpushed local edits are; a review sends it, or the
+               ;; text moves to a projection.  Only a pull that applies
+               ;; Jira's fields can lose any.  An adopted creation's
+               ;; content is restored below instead.
+               (never-synced-held
+                (when (and modified-p (not adopted) (not ejira--discard-local-edits))
+                  (org-with-point-at key-m
+                    (when (ejira--never-synced-p)
+                      (ejira--never-synced-held
+                       (ejira--remote-differences
+                        :summary summary :description description
+                        :status status :resolution resolution
+                        :deadline deadline :priority-id priority-id))))))
                ;; Only the content fields gate summary/description imports:
                ;; a pending local state edit must not block a description
                ;; pull.
                (local-dirty-p
                 (and (not ejira--discard-local-edits)
-                     (org-with-point-at key-m (ejira--content-modified-p))))
+                     (or (org-with-point-at key-m (ejira--content-modified-p))
+                         (cl-some (lambda (d) (memq (car d) '(summary description deadline)))
+                                  never-synced-held))))
                (state-dirty-p
                 ;; Pending local state edits (todo keyword, assignee,
                 ;; status): the pull keeps the local values and leaves them
                 ;; dirty for the push flow instead of reversing them.
                 (and (not ejira--discard-local-edits)
-                     (org-with-point-at key-m (ejira--state-modified-p))))
+                     (or (org-with-point-at key-m (ejira--state-modified-p))
+                         (and (assq 'state never-synced-held) t))))
                (stored-priority-id
                 (org-entry-get key-m ejira-priority-id-property))
                (stored-priority-name
@@ -950,6 +983,9 @@ converted to Org; callers hold the issue and report it."
             (when local-dirty-p
               (message "ejira: %s has unpushed local edits; keeping local summary and description"
                        key))
+            (when never-synced-held
+              (message "ejira: %s was never synced and differs from Jira (%s); keeping the local version"
+                       key (mapconcat #'cdr never-synced-held ", ")))
             (unless local-dirty-p
               (ejira--set-summary key summary))
 
@@ -1019,13 +1055,7 @@ converted to Org; callers hold the issue and report it."
                    (heading-buf (marker-buffer (ejira--find-heading key)))
                    (heading-file (buffer-file-name heading-buf))
                    (target-m (ejira--find-heading target))
-                   ;; `heading-file' is nil for non-file-backed buffers
-                   ;; (tests, capture targets); treat them as outside the
-                   ;; ejira directory.
-                   (in-ejira-dir (and heading-file
-                                      (string-prefix-p
-                                       (file-truename (expand-file-name ejira-org-directory))
-                                       (file-truename heading-file))))
+                   (in-ejira-dir (ejira--file-in-org-directory-p heading-file))
                    (same-buffer (and target-m (eq (marker-buffer target-m) heading-buf))))
               (when (if in-ejira-dir
                         t
@@ -1613,6 +1643,145 @@ Headings without a baseline are treated as unmodified; the baseline is
 established on the next sync or push, never during a plain save."
   (or (ejira--content-modified-p) (ejira--state-modified-p)))
 
+;;; Headings never synced
+
+(defun ejira--never-synced-p ()
+  "Return non-nil when the issue heading at point was never synced.
+Its ID names a Jira issue but it has no local baseline (see
+`ejira-local-hash-property'): it was written by hand, by an agent or
+outside Emacs, for an issue that already exists.  Its text is local
+work of unknown age, which no sync has compared with Jira, so it is
+never seen as edited (`ejira--locally-modified-p') and a pull must not
+replace it unseen; see `ejira--remote-differences'.  The placeholder
+`ejira--new-heading' writes for an import holds nothing yet, and is
+not such a heading."
+  (let ((id (org-entry-get nil "ID")))
+    (and id
+         (string-match-p "\\`[A-Z][A-Z0-9]+-[0-9]+\\'" id)
+         (not (ejira--comment-heading-p))
+         (not (org-entry-get nil ejira-local-hash-property))
+         (not (equal (org-get-heading t t t t) ejira--new-heading-title)))))
+
+(defun ejira--content-normalize (s)
+  "Normalize Org text S to compare a heading's text with Jira's.
+Drops what the Jira export cannot carry or renders equivalently, so
+only content differences remain: drawers (a LOGBOOK under a description
+subheading is never exported), blank lines (the exporter separates
+every element with one), the brackets of a bare link \\=(a plain URL
+exports as [url] and imports as [[url]]), and whether a timestamp is
+active (JIRA dates import as inactive timestamps)."
+  (let ((s (ejira--push-normalize (ejira-parser-inactivate-timestamps (or s "")))))
+    (setq s (replace-regexp-in-string
+             "^[ \t]*:[A-Za-z_]+:[ \t]*\n\\(?:.*\n\\)*?[ \t]*:END:[ \t]*$" "" s))
+    (setq s (replace-regexp-in-string "\\[\\[\\(https?://[^]\n]+\\)\\]\\]" "\\1" s))
+    (setq s (replace-regexp-in-string "\n\\(?:[ \t]*\n\\)+" "\n" s))
+    (string-trim s)))
+
+(defun ejira--convert-or-unconvertible (markup level)
+  "Convert JIRA MARKUP at outline LEVEL to Org, or return `:unconvertible'."
+  (condition-case nil
+      (let ((ejira-parser-signal-failures t))
+        (ejira--parse-body markup level))
+    (ejira-parser-error :unconvertible)))
+
+(defun ejira--state-matches-status-p (local-state status resolution)
+  "Return non-nil when Org LOCAL-STATE corresponds to Jira STATUS/RESOLUTION.
+Several Org keywords can map to one Jira status (and one status to
+several keywords), so compare through `ejira-todo-states-alist' both
+ways rather than by index alone."
+  (let* ((remote-index (funcall ejira-todo-state-fn status resolution))
+         (local-index (1+ (or (cl-position local-state org-todo-keywords-1
+                                           :test #'equal)
+                              -2))))
+    (or (= remote-index local-index)
+        (and (not (equal status "Closed"))
+             (member status
+                     (mapcar #'car
+                             (cl-remove-if-not
+                              (lambda (e) (= (cdr e) local-index))
+                              ejira-todo-states-alist)))))))
+
+(cl-defun ejira--remote-differences (&key summary description status resolution
+                                          deadline priority-id)
+  "Return how the issue heading at point differs from Jira's version of it.
+Jira's version is SUMMARY, already converted to Org (or `:unconvertible'),
+DESCRIPTION in Jira markup, STATUS and RESOLUTION names, DEADLINE as
+YYYY-MM-DD and PRIORITY-ID; a nil DEADLINE is no due date, and a nil
+PRIORITY-ID or STATUS is not compared.  The heading's Jira-facing
+summary and description are compared (its projection, for a projected
+heading), normalized by `ejira--content-normalize', and so are its
+deadline, todo state and priority.
+
+Return an alist of (FIELD . DESCRIPTION), FIELD being `summary',
+`description', `deadline', `state' or `priority', in that order, and
+DESCRIPTION a short human-readable line.  Markup that cannot be
+converted counts as a difference: nothing tells it equal."
+  (let* ((m (point-marker))
+         (rdesc (condition-case nil
+                    (let ((ejira-parser-signal-failures t))
+                      (ejira--expected-jira-description m description))
+                  (ejira-parser-error :unconvertible)))
+         (local-state (substring-no-properties (or (org-get-todo-state) "")))
+         (local-deadline (when-let* ((d (org-get-deadline-time m)))
+                           (format-time-string "%Y-%m-%d" d)))
+         (local-priority (org-entry-get nil ejira-priority-id-property)))
+    (delq nil
+          (list
+           (cond ((eq summary :unconvertible) '(summary . "summary unconvertible"))
+                 ((not (equal (ejira--push-normalize summary)
+                              (ejira--push-normalize (ejira--jira-summary))))
+                  '(summary . "summary")))
+           (cond ((eq rdesc :unconvertible) '(description . "description unconvertible"))
+                 ((not (equal (ejira--content-normalize rdesc)
+                              (ejira--content-normalize (ejira--jira-description))))
+                  '(description . "description")))
+           (unless (equal (or deadline "") (or local-deadline ""))
+             (cons 'deadline (format "deadline %s vs %s"
+                                     (or local-deadline "none") (or deadline "none"))))
+           (when (and status
+                      (not (ejira--state-matches-status-p local-state status resolution)))
+             (cons 'state (format "state %s vs %s" local-state status)))
+           (when (and local-priority priority-id
+                      (not (equal local-priority priority-id)))
+             (cons 'priority (format "priority %s vs %s" local-priority priority-id)))))))
+
+(defun ejira--item-remote-differences (item)
+  "Return `ejira--remote-differences' of the heading at point against REST ITEM."
+  (ejira--remote-differences
+   :summary (ejira--convert-or-unconvertible (ejira--alist-get item 'fields 'summary) nil)
+   :description (ejira--alist-get item 'fields 'description)
+   :status (ejira--alist-get item 'fields 'status 'name)
+   :resolution (ejira--alist-get item 'fields 'resolution 'name)
+   :deadline (ejira--alist-get item 'fields 'duedate)
+   :priority-id (ejira--priority-id-string
+                 (ejira--alist-get item 'fields 'priority 'id))))
+
+(defun ejira--never-synced-held (differences)
+  "Return the DIFFERENCES a pull of the never-synced heading at point would lose.
+DIFFERENCES are those of `ejira--remote-differences'.  A pull loses
+the heading's own text where it has some: a summary, a description or
+a deadline that Jira's empty value would replace is nothing lost, and
+is pulled.  It loses the heading's state whenever that differs.  The
+priority is Jira's to set, and a pull applies it."
+  (cl-remove-if-not
+   (lambda (d)
+     (pcase (car d)
+       ('summary (not (string-empty-p (ejira--push-normalize (ejira--jira-summary)))))
+       ('description (not (string-empty-p
+                           (ejira--content-normalize (ejira--jira-description)))))
+       ('deadline (org-get-deadline-time (point-marker)))
+       ('state t)))
+   differences))
+
+(defun ejira--never-synced-differences (item)
+  "Return what a pull of ITEM would lose of the never-synced heading at point.
+ITEM is Jira's version of the heading, a REST item.  Nil unless the
+heading is never synced (`ejira--never-synced-p'); otherwise see
+`ejira--never-synced-held'.  A pull may replace such a heading only
+when this is nil."
+  (when (ejira--never-synced-p)
+    (ejira--never-synced-held (ejira--item-remote-differences item))))
+
 (defun ejira--update-local-baseline ()
   "Record the heading at point as it is now as its local baseline.
 For a clean full pull, a completed push, or a new comment draft: the
@@ -1958,7 +2127,7 @@ returns the existing one instead.  Callers reach here after a failed
                ;; No parent: insert after the first line (startup keyword).
                (forward-line)
                (org-insert-heading-respect-content t))
-             (insert "<ejira new heading>")
+             (insert ejira--new-heading-title)
              (org-set-property "ID" id)
              (org-beginning-of-line)
              (ejira--save-buffer-safe)
@@ -2088,6 +2257,17 @@ runs first."
             (puthash id m ejira--heading-cache))
           m))))
 
+
+(defun ejira--file-in-org-directory-p (file)
+  "Return non-nil when FILE lies inside `ejira-org-directory'.
+There ejira enforces the Jira hierarchy, and a pull refiles a heading
+under its parent from any file; elsewhere a heading is the user's to
+place, and is only re-nested within its own file.  Symlinks are
+resolved on both sides.  A nil FILE (a buffer visiting no file: tests,
+capture targets) is outside."
+  (and file
+       (string-prefix-p (file-truename (expand-file-name ejira-org-directory))
+                        (file-truename file))))
 
 (defun ejira--synced-project-p (project)
   "Return non-nil when PROJECT is one of `ejira-projects'.

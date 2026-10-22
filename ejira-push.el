@@ -584,6 +584,14 @@ same way."
       (goto-char (point-min))
       (re-search-forward "^[ \t]*:LocalHash:" nil t))))
 
+(defvar ejira--never-synced-push-keys nil
+  "Keys of never-synced headings that `ejira--push-scan-buffer' offers.
+A heading never synced (`ejira--never-synced-p') has no baseline to
+tell an edit, so nothing marks it as one.  A reconciliation cycle that
+compared it with Jira and found it different binds this to its key:
+the push plan then shows what differs, for review.  Only Jira's answer
+makes it a push: an issue Jira did not return is not one to update.")
+
 (defun ejira--push-scan-buffer (buf)
   "Return list of pending-op plists for BUF."
   (with-current-buffer buf
@@ -630,11 +638,15 @@ same way."
                                              :body (ejira--get-heading-body marker)))
                            ops)
                    ;; Rules A-G (only when NOT PendingDelete)
-                   ;; Rule A: dirty local baseline — issues
+                   ;; Rule A: dirty local baseline — issues.  And a
+                   ;; heading never synced that the running cycle found
+                   ;; different from Jira (`ejira--never-synced-push-keys').
                    (when (and (member type ejira-pushable-types)
                               id
                               (not (equal type "ejira-comment"))
-                              (ejira--locally-modified-p)
+                              (or (ejira--locally-modified-p)
+                                  (and (member id ejira--never-synced-push-keys)
+                                       (ejira--never-synced-p)))
                               (not pending-delete))
                      (let ((proj (car (split-string id "-"))))
                        (push (list :op 'update
