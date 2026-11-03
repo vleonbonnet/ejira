@@ -234,7 +234,7 @@ list line such as `* (x) item' becomes an Org heading.")
 
 (define-error 'ejira-parser-error "JIRA markup could not be converted to Org")
 
-(defvar ejira-parser-browse-links-as-id nil
+(defcustom ejira-parser-browse-links-as-id nil
   "Whether to import issue browse links as `id:' links.
 A JIRA link whose URL is `<jiralib2-url>/browse/KEY' becomes
 `[[id:KEY][label]]', so an Org file that references issues by their
@@ -244,7 +244,15 @@ with an exporter that writes `id:' issue links back as browse URLs.
   t      convert every issue key;
   known  convert only keys that have a local heading (in
          `org-id-locations'), so no dead `id:' link is created for an
-         issue the Org files do not hold.")
+         issue the Org files do not hold.
+A user option, so a value customized before this file loads (such as
+use-package's `:custom' on a lazily loaded package) takes effect when
+it does.  Regression: as a plain `defvar' it kept nil, and pulls wrote
+browse URLs over the `id:' links of the files."
+  :group 'ejira
+  :type '(choice (const :tag "Keep browse URLs" nil)
+                 (const :tag "Convert every issue key" t)
+                 (const :tag "Convert keys with a local heading" known)))
 
 (defun ejira-parser--issue-known-p (key)
   "Return non-nil when issue KEY has a heading known to `org-id'."

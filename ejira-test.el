@@ -1489,6 +1489,21 @@ first bare `}}', so the escape is what keeps the brace inside it."
   ;; lets the next push upgrade the remote markup.
   (should (equal "=a=}" (ejira-test--parse "{{a}}}"))))
 
+(ert-deftest ejira-parser/browse-links-as-id-is-a-user-option ()
+  "`ejira-parser-browse-links-as-id' is declared with `defcustom'.
+A value customized before the parser loads, as use-package's `:custom'
+does for a lazily loaded package, is only picked up by a `defcustom'
+when it loads; a `defvar' keeps its own default.  Regression: declared
+with `defvar', the configured `known' never applied, and pulls wrote
+browse URLs over the `id:' links of the files."
+  (should (custom-variable-p 'ejira-parser-browse-links-as-id))
+  (let ((form (cl-find-if
+               (lambda (f) (and (memq (car-safe f) '(defvar defcustom))
+                                (eq (cadr f) 'ejira-parser-browse-links-as-id)))
+               (ejira-test--source-forms
+                (expand-file-name "ejira-parser.el" ejira-test--source-dir)))))
+    (should (eq 'defcustom (car form)))))
+
 (ert-deftest ejira-parser/browse-links-as-id ()
   "Issue browse links import as `id:' links when enabled.
 Regression: the rule used to run `string-match' without preserving
